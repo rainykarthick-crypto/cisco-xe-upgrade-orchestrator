@@ -1,4337 +1,9779 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-================================================================================
- Cisco IOS-XE Fleet Upgrade Orchestrator                       version 35.9.34
-================================================================================
-Upgrades a fleet of Cisco IOS-XE switches (Catalyst 9200/9200L/9200CX/9300/9500)
-to IOS-XE 17.18.04 by transferring the .bin via SCP, installing with
-``install add`` / ``install activate`` / ``install commit``, reloading and
-verifying.
-
-Design rules that this file deliberately obeys (see the project spec):
-
-  * STATE DRIVEN, NEVER TIMER DRIVEN.  Each install-loop iteration reads device
-    state, classifies it, issues exactly ONE command, then loops.  The only
-    hard time stop is STATE_MACHINE_DEADLINE per device.
-  * SESSION CONTINUITY.  The session that carried ``install add`` is the same
-    session that runs activate / commit / reload.  A second session opened
-    between those phases races the install engine lock.
-  * VERSION AWARE DISPATCH.  The activate command form depends on the running
-    IOS-XE version (bare form is rejected on >= 17.10).
-  * SERVICE LOCKS ON EVERY DEVICE, including devices already on target; every
-    temporary change is recorded in state/temp_changes_<RUN_ID>.json and is
-    reverted (and verified) at the end of the location run.
-
-Usage
------
-    python cisco_upgrade_v35_9_34.py --validate
-    python cisco_upgrade_v35_9_34.py --check
-    python cisco_upgrade_v35_9_34.py --locations Jaipur Hyderabad --yes
-    python cisco_upgrade_v35_9_34.py --hosts SW1=10.0.0.1 --dry-run
-    python cisco_upgrade_v35_9_34.py --recover
-
-Requires: Python 3.10+, netmiko, paramiko, pscp.exe (PuTTY) in the base dir.
-================================================================================
-"""
-
-from __future__ import annotations
-
-import argparse
-import atexit
-import csv
-import glob
-import hashlib
-import inspect
-import json
-import os
-import queue
-import re
-import shutil
-import signal
-import socket
-import struct
-import subprocess
-import sys
-import tempfile
-import threading
-import time
-import traceback
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
-
-# ---------------------------------------------------------------------------
-# Optional third party imports.  They are required for a real run, but the
-# module must still import cleanly so that --validate / --version work even on
-# a workstation where the wheels are not installed yet.
-# ---------------------------------------------------------------------------
-try:  # pragma: no cover
-    import paramiko  # type: ignore
-except Exception:  # pragma: no cover
-    paramiko = None  # type: ignore
-
-try:  # pragma: no cover
-    from netmiko import ConnectHandler  # type: ignore
-except Exception:  # pragma: no cover
-    ConnectHandler = None  # type: ignore
+def _run_install_commit_only(conn, host, st, ip, user, pw, target_ver):
+    wlog(host, "COMMIT (already-added path)", "STEP")
+    set_state(host, "INSTALL", "commit")
+    if st.get("reboot_detected") or conn is None:
+        wlog(host, "Waiting for reboot to settle before commit", "INFO")
+        if not wait_for_ping_down(ip, host,
+                                  timeout_sec=PING_DOWN_TIMEOUT_SEC):
+            wlog(host, "Device did not go down -- checking anyway", "WARN")
+        if not wait_for_ping_up(ip, host,
+                                timeout_sec=PING_UP_TIMEOUT_SEC):
+            return False, "device did not return after activate", None
+        if not wait_for_ping_stable(ip, host):
+            return False, "boot loop detected", None
+        if not wait_for_ssh_ready(ip, host):
+            return False, "SSH did not return after activate", None
+        time.sleep(POST_REBOOT_SETTLE_SEC)
+        conn = robust_reconnect(ip, user, pw, host,
+                                max_attempts=POST_REBOOT_MAX_ATTEMPTS,
+                                delay=POST_REBOOT_DELAY_SEC,
+                                purpose="post-activate commit")
+        if not conn:
+            return False, "could not reconnect for commit", None
+    if _finalize_install_commit(conn, host, target_ver, fw_file=""):
+        return True, "", conn
+    return False, "commit could not be verified", conn
 
 
-def tune_paramiko_algorithms() -> Dict[str, Any]:
-    """Offer the legacy algorithms that IOS-XE 16.x/17.3 still speak.
+def precheck_device(conn, host, fw_file, target_ver):
+    wlog(host, "--- PRE-CHECK ---", "STEP")
+    members_count = 1
+    try:
+        sw = conn.send_command("show switch", read_timeout=60)
+        rows = _SWITCH_ROW_RE.findall(sw)
+        members_count = len(rows) if rows else 1
+    except Exception:
+        members_count = 1
 
-    Old Catalyst builds frequently offer only dh-group14-sha1/group1-sha1,
-    hmac-sha1 and ssh-rsa.  Newer paramiko releases dropped several of those
-    from their default preference lists, which surfaces as
-    "no acceptable kex algorithm" / "no acceptable host key" at connect time.
+    set_state(host, "PRE-CHECK", "clock")
+    _ok, _drift, _tz = _ensure_device_clock_correct_cached(
+        conn, host, max_drift_sec=CLOCK_DRIFT_FIX_SEC)
+    clock_fixed = bool(_ok and _drift is not None
+                       and _drift > CLOCK_DRIFT_FIX_SEC)
 
-    Every candidate is validated against the algorithm table that this
-    paramiko build actually implements, so naming a removed implementation can
-    never poison the negotiation.  Attributes whose table is unavailable are
-    left at paramiko's own defaults - guessing there would cause hard
-    connection failures rather than graceful fallback.
-    """
-    report: Dict[str, Any] = {"legacy_kex": False, "legacy_key": False,
-                              "applied": [], "paramiko": None}
-    if paramiko is None:
-        return report
-    report["paramiko"] = getattr(paramiko, "__version__", "unknown")
-    kex = ("curve25519-sha256", "curve25519-sha256@libssh.org",
-           "ecdh-sha2-nistp256", "ecdh-sha2-nistp384", "ecdh-sha2-nistp521",
-           "diffie-hellman-group-exchange-sha256",
-           "diffie-hellman-group16-sha512",
-           "diffie-hellman-group14-sha256",
-           "diffie-hellman-group14-sha1",
-           "diffie-hellman-group-exchange-sha1",
-           "diffie-hellman-group1-sha1")
-    ciphers = ("aes128-ctr", "aes192-ctr", "aes256-ctr",
-               "aes128-gcm@openssh.com", "aes256-gcm@openssh.com",
-               "aes128-cbc", "aes192-cbc", "aes256-cbc", "3des-cbc")
-    macs = ("hmac-sha1", "hmac-sha1-etm@openssh.com", "hmac-sha1-96",
-            "hmac-sha2-256", "hmac-sha2-256-etm@openssh.com",
-            "hmac-sha2-512", "hmac-sha2-512-etm@openssh.com",
-            "hmac-md5", "hmac-md5-96",
-            "hmac-ripemd160@openssh.com", "umac-64@openssh.com")
-    keys = ("rsa-sha2-512", "rsa-sha2-256", "ssh-rsa")
-    transport = getattr(paramiko, "Transport", None)
-    if transport is None:
-        return report
-    plan = (("_preferred_kex", "_kex_info", kex, "legacy_kex",
-             ("diffie-hellman-group14-sha1", "diffie-hellman-group1-sha1",
-              "diffie-hellman-group-exchange-sha1")),
-            ("_preferred_ciphers", "_cipher_info", ciphers, None,
-             ("3des-cbc", "aes128-cbc")),
-            ("_preferred_macs", "_mac_info", macs, None,
-             ("hmac-md5", "hmac-sha1")),
-            ("_preferred_keys", "_key_info", keys, "legacy_key", ("ssh-rsa",)))
-    for attr, info_attr, wanted, flag, legacy_markers in plan:
+    set_state(host, "PRE-CHECK", "model")
+    model = get_model(conn)
+    if model: wlog(host, "  Model: %s" % model, "INFO")
+
+    ok_fam, reason = verify_model_firmware_consistency(
+        model, fw_file, target_ver)
+    if not ok_fam:
+        wlog(host, "  Firmware/model mismatch: %s" % reason, "ERROR")
+        if STRICT_FAMILY_CHECK:
+            return (False, "firmware mismatch: %s" % reason, "unknown",
+                    clock_fixed)
+        else:
+            wlog(host, "  Continuing in lenient mode", "WARN")
+
+    set_state(host, "PRE-CHECK", "readiness")
+    ready_ok, ready_reason = verify_boot_and_install_ready(
+        conn, host, fw_file, self_heal=True)
+    if not ready_ok:
+        wlog(host, "  readiness gate: %s" % ready_reason, "ERROR")
+        return (False, ready_reason, "unknown", clock_fixed)
+
+    set_state(host, "PRE-CHECK", "version")
+    ver_out = conn.send_command("show version | include Version")
+    m = re.search(r"Version ([\w.()]+)", ver_out)
+    current_ver = m.group(1) if m else "unknown"
+    wlog(host, "  Version: %s  ->  target %s" % (current_ver, target_ver),
+         "INFO", silent=QUIET_SKIPPED)
+
+    if _norm_ver(current_ver) == _norm_ver(target_ver):
+        needs_finalize = False
         try:
-            info = getattr(transport, info_attr, None)
-            if not isinstance(info, dict) or not info:
-                continue  # cannot verify the names -> keep paramiko defaults
-            chosen = [name for name in wanted if name in info]
-            if not chosen:
-                continue
-            setattr(transport, attr, tuple(chosen))
-            report["applied"].append("%s=%d" % (attr, len(chosen)))
-            if flag and any(marker in chosen for marker in legacy_markers):
-                report[flag] = True
-        except Exception as exc:
-            report["applied"].append("%s failed: %s" % (attr, str(exc)[:60]))
-    return report
-
-
-PARAMIKO_REPORT: Dict[str, Any] = tune_paramiko_algorithms()
-
-
-# ===========================================================================
-#  IDENTITY
-# ===========================================================================
-VERSION = "35.9.34"
-SCRIPT_NAME = "cisco_upgrade_v35_9_34.py"
-TARGET_VERSION = "17.18.04"
-
-DEFAULT_LOCATIONS = ["Jaipur", "Hyderabad", "Ghaziabad", "KB-Churchgate", "Kolkata"]
-
-# ---------------------------------------------------------------------------
-#  Model -> firmware mapping.  ORDER MATTERS: longest prefix first so that
-#  "C9200CX"/"C9200L" are matched before the shorter "C9200" prefix.
-# ---------------------------------------------------------------------------
-MODEL_FIRMWARE_MAP: Tuple[Tuple[str, str, str], ...] = (
-    ("C9200CX", "cat9k_lite_iosxe.17.18.04.SPA.bin", "17.18.04"),
-    ("C9200L", "cat9k_lite_iosxe.17.18.04.SPA.bin", "17.18.04"),
-    ("C9200", "cat9k_lite_iosxe.17.18.04.SPA.bin", "17.18.04"),
-    ("C9300", "cat9k_iosxe.17.18.04.SPA.bin", "17.18.04"),
-    ("C9500", "cat9k_iosxe.17.18.04.SPA.bin", "17.18.04"),
-)
-
-MODEL_FAMILY_MAP: Dict[str, Tuple[str, Optional[str]]] = {
-    "C9200CX": ("lite", "_lite_"),
-    "C9200L": ("lite", "_lite_"),
-    "C9200": ("lite", "_lite_"),
-    "C9300": ("full", None),
-    "C9500": ("full", None),
-}
-
-LARGE_MODEL_PREFIXES = ("C9300", "C9500")
-
-# Errors that must never be retried: retrying makes things worse.
-NON_RETRYABLE_PREFIXES = (
-    "not_install_mode",
-    "insufficient_space",
-    "insufficient_space_stack",
-    "not priv 15",
-    "unsupported model",
-    "size mismatch",
-    "MD5 mismatch",
-    "hash mismatch",
-    "shutdown requested",
-    "TACACS+ denied",
-    "TACACS+ dropped",
-    "SSH negotiation failed",
-    "host key",
-    "firmware mismatch",
-    "two committed versions",
-    "install_activate FAILED",
-    "install_add FAILED",
-    "install_commit FAILED",
-    "install operation error",
-)
-
-
-# ===========================================================================
-#  TUNING CONSTANTS  (every one of these may be overridden from config.json)
-# ===========================================================================
-TRANSFER_SLOTS = 5
-INSTALL_WORKERS = 10
-MAX_SAFE_SSH_SESSIONS = 15
-LARGE_MODEL_PARALLEL = 3
-SERIAL_TRANSFER_LARGE_MODELS = True          # C9300/C9500 run in their own slower phase
-
-USE_PSCP = True
-PSCP_TRANSFER_FALLBACK = True
-TRANSFER_RETRY_ATTEMPTS = 3
-TRANSFER_RETRY_DELAY_SEC = 30
-VERIFY_TRANSFER_HASH = True
-FIRMWARE_RECHECK_BEFORE_TRANSFER = True
-SCP_STALL_TIMEOUT = 600
-SCP_SIZE_CHECK_INTERVAL = 90
-
-MIN_FREE_BYTES = 1_000_000_000
-EXTRA_HEADROOM_BYTES = 200_000_000
-STACK_MEMBER_HEADROOM = 100_000_000
-
-STATE_MACHINE_DEADLINE = 2400                # outer per-device cap, seconds
-STATE_POLL_INTERVAL = 15
-STATE_MAX_SAME = 40
-MAX_ESCALATIONS = 2
-
-PING_TIMEOUT_MS = 2000
-PING_DOWN_POLL_SEC = 5
-PING_DOWN_TIMEOUT_SEC = 300
-PING_UP_POLL_SEC = 10
-PING_UP_TIMEOUT_SEC = 900
-
-POST_REBOOT_SSH_WAIT_SEC = 900
-POST_REBOOT_SETTLE_SEC = 120
-POST_REBOOT_MAX_ATTEMPTS = 30
-POST_REBOOT_DELAY_SEC = 30
-
-RECONNECT_MAX_ATTEMPTS = 5
-RECONNECT_DELAY_SEC = 30
-
-STALL_DETECT_MIN = 20
-MONITOR_INTERVAL = 15
-
-PRESERVE_ROLLBACK = True                     # keep old images in flash
-REVERT_TEMP_CONFIG_POST_LOCATION = True
-REVERT_MAX_ATTEMPTS = 5
-REVERT_RETRY_DELAY_SEC = 20
-REVERT_WRITE_MEMORY = True
-
-ABORT_GATE_THRESHOLD = 0.50
-ABORT_GATE_MIN_DEVICES = 4
-
-MAX_RETRIES = 2
-RETRY_DELAY_SEC = 60
-
-# Model family sanity bounds (megabytes) used by the firmware pre-flight.  A
-# violation is reported as a warning, never a hard stop: the real .bin sizes
-# move between maintenance releases and a wrong bound must not block a fleet.
-FAMILY_SIZE_BOUNDS = {"lite": (300, 800), "full": (1000, 1600)}
-FAMILY_SIZE_BOUNDS_STRICT = False
-
-# Retention housekeeping for a long lived orchestrator box.
-LOG_MAX_AGE_DAYS = 30
-LOG_MAX_SIZE_GB = 10
-BACKUP_MAX_FILES = 500
-BACKUP_MAX_SIZE_GB = 5
-
-# SSH reachability probing before paying for a full auth handshake.
-SSH_PORT_PROBE_SEC = 5
-SSH_PORT_PROBE_POLL_SEC = 5
-
-ALLOW_BUNDLE_MODE_CONVERSION = True
-SKIP_CONFIG_DRIFT_CHECK = False
-PRESAVE_CONFIG = True
-
-# Lines our own temporary changes add; they must not be reported as drift.
-DRIFT_NOISE_PREFIXES = (
-    "exec-timeout", "ip scp server enable", "ip http server",
-    "ip http secure-server", "tftp-server", "no ip http",
-    "ip ssh server algorithm", "ip ssh server algorithm kex",
-    "boot system flash:packages.conf", "no boot system",
-)
-
-POOL_LOCATIONS = True                        # all locations share one worker queue
-
-CLOCK_DRIFT_FIX_SEC = 60
-NTP_SERVERS = ("pool.ntp.org", "time.google.com", "time.cloudflare.com",
-               "time.windows.com")
-
-# Local image sizes (bytes) keyed by filename; filled by preflight_firmware().
-FIRMWARE_SIZES: Dict[str, int] = {}
-
-MODELS_REQUIRING_SSH_TUNE = ("C9300", "C9500")
-
-CHEAP_CRYPTO_TUNING = True
-CHEAP_CIPHER = "aes128-ctr"
-CHEAP_MAC = "hmac-sha1"
-CHEAP_CRYPTO_MIN_VERSION = (17, 10, 0)
-CHEAP_CRYPTO_APPLY = ["ip ssh server algorithm encryption aes128-ctr",
-                      "ip ssh server algorithm mac hmac-sha1"]
-CHEAP_CRYPTO_REVERT = ["no ip ssh server algorithm encryption",
-                       "no ip ssh server algorithm mac"]
-
-# Operational extras (not part of the tuning table but useful / overridable)
-CONNECT_TIMEOUT_SEC = 30
-INSTALL_ADD_DEADLINE_SEC = 2400
-ACTIVATE_DEADLINE_SEC = 1200
-COMMIT_DEADLINE_SEC = 900
-MD5_DEADLINE_SEC = 1800
-VERIFY_NO_TEMP_CHANGES = True
-PROMPT_QUIET_SEC = 3.0        # silence on the channel that means "prompt returned"
-
-LIVE_LOG_PANEL_PHASES = ("TRANSFER", "INSTALL", "MD5", "REBOOT", "VERIFY")
-LIVE_LOG_PANEL_N = 6
-
-ALL_PHASES = ("QUEUE", "PRE-CHECK", "SERVICE-LOCKS", "TRANSFER", "MD5", "INSTALL",
-              "REBOOT", "VERIFY", "DONE", "FAILED", "SKIPPED", "STALLED")
-PHASE_ORDER = {name: idx for idx, name in enumerate(ALL_PHASES)}
-ACTIVE_PHASES = ("PRE-CHECK", "SERVICE-LOCKS", "TRANSFER", "MD5", "INSTALL", "REBOOT", "VERIFY")
-
-
-# ===========================================================================
-#  PATHS  -- update_paths() owns *every* path global (bug B4)
-# ===========================================================================
-_SCRIPT_DIR = Path(__file__).resolve().parent
-_DEFAULT_BASE = Path(os.environ.get("CISCO_UPGRADE_BASE", r"C:\Cisco_Upgrade"))
-if not _DEFAULT_BASE.exists() and (_SCRIPT_DIR / "firmware").exists():
-    # Running straight out of an unpacked tree: use the script's own folder.
-    _DEFAULT_BASE = _SCRIPT_DIR
-
-BASE_DIR: Path = _DEFAULT_BASE
-FIRMWARE_DIR: Path = BASE_DIR / "firmware"
-LOCATIONS_DIR: Path = BASE_DIR / "locations"
-LOG_DIR: Path = BASE_DIR / "logs"
-BACKUP_DIR: Path = BASE_DIR / "backups"
-REPORT_DIR: Path = BASE_DIR / "reports"
-STATE_DIR: Path = BASE_DIR / "state"
-CHECKPOINT_DIR: Path = BASE_DIR / "checkpoints"
-CONFIG_FILE: Path = BASE_DIR / "config.json"
-LOCK_FILE: Path = BASE_DIR / ".upgrade.lock"
-PSCP_EXE: Path = BASE_DIR / "pscp.exe"
-PLINK_EXE: Path = BASE_DIR / "plink.exe"
-_PWFILE_BASE: str = str(Path(tempfile.gettempdir()) / "_pscp_pw_")
-
-# popen flag that keeps a console window from flashing for ping / pscp
-NO_WINDOW: int = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-
-
-def update_paths(base_dir: Any) -> None:
-    """Point EVERY derived path at *base_dir*.
-
-    Bug B4: the old code only refreshed BASE_DIR, which left the log, state,
-    report, backup and firmware paths (plus the lock and password temp files)
-    aimed at the original tree.
-    """
-    global BASE_DIR, FIRMWARE_DIR, LOCATIONS_DIR, LOG_DIR, BACKUP_DIR
-    global REPORT_DIR, STATE_DIR, CHECKPOINT_DIR, CONFIG_FILE, LOCK_FILE
-    global PSCP_EXE, PLINK_EXE, _PWFILE_BASE
-
-    BASE_DIR = Path(base_dir).expanduser()
-    FIRMWARE_DIR = BASE_DIR / "firmware"
-    LOCATIONS_DIR = BASE_DIR / "locations"
-    LOG_DIR = BASE_DIR / "logs"
-    BACKUP_DIR = BASE_DIR / "backups"
-    REPORT_DIR = BASE_DIR / "reports"
-    STATE_DIR = BASE_DIR / "state"
-    CHECKPOINT_DIR = BASE_DIR / "checkpoints"
-    CONFIG_FILE = BASE_DIR / "config.json"
-    LOCK_FILE = BASE_DIR / ".upgrade.lock"
-    PSCP_EXE = BASE_DIR / "pscp.exe"
-    PLINK_EXE = BASE_DIR / "plink.exe"
-    _PWFILE_BASE = str(Path(tempfile.gettempdir()) / "_pscp_pw_")
-
-
-# ===========================================================================
-#  RUNTIME STATE  (thread shared, always touched under a lock)
-# ===========================================================================
-RUN_ID: str = time.strftime("%Y%m%d_%H%M%S")
-SHUTDOWN_REQ = threading.Event()
-SHUTDOWN_COUNT = 0
-
-DEV_STATE: Dict[str, Dict[str, Any]] = {}
-STATE_LOCK = threading.RLock()
-
-TEMP_CHANGES: Dict[str, Dict[str, Any]] = {}
-TEMP_LOCK = threading.RLock()
-STATE_FILES_LOADED: List[str] = []
-
-LOG_LOCK = threading.Lock()
-SESSION_SEM = threading.Semaphore(MAX_SAFE_SSH_SESSIONS)
-LARGE_SEM = threading.BoundedSemaphore(LARGE_MODEL_PARALLEL)
-
-LIVE_TRANSFER = False
-DRY_RUN = False
-CHECK_ONLY = False
-NO_RECONCILE = False
-DASHBOARD_ENABLED = True
-CONSOLE_ECHO = True
-SERIAL_LARGE = True          # C9300/C9500 transfer in their own slower phase
-ALLOW_BUNDLE_CONVERSION = True
-VERIFY_HASH = True
-
-ENABLE_PASSWORD: Optional[str] = None
-ENABLE_USER: Optional[str] = None
-
-_ANSWERS_DONE: Dict[str, int] = {}
-
-
-# ===========================================================================
-#  LOGGING
-# ===========================================================================
-def _stamp() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _ensure_dir(path: Path) -> None:
-    try:
-        path.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-
-
-def _append(path: Path, text: str) -> None:
-    try:
-        _ensure_dir(path.parent)
-        with LOG_LOCK:
-            with open(path, "a", encoding="utf-8", errors="replace") as fh:
-                fh.write(text + "\n")
-    except Exception:
-        pass
-
-
-def _fmt(level: str, host: str, msg: str) -> str:
-    return "%s [%-5s] [%s] %s" % (_stamp(), level, host, msg)
-
-
-def log_master(level: str, msg: str) -> None:
-    _append(LOG_DIR / ("master_%s.log" % RUN_ID), _fmt(level, "master", msg))
-    if level in ("WARN", "ERROR"):
-        _append(LOG_DIR / "errors.log", _fmt(level, "master", msg))
-
-
-def dev_log(host: str, level: str, msg: str) -> None:
-    _append(LOG_DIR / ("%s.log" % host), _fmt(level, host, msg))
-    if level in ("WARN", "ERROR"):
-        _append(LOG_DIR / "errors.log", _fmt(level, host, msg))
-
-
-def log_console(level: str, msg: str) -> None:
-    if CONSOLE_ECHO:
-        _safe_print("%s %-5s %s" % (time.strftime("%H:%M:%S"), level, msg))
-
-
-def _safe_print(text: str = "") -> None:
-    """Print without ever dying on a legacy console code page."""
-    try:
-        print(text)
-    except UnicodeEncodeError:
-        enc = sys.stdout.encoding or "ascii"
+            summ = conn.send_command("show install summary",
+                                     read_timeout=60)
+            feed_live_log(host,
+                          "[precheck] show install summary\n%s" % summ)
+            if summary_committed_on_target(summ, target_ver):
+                wlog(host, "  on target and committed", "OK",
+                     silent=QUIET_SKIPPED)
+            else:
+                entries = _parse_install_summary(summ)
+                status = entries.get(_norm_ver(target_ver))
+                other_c = [v for v, s in entries.items()
+                           if s == "C" and v != _norm_ver(target_ver)]
+                if other_c:
+                    wlog(host, "  on target but TWO committed versions "
+                               "present (%s) -- manual remediation required"
+                         % ", ".join(other_c), "ERROR")
+                    return (False,
+                            "two committed versions present: %s + %s"
+                            % (target_ver, ", ".join(other_c)),
+                            current_ver, clock_fixed)
+                wlog(host, "  on target but install summary status=%s "
+                           "-- will run install commit" % (status or "?"),
+                     "WARN")
+                needs_finalize = True
+        except Exception as e:
+            wlog(host, "  summary read failed: %s -- assuming commit "
+                       "needed" % str(e)[:80], "WARN")
+            needs_finalize = True
+
+        residuals = {}
         try:
-            print(text.encode(enc, "replace").decode(enc, "replace"))
-        except Exception:
-            pass
+            residuals = _detect_residual_temp_config(conn, host)
+        except Exception as e:
+            wlog(host, "  residual scan failed: %s" % str(e)[:80], "WARN")
+
+        existing_types = {ch["type"] for ch in get_temp_changes(host)}
+        newly_discovered = []
+        for t, d in residuals.items():
+            if t not in existing_types:
+                newly_discovered.append(t)
+            track_temp_change(host, t, d)
+
+        all_residual_types = set(existing_types) | set(residuals.keys())
+        needs_cleanup = bool(all_residual_types)
+
+        if newly_discovered:
+            wlog(host, "  newly discovered residual temp config: %s"
+                 % ", ".join(sorted(newly_discovered)), "WARN")
+        if needs_cleanup:
+            wlog(host, "  temp config to revert: %s"
+                 % ", ".join(sorted(all_residual_types)), "INFO")
+
+        if not needs_finalize and not needs_cleanup:
+            wlog(host, "  on target, committed, and clean", "OK")
+            return (True, "already_on_target", current_ver, clock_fixed)
+        if needs_finalize and not needs_cleanup:
+            wlog(host, "  fixup: finalize only", "INFO")
+            return (True, "already_on_target_needs_finalize", current_ver,
+                    clock_fixed)
+        if not needs_finalize and needs_cleanup:
+            wlog(host, "  fixup: cleanup only", "INFO")
+            return (True, "already_on_target_needs_cleanup", current_ver,
+                    clock_fixed)
+        wlog(host, "  fixup: finalize + cleanup", "INFO")
+        return (True, "already_on_target_needs_finalize_and_cleanup",
+                current_ver, clock_fixed)
+
+    already_added, added_reason = _is_target_pkg_set_present(
+        conn, host, target_ver)
+    if already_added:
+        wlog(host, "  %s" % added_reason, "OK")
+        wlog(host, "  skipping space gate and transfer; proceeding to "
+                   "activate/commit", "OK")
+        return (True, "already_added_needs_activate",
+                current_ver, clock_fixed)
+
+    boot = conn.send_command("show boot | include BOOT", read_timeout=60)
+    feed_live_log(host, "[precheck] show boot\n%s" % boot)
+    if "packages.conf" not in boot:
+        if ALLOW_BUNDLE_MODE_CONVERSION:
+            wlog(host, "  Bundle mode -- install will convert", "WARN")
+            master_log("%s: BUNDLE MODE -- will convert via install add" % host)
+        else:
+            wlog(host, "  Not INSTALL mode", "ERROR")
+            return (False, "not_install_mode", current_ver, clock_fixed)
+
+    fw_size = get_firmware_size(fw_file)
+    if not fw_size:
+        fw_size = MIN_FREE_BYTES
+
+    bin_present = False
+    try:
+        out = conn.send_command(
+            "dir flash: | include %s" % re.escape(fw_file),
+            read_timeout=TRANSFER_VERIFY_TIMEOUT)
+        if fw_file in out:
+            remote_size = _parse_file_size_from_dir(out, fw_file)
+            if remote_size and remote_size == fw_size:
+                bin_present = True
+                wlog(host, "  target .bin already on flash (correct "
+                           "size)", "OK")
+            elif remote_size:
+                wlog(host, "  target .bin on flash but wrong size "
+                           "(%d vs %d) -- will be re-transferred"
+                     % (remote_size, fw_size), "WARN")
     except Exception:
         pass
 
+    extraction = int(fw_size * EXTRACTION_OVERHEAD_FACTOR)
+    required_active = (extraction + EXTRA_HEADROOM_BYTES) if bin_present \
+                      else (fw_size + extraction + EXTRA_HEADROOM_BYTES)
+    wlog(host, "  Space plan: fw_size=%s extraction=%s headroom=%s "
+               "bin_on_flash=%s"
+         % (_fmt_bytes(fw_size), _fmt_bytes(extraction),
+            _fmt_bytes(STACK_MEMBER_HEADROOM),
+            "yes" if bin_present else "no"), "INFO")
 
-def _init_stdout() -> None:
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
-    except Exception:
-        pass
-
-
-def archive_device_log(host: str) -> None:
-    """Keep the previous run's per device log (see ROBUSTNESS section)."""
-    src = LOG_DIR / ("%s.log" % host)
-    if not src.exists():
-        return
-    dst = LOG_DIR / "archive" / ("%s_prev_%s.log" % (host, RUN_ID))
-    try:
-        _ensure_dir(dst.parent)
-        shutil.copy2(str(src), str(dst))
-        src.unlink()
-    except Exception:
-        pass
-
-
-# ===========================================================================
-#  LIVE DASHBOARD
-# ===========================================================================
-def dev_live_log(host: str, line: str) -> None:
-    line = (line or "").strip()
-    if not line:
-        return
-    with STATE_LOCK:
-        st = DEV_STATE.get(host)
-        if st is None:
-            st = DEV_STATE[host] = {"phase": "QUEUE", "detail": "", "start": time.time(),
-                                    "phase_since": time.time(), "log": deque(maxlen=LIVE_LOG_PANEL_N)}
-        st.setdefault("log", deque(maxlen=LIVE_LOG_PANEL_N))
-        st["log"].append(line[:118])
-
-
-def set_phase(host: str, phase: str, detail: str = "", pct: Optional[float] = None) -> None:
-    now = time.time()
-    with STATE_LOCK:
-        st = DEV_STATE.setdefault(host, {})
-        st.setdefault("start", now)
-        if st.get("phase") != phase:
-            st["phase_since"] = now
-        st["phase"] = phase
-        st["detail"] = detail
-        st["updated"] = now
-        if pct is not None:
-            st["pct"] = pct
-        if phase in ("DONE", "FAILED", "SKIPPED"):
-            st["finished"] = now
-
-
-def _progress_bar(pct: float, width: int = 10) -> str:
-    pct = max(0.0, min(100.0, float(pct)))
-    filled = int(round(width * pct / 100.0))
-    return "[%s%s] %5.1f%%" % ("#" * filled, "." * (width - filled), pct)
-
-
-def _use_ansi() -> bool:
-    try:
-        return bool(sys.stdout.isatty())
-    except Exception:
-        return False
-
-
-_UNICODE_OK: Optional[bool] = None
-
-
-def _use_unicode() -> bool:
-    global _UNICODE_OK
-    if _UNICODE_OK is None:
-        enc = (sys.stdout.encoding or "ascii").lower()
-        _UNICODE_OK = "utf" in enc
-    return bool(_UNICODE_OK)
-
-
-def _dash_rules() -> Tuple[str, str]:
-    if _use_unicode():
-        return ("\u2500" * 32, "\u2500" * 16)
-    return ("-" * 32, "-" * 16)
-
-
-def render_dashboard(force: bool = False) -> str:
-    """Render the dashboard into a string (also used by --check summaries)."""
-    now = time.time()
-    total = done = failed = active = 0
-    rows: List[Tuple[int, str, str, str, str, Tuple[str, ...]]] = []
-    with STATE_LOCK:
-        for host, st in DEV_STATE.items():
-            phase = st.get("phase", "QUEUE")
-            if phase in ACTIVE_PHASES and (now - st.get("phase_since", now)) > (STALL_DETECT_MIN * 60):
-                phase = "STALLED"
-            detail = st.get("detail", "") or ""
-            if phase == "TRANSFER" and st.get("pct") is not None:
-                detail = _progress_bar(float(st["pct"]))
-            elapsed = int(now - st.get("start", now))
-            live = tuple(st.get("log") or ())
-            rows.append((PHASE_ORDER.get(phase, 99), host, phase, detail[:24], "%ds" % elapsed, live))
-            total += 1
-            if phase == "DONE":
-                done += 1
-            elif phase == "FAILED":
-                failed += 1
-            elif phase in ("STALLED",):
-                active += 1
-            elif phase not in ("SKIPPED",):
-                active += 1
-    rows.sort(key=lambda r: (r[0], r[1]))
-    lines: List[str] = []
-    h1, h2 = _dash_rules()
-    lines.append("  %-30s %-16s %-24s %7s" % ("Host", "Phase", "Detail", "Time"))
-    lines.append("  %s %s %s %s" % (h1, h2, "-" * 24, "-" * 7))
-    for _order, host, phase, detail, elapsed, live in rows:
-        lines.append("  %-30s %-16s %-24s %7s" % (host[:30], phase, detail, elapsed))
-        if LIVE_TRANSFER and phase in LIVE_LOG_PANEL_PHASES and live:
-            for line in live[-LIVE_LOG_PANEL_N:]:
-                lines.append("      | %s" % line[:110])
-    lines.append("")
-    lines.append("  devices=%d  done=%d  failed=%d  in-flight=%d  run=%s  %s"
-                 % (total, done, failed, active, RUN_ID, _stamp()))
-    return "\n".join(lines)
-
-
-def dashboard_thread() -> None:
-    """Refresh the dashboard every MONITOR_INTERVAL seconds.
-
-    When stdout is a terminal the panel is redrawn in place.  When the output
-    is redirected (a log file) the panel is only written when the completion
-    counters move or every 15 minutes, so a 500 device run does not produce a
-    megabyte of near-identical frames.
-    """
-    last_print = 0.0
-    last_counts: Optional[Tuple[int, int, int]] = None
-    while not SHUTDOWN_REQ.is_set():
+    if not DRY_RUN:
         try:
-            if DASHBOARD_ENABLED:
-                body = render_dashboard()
-                with STATE_LOCK:
-                    counts = (
-                        sum(1 for s in DEV_STATE.values() if s.get("phase") == "DONE"),
-                        sum(1 for s in DEV_STATE.values() if s.get("phase") == "FAILED"),
-                        len(DEV_STATE),
-                    )
-                if _use_ansi():
-                    sys.stdout.write("\033[2J\033[H")
-                    _safe_print(body)
-                elif counts != last_counts or (time.time() - last_print) > 900:
-                    _safe_print(body)
-                sys.stdout.flush()
-                last_print = time.time()
-                last_counts = counts
-        except Exception:
-            pass
-        SHUTDOWN_REQ.wait(MONITOR_INTERVAL)
+            in_install = _is_install_mode(conn)
+            if in_install:
+                wlog(host, "  Purging stale .bin / .conf / junk "
+                           "(running .bin is deletable in install mode)",
+                     "INFO")
+                _purge_unnecessary_files(conn, host, fw_file, aggressive=False,
+                                         target_ver=target_ver)
+                if members_count > 1:
+                    _purge_standby_members(conn, host, fw_file, members_count)
+                time.sleep(2)
+                try:
+                    out2 = conn.send_command(
+                        "dir flash: | include %s" % re.escape(fw_file),
+                        read_timeout=60)
+                    if fw_file in out2:
+                        bin_present = True
+                except Exception:
+                    pass
+        except Exception as e:
+            wlog(host, "  purge failed (non-fatal): %s" % str(e)[:80],
+                 "WARN")
+
+    try:
+        per_member_bytes = _get_all_member_free_bytes(conn, host)
+        skip_per_member_gate = False
+        if per_member_bytes is None:
+            wlog(host, "  Could not verify all stack member storage -- "
+                       "SKIPPING pre-check space gate "
+                       "(install will validate)", "WARN")
+            skip_per_member_gate = True
+
+        if (not skip_per_member_gate) and per_member_bytes and fw_size:
+            shortfalls = []
+            for idx, mfree in enumerate(per_member_bytes):
+                need_this = _member_required_bytes(
+                    fw_size,
+                    preserve_rollback=PRESERVE_ROLLBACK,
+                    bin_already_present=(bin_present and idx == 0),
+                    is_standby=(idx > 0))
+                role = "active" if idx == 0 else "standby"
+                marker = "OK" if mfree >= need_this else "SHORT"
+                wlog(host, "  member %d (%s): free=%s need=%s %s"
+                     % (idx + 1, role, _fmt_bytes(mfree),
+                        _fmt_bytes(need_this), marker),
+                     "OK" if mfree >= need_this else "WARN")
+                if mfree < need_this:
+                    shortfalls.append((idx + 1, role, mfree, need_this))
+
+            if shortfalls:
+                wlog(host, "  Space short on %d member(s) -- attempting "
+                           "aggressive purge" % len(shortfalls), "WARN")
+                try:
+                    _purge_unnecessary_files(conn, host, fw_file,
+                                             aggressive=True,
+                                             target_ver=target_ver)
+                    if members_count > 1:
+                        _purge_standby_members(conn, host, fw_file,
+                                               members_count)
+                except Exception as e:
+                    wlog(host, "  aggressive purge failed: %s"
+                         % str(e)[:80], "WARN")
+                time.sleep(3)
+                per_member_bytes = _get_all_member_free_bytes(conn, host)
+                if per_member_bytes is None:
+                    skip_per_member_gate = True
+                else:
+                    shortfalls = []
+                    for idx, mfree in enumerate(per_member_bytes):
+                        need_this = _member_required_bytes(
+                            fw_size,
+                            preserve_rollback=PRESERVE_ROLLBACK,
+                            bin_already_present=(bin_present and idx == 0),
+                            is_standby=(idx > 0))
+                        role = "active" if idx == 0 else "standby"
+                        marker = "OK" if mfree >= need_this else "SHORT"
+                        wlog(host,
+                             "  after purge -- member %d (%s): free=%s "
+                             "need=%s %s"
+                             % (idx + 1, role, _fmt_bytes(mfree),
+                                _fmt_bytes(need_this), marker),
+                             "OK" if mfree >= need_this else "WARN")
+                        if mfree < need_this:
+                            shortfalls.append((idx + 1, role, mfree,
+                                               need_this))
+
+            if shortfalls and not skip_per_member_gate:
+                detail = "; ".join(
+                    "m%d(%s) free=%s need=%s"
+                    % (m, role, _fmt_bytes(f), _fmt_bytes(n))
+                    for m, role, f, n in shortfalls)
+                reason = ("insufficient_space_stack: %s "
+                          "fw_size=%s extraction=%s headroom=%s"
+                          % (detail,
+                             _fmt_bytes(fw_size),
+                             _fmt_bytes(extraction),
+                             _fmt_bytes(STACK_MEMBER_HEADROOM)))
+                wlog(host, "  STILL insufficient: %s -- REFUSING"
+                     % reason, "ERROR")
+                return (False, reason, current_ver, clock_fixed)
+            if not shortfalls and not skip_per_member_gate:
+                wlog(host, "  All %d member(s) have sufficient space"
+                     % len(per_member_bytes), "OK")
+        elif not skip_per_member_gate and fw_size:
+            wlog(host, "  Could not determine per-member free", "WARN")
+    except Exception as e:
+        wlog(host, "  Stack free-space check skipped: %s" % str(e)[:80],
+             "WARN")
+
+    if WIPE_BEFORE_TRANSFER and not DRY_RUN:
+        set_state(host, "PRE-CHECK", "wiping")
+        wipe_firmware_flash(conn, host)
+    free_bytes = get_flash_free_bytes(conn)
+    if free_bytes < required_active:
+        reason = ("insufficient_space: free=%s need=%s"
+                  % (_fmt_bytes(free_bytes),
+                     _fmt_bytes(required_active)))
+        wlog(host, "  STILL insufficient on active member: %s -- REFUSING"
+             % reason, "ERROR")
+        return (False, reason, current_ver, clock_fixed)
+    wlog(host, "  Space OK: %.1f MB (active need ~%.0f MB)"
+         % (free_bytes/1e6, required_active/1e6), "OK")
+    return (True, "ready", current_ver, clock_fixed)
 
 
-# ===========================================================================
-#  SMALL REGEX / FORMAT HELPERS
-# ===========================================================================
-_VER3_RE = re.compile(r"\b(\d+)\.(\d+)\.(\d+)\b")
-_IOSXE_VER_RE = re.compile(r"Cisco IOS XE Software,\s*Version\s+(\d+)\.(\d+)\.(\d+)")
-_ANY_VER_RE = re.compile(r"[Vv]ersion[:\s]+(\d+)\.(\d+)\.(\d+)")
-
-# Bug B11: this list must NOT contain 'failed:\\s*install' -- the switch prints
-# "FAILED:" inside its own summary header and that caused false positives.
-_FAST_FAIL_RE = re.compile(
-    r"(install_activate\s+exit\(\d+\)"
-    r"|install_add\s+exit\(\d+\)"
-    r"|install_commit\s+exit\(\d+\)"
-    r"|install_remove\s+exit\(\d+\)"
-    r"|%INSTALL-3-OPERATION_ERROR_MESSAGE"
-    r"|%INSTALL-4-INSTALL_BUSY)",
-    re.I,
-)
-
-# Bug B15: word boundary around eof, never a bare substring test.
-_DEAD_SOCKET_RE = re.compile(
-    r"(socket is closed|connection reset by peer|connection closed|broken pipe"
-    r"|\beof\b|no existing session|transport is closed|ssh session not active"
-    r"|not connected|channel closed|10054|10060|10053|paramiko\.ssh_exception)",
-    re.I,
-)
-
-# TACACS+ command authorization denies privileged commands; the session is
-# still usable for reads, so these must not be mistaken for "not priv 15".
-_AUTHZ_FAIL_MARKERS = (
-    "% authorization failed",
-    "authorization failed for user",
-    "command authorization failed",
-    "command not authorized",
-    "% authorization denied",
-)
-
-_PROMPT_TAIL_RE = re.compile(r"(?:^|\n)\s*[\w\-\./()\[\]:]{1,60}[#>]\s*$")
-_CONFIRM_RE = re.compile(r"\[(?:confirm|y/n|yes/no)\]", re.I)
-_SAVE_RE = re.compile(r"\[(?:yes/no|y/n)\]\s*$", re.I)
-_YN_RE = re.compile(r"\[(?:y/n|yes/no|confirm)\]", re.I)
-_ACTIVATE_REJECT_RE = re.compile(
-    r"(issu keyword|Invalid input|%\s*Invalid|rejected|not supported"
-    r"|%INSTALL-3-OPERATION_ERROR|incompatible)",
-    re.I,
-)
+def _pwfile_for_thread():
+    global _PWFILE_COUNTER
+    with _PWFILE_COUNTER_LK:
+        _PWFILE_COUNTER += 1
+        n = _PWFILE_COUNTER
+    return "%s_%d_%d.tmp" % (_PWFILE_BASE, os.getpid(), n)
 
 
-def _trim1200(text: str) -> str:
-    """Bug B12: parsing buffers are trimmed to 1200 chars, not 4000."""
-    return (text or "")[-1200:]
-
-
-def _ver_tuple(ver: Any) -> Tuple[int, int, int]:
-    if ver is None:
-        return (0, 0, 0)
-    if isinstance(ver, (tuple, list)) and len(ver) >= 3:
+def _write_pwfile(pw):
+    path = _pwfile_for_thread()
+    with _PWFILE_LOCK:
         try:
-            return (int(ver[0]), int(ver[1]), int(ver[2]))
-        except Exception:
-            return (0, 0, 0)
-    m = _VER3_RE.search(str(ver))
-    if not m:
-        return (0, 0, 0)
-    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            with open(path, "w", newline="") as f:
+                f.write(pw + "\n")
+            return path
+        except Exception as e:
+            master_log("Could not write pwfile: %s" % e)
+            return None
 
 
-def _ver_str(ver: Any) -> str:
-    t = _ver_tuple(ver)
-    if t == (0, 0, 0):
-        return str(ver or "")
-    return "%d.%d.%d" % t
+def _delete_pwfile(path):
+    if not path: return
+    with _PWFILE_LOCK:
+        try:
+            if os.path.exists(path): os.remove(path)
+        except OSError: pass
 
 
-def _is_dead_socket_error(text: Any) -> bool:
-    if not text:
-        return False
-    return bool(_DEAD_SOCKET_RE.search(str(text)))
-
-
-def parse_running_version(out: str) -> str:
-    m = _IOSXE_VER_RE.search(out or "")
-    if not m:
-        m = _ANY_VER_RE.search(out or "")
-    if not m:
-        return ""
-    return "%s.%s.%s" % (m.group(1), m.group(2), m.group(3))
-
-
-# ---------------------------------------------------------------------------
-#  install-summary parsing  (bug B18: six different output shapes)
-# ---------------------------------------------------------------------------
-_STATUS_WORDS = {
-    "c": "C", "committed": "C", "commit": "C", "committed.": "C",
-    "a": "A", "active": "A", "activated": "A", "activate": "A",
-    "u": "U", "uncommitted": "U", "pending": "U", "pending-commit": "U",
-    "i": "I", "inactive": "I", "deactivated": "I",
-}
-_STATUS_RANK = {"C": 3, "A": 2, "U": 1, "I": 0}
-
-
-def _normalise_status(raw: Any) -> str:
-    """'(C)' / '[C]' / 'Active, Committed' -> single letter status."""
-    if raw is None:
-        return "?"
-    text = str(raw).strip().strip("()[]{}<>,;: \t\"'")
-    if not text:
-        return "?"
-    token = re.split(r"[\s,;/|]+", text.strip())[0].strip("()[]{}<>,;:.!\"'")
-    return _STATUS_WORDS.get(token.lower(), "?")
-
-
-def _status_tokens(line: str) -> List[str]:
-    """Every recognised status token on one line, normalised."""
-    found: List[str] = []
-    for token in re.split(r"[\s,;/|]+", line or ""):
-        bare = token.strip().strip("()[]{}<>,;:.\"'")
-        if not bare:
-            continue
-        st = _STATUS_WORDS.get(bare.lower())
-        if st:
-            found.append(st)
-    return found
-
-
-def _pick_status(tokens: List[str]) -> str:
-    best = "?"
-    for tok in tokens:
-        if _STATUS_RANK.get(tok, -1) > _STATUS_RANK.get(best, -1):
-            best = tok
-    return best
-
-
-def _parse_install_summary(out: str) -> Dict[str, str]:
-    """Parse ``show install summary`` into ``{version: single_letter_status}``.
-
-    Handles, at minimum:
-        "  IMG  C  17.18.04"                      (row)
-        "IMG: flash:..bin" / "Version : X" / "Status : C"   (multi block)
-        "17.18.04   Active, Committed"            (table)
-        "Version:17.18.04" / "Status: Active"     (no space)
-        "17.18.04   Inactive"                     (word form)
-        "(C)" / "[C]"                             (bracketed)
-    """
-    result: Dict[str, str] = {}
-    pending_ver: Optional[str] = None
-    for raw in (out or "").splitlines():
-        line = raw.strip().strip("|")
-        if not line or set(line) <= set("-=+ "):
-            continue
-        low = line.lower()
-
-        m = re.match(r"^(?:version|ver)\s*[:=]\s*(\d+\.\d+\.\d+)", low)
-        if m:
-            pending_ver = m.group(1)
-            continue
-
-        m = re.match(r"^(?:status|state)\s*[:=]\s*(.+)$", low)
-        if m:
-            status = _normalise_status(m.group(1))
-            ver = pending_ver
-            if ver is None:
-                vm = _VER3_RE.search(line)
-                ver = vm.group(0) if vm else None
-            if ver and status != "?":
-                prev = result.get(ver)
-                if prev is None or _STATUS_RANK.get(status, -1) >= _STATUS_RANK.get(prev, -1):
-                    result[ver] = status
-            continue
-
-        vmatch = _VER3_RE.search(line)
-        stats = _status_tokens(line)
-        if vmatch and stats:
-            ver = vmatch.group(0)
-            status = _pick_status(stats)
-            prev = result.get(ver)
-            if prev is None or _STATUS_RANK.get(status, -1) >= _STATUS_RANK.get(prev, -1):
-                result[ver] = status
-            pending_ver = ver
-        elif vmatch:
-            pending_ver = vmatch.group(0)
-        elif stats and pending_ver and len(line.split()) <= 3:
-            # Multi-block form: a bare status word such as "C" or "(C)" on its
-            # own line belongs to the version announced just above it.  Longer
-            # lines are column headers ("Active  Package  Type  State") and are
-            # ignored so they cannot be mistaken for a status.
-            status = _pick_status(stats)
-            prev = result.get(pending_ver)
-            if prev is None or _STATUS_RANK.get(status, -1) >= _STATUS_RANK.get(prev, -1):
-                result[pending_ver] = status
-    return result
-
-
-def _sum_status_for(summary: Dict[str, str], target_ver: str) -> Optional[str]:
-    """Status of *target_ver* in a parsed summary, or None.  Exact compare."""
-    if not summary:
-        return None
-    want = _ver_tuple(target_ver)
-    for ver, status in summary.items():
-        if _ver_tuple(ver) == want:
-            return status
-    return None
-
-
-def summary_committed_on_target(summary: Dict[str, str], target_ver: str) -> bool:
-    """Bug B13: never substring-match versions here.
-
-    Exactly one entry, exactly the target version, status 'C'.
-    """
-    if not summary or len(summary) != 1:
-        return False
-    ver, status = next(iter(summary.items()))
-    return _ver_tuple(ver) == _ver_tuple(target_ver) and status == "C"
-
-
-# ===========================================================================
-#  VERSION AWARE COMMAND DISPATCH  (design rule P3)
-# ===========================================================================
-def classify_install_syntax(ver_tuple: Any) -> Dict[str, Any]:
-    """Pick the activate form that this IOS-XE build accepts.
-
-      < 17.3.0   -> bare ``install activate``
-      17.3-17.6  -> ``install activate file flash:X``
-      17.6-17.9  -> either form works
-      >= 17.10   -> ``install activate file flash:X`` (bare rejected)
-    """
-    ver = _ver_tuple(ver_tuple)
-    if ver < (17, 3, 0):
-        form = "bare"
-    elif ver < (17, 6, 0):
-        form = "file"
-    elif ver < (17, 10, 0):
-        form = "either"
-    else:
-        form = "file"
-    return {
-        "activate_form": form,
-        "add_syntax": "install add file flash:%s",
-        "supports_issu": ver >= (17, 3, 0),
-        "version_str": _ver_str(ver) if ver != (0, 0, 0) else "",
-    }
-
-
-def build_activate_cmds(fw_file: str, syntax: Dict[str, Any]) -> List[str]:
-    """Best-first list of activate commands for the given syntax decision."""
-    file_form = "install activate file flash:%s" % fw_file
-    bare_form = "install activate"
-    form = (syntax or {}).get("activate_form", "file")
-    if form == "bare":
-        return [bare_form]
-    if form == "either":
-        return [file_form, bare_form]
-    return [file_form]
-
-
-# ===========================================================================
-#  SESSION PLUMBING
-# ===========================================================================
-def _session_slot(acquire: bool, timeout: float = 0.0) -> bool:
-    """Keep the fleet under MAX_SAFE_SSH_SESSIONS concurrent SSH channels."""
-    if acquire:
-        if timeout and timeout > 0:
-            return SESSION_SEM.acquire(timeout=timeout)
-        SESSION_SEM.acquire()
+def _verify_firmware_hash(fw_file, host):
+    if not FIRMWARE_RECHECK_BEFORE_TRANSFER: return True
+    expected = FIRMWARE_SHA256.get(fw_file)
+    if not expected: return True
+    p = os.path.join(FIRMWARE_DIR, fw_file)
+    try:
+        actual = _sha256_of_file(p)
+        if actual != expected:
+            wlog(host, "Firmware hash changed! expected %s... got %s..."
+                 % (expected[:16], actual[:16]), "ERROR")
+            return False
         return True
-    try:
-        SESSION_SEM.release()
-    except Exception:
-        pass
-    return True
+    except Exception as e:
+        wlog(host, "Firmware hash re-check failed: %s" % str(e)[:80], "WARN")
+        return True
 
 
-def do_connect(ip: str, host: str, user: str, pw: str, enable_pw: str = "",
-               fast: bool = False, timeout: int = CONNECT_TIMEOUT_SEC) -> Any:
-    """Open one netmiko session and install a paramiko keepalive.
-
-    Bug B2: paramiko's SSHClient has no public ``transport`` attribute, so the
-    old reflective attribute lookup silently did nothing and mid-install
-    disconnects were never prevented.  We now call ``get_transport()`` on the
-    underlying client and set a 30 s keepalive.
+def _pscp_run_once(cmd, host, start, tag_prefix=""):
     """
-    if ConnectHandler is None:
-        raise RuntimeError("netmiko is not installed; pip install netmiko")
-    _session_slot(True, timeout=300)
+    v35.9.43 FIX-PSCP-STALL: adds a stall detector.  Previously the
+    blocking `proc.stdout.read(4096)` never returned when pscp stopped
+    producing output (hung socket, stalled transfer), freezing the
+    entire transfer pool.  Now a background reader thread pushes raw
+    bytes onto a queue, and the main loop kills the process after
+    SCP_STALL_TIMEOUT seconds without any output, letting the caller's
+    retry path take over.
+    """
+    import queue as _queue
     try:
-        params = dict(
-            device_type="cisco_ios",
-            host=ip,
-            username=user,
-            password=pw,
-            secret=enable_pw or pw,
-            port=22,
-            timeout=timeout,
-            conn_timeout=timeout,
-            auth_timeout=timeout,
-            banner_timeout=timeout,
-            fast_cli=bool(fast),
-            global_delay_factor=1.0,
-        )
-        client = ConnectHandler(**params)
-    except Exception:
-        _session_slot(False)
-        raise
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            bufsize=-1,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    except Exception as e:
+        wlog(host, "pscp spawn failed: %s" % str(e)[:120], "ERROR")
+        return -1, 0.0, False
 
-    transport = None
-    try:
-        transport = client.remote_conn.get_transport()
-    except Exception:
-        transport = None
-    if transport is None:
+    pct_re = re.compile(rb"(\d{1,3})%")
+    last_pct = -1
+    last_report = 0.0
+    killed = False
+
+    chunks = _queue.Queue()
+    _SENTINEL = object()
+
+    def _reader():
         try:
-            transport = client.get_transport()
-        except Exception:
-            transport = None
-    if transport is not None:
-        try:
-            transport.set_keepalive(30)
+            while True:
+                buf = proc.stdout.read(4096)
+                if not buf:
+                    break
+                chunks.put(buf)
         except Exception:
             pass
+        finally:
+            try: proc.stdout.close()
+            except Exception: pass
+            chunks.put(_SENTINEL)
 
+    rt = threading.Thread(target=_reader, daemon=True, name="pscp-rd")
+    rt.start()
+
+    pending = b""
+    last_data = time.time()
     try:
-        client.enable()
-    except Exception:
-        pass
-    dev_log(host, "INFO", "ssh session established to %s" % ip)
+        while True:
+            if SHUTDOWN_REQ.is_set():
+                try: proc.terminate()
+                except Exception: pass
+                killed = True
+                wlog(host, "pscp aborted (shutdown)", "WARN")
+                break
+            try:
+                item = chunks.get(timeout=1.0)
+            except _queue.Empty:
+                if time.time() - last_data > SCP_STALL_TIMEOUT:
+                    wlog(host, "pscp stalled %ds with no output -- killing "
+                               "(will retry)" % SCP_STALL_TIMEOUT, "WARN")
+                    try: proc.kill()
+                    except Exception: pass
+                    killed = True
+                    break
+                continue
+            if item is _SENTINEL:
+                break
+            last_data = time.time()
+            pending += item
+            # pscp writes progress with `\r`, stats with `\n`.
+            while True:
+                i_r = pending.find(b"\r")
+                i_n = pending.find(b"\n")
+                idxs = [i for i in (i_r, i_n) if i >= 0]
+                if not idxs:
+                    break
+                i = min(idxs)
+                line, pending = pending[:i], pending[i+1:]
+                if LIVE_LOG_FEED_TRANSFER:
+                    try: line_str = line.decode("utf-8", "replace")
+                    except Exception: line_str = str(line)
+                    if line_str.strip():
+                        feed_live_log(host, "[%spscp] %s"
+                                      % (tag_prefix, line_str.strip()))
+                m = pct_re.search(line)
+                if m:
+                    try: pct = int(m.group(1))
+                    except Exception: continue
+                    if pct != last_pct and time.time() - last_report > 3:
+                        last_pct = pct
+                        last_report = time.time()
+                        with STATE_LOCK:
+                            if host in PEER_STATES:
+                                PEER_STATES[host]["progress"] = float(pct)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            try: proc.kill()
+            except Exception: pass
+            wlog(host, "pscp hung on exit", "WARN")
+            return -2, time.time() - start, False
+    except Exception as e:
+        wlog(host, "pscp read error: %s" % str(e)[:120], "WARN")
+        try: proc.kill()
+        except Exception: pass
+        return -3, time.time() - start, False
+
+    rc_final = proc.returncode if proc.returncode is not None else -4
+    if rc_final != 0:
+        try:
+            tail = (pending or b"").decode("utf-8", "replace").strip()
+            if tail:
+                wlog(host, "  pscp(%s) output tail: %s"
+                     % (tag_prefix or "main", tail[-500:]), "INFO")
+        except Exception: pass
+    return rc_final, time.time() - start, killed
+
+
+def transfer_via_pscp(ip, user, pw, fw_file, host):
+    if not os.path.isfile(PSCP_EXE):
+        wlog(host, "pscp.exe not found at %s" % PSCP_EXE, "ERROR"); return False
+    local_file = os.path.join(FIRMWARE_DIR, fw_file)
+    if not os.path.isfile(local_file):
+        wlog(host, "pscp: local missing %s" % local_file, "ERROR")
+        return False
+    if not _verify_firmware_hash(fw_file, host): return False
+    pwfile = _write_pwfile(pw)
+    if not pwfile: return False
+    wlog(host, "PSCP push -> %s:%s" % (ip, fw_file), "STEP")
+    set_state(host, "TRANSFER", "PSCP", progress=0)
+    set_cmd(host, "pscp -> flash:%s" % fw_file)
+    dest = "%s@%s:flash:%s" % (user, ip, fw_file)
+    cmd = [PSCP_EXE, "-scp", "-batch", "-pwfile", pwfile,
+           local_file, dest]
+    start = time.time()
+    rc, elapsed, killed = _pscp_run_once(cmd, host, start)
+    try: _delete_pwfile(pwfile)
+    except Exception: pass
+    if killed: return False
+    if rc == 0:
+        fw_size = get_firmware_size(fw_file)
+        mbps = fw_size / max(elapsed, 1) / 1e6 if fw_size else 0
+        wlog(host, "PSCP success -- %.0fs (%.2f MB/s)" % (elapsed, mbps),
+             "OK")
+        return True
+    if rc == 1 and elapsed < 60:
+        wlog(host, "  pscp failed fast -- fetching host key", "WARN")
+        hk = _get_host_key_fingerprint(ip, user, pw)
+        if hk: wlog(host, "  host key: %s  %s..." % (hk[0], hk[1][:32]), "INFO")
+        else: wlog(host, "  no host key fingerprint", "WARN")
+        cmd2 = [PSCP_EXE, "-scp", "-batch", "-pw", pw]
+        if hk: cmd2.extend(["-hostkey", hk[1]])
+        cmd2.extend([local_file, dest])
+        start2 = time.time()
+        rc2, elapsed2, killed2 = _pscp_run_once(cmd2, host, start2,
+                                                tag_prefix="retry-")
+        if killed2: return False
+        if rc2 == 0:
+            fw_size = get_firmware_size(fw_file)
+            mbps = fw_size / max(elapsed2, 1) / 1e6 if fw_size else 0
+            wlog(host, "PSCP (via -pw) -- %.0fs (%.2f MB/s)"
+                 % (elapsed2, mbps), "OK")
+            return True
+        wlog(host, "PSCP retry failed rc=%d" % rc2, "ERROR")
+        return False
+    wlog(host, "PSCP failed rc=%d after %.0fs" % (rc, elapsed), "ERROR")
+    return False
+
+
+def transfer_via_scp(ip, user, pw, fw_file, host):
+    wlog(host, "Paramiko SCP (legacy) -> %s:%s" % (ip, fw_file), "STEP")
+    set_state(host, "TRANSFER", "SCP", progress=0)
+    fw_size = get_firmware_size(fw_file)
+    if DRY_RUN:
+        wlog(host, "DRY-RUN: skipping SCP", "INFO"); return True
+    local_file = os.path.join(FIRMWARE_DIR, fw_file)
+    if not os.path.isfile(local_file):
+        wlog(host, "local firmware missing: %s" % local_file, "ERROR")
+        return False
+    if not _verify_firmware_hash(fw_file, host): return False
+    for attempt in range(1, SCP_MAX_ATTEMPTS + 1):
+        if SHUTDOWN_REQ.is_set(): return False
+        conn = None
+        start_time = time.time()
+        try:
+            conn = do_connect(ip, user, pw)
+            tacacs_enable(conn, host, ssh_pw=pw)
+            if not ensure_scp_server_enabled(conn, host):
+                raise RuntimeError("could not enable SCP server")
+            result = file_transfer(
+                conn, source_file=local_file, dest_file=fw_file,
+                file_system="flash:", direction="put",
+                overwrite_file=True, socket_timeout=SCP_TIMEOUT_SEC)
+            if result.get("file_transferred") or result.get("file_exists"):
+                elapsed = time.time() - start_time
+                mbps = fw_size / max(elapsed, 1) / 1e6 if fw_size else 0
+                wlog(host, "  SCP success -- %.0fs (%.2f MB/s)"
+                     % (elapsed, mbps), "OK")
+                return True
+        except Exception as e:
+            tag = _classify_connect_error(e)
+            if tag:
+                wlog(host, "  SCP %s" % tag, "WARN"); return False
+            wlog(host, "  SCP attempt %d: %s" % (attempt, str(e)[:120]),
+                 "WARN")
+        finally:
+            if conn:
+                try: conn.disconnect()
+                except Exception: pass
+        if attempt < SCP_MAX_ATTEMPTS and not SHUTDOWN_REQ.is_set():
+            wlog(host, "  Retrying in %ds..." % SCP_RETRY_DELAY, "INFO")
+            time.sleep(SCP_RETRY_DELAY)
+    return False
+
+
+def _build_optimized_paramiko_client(ip, user, pw):
+    import paramiko as _p
+    client = _p.SSHClient()
+    client.set_missing_host_key_policy(_p.AutoAddPolicy())
+    client.connect(
+        hostname=ip, username=user, password=pw,
+        look_for_keys=False, allow_agent=False,
+        timeout=PARAMIKO_CONNECT_TIMEOUT,
+        banner_timeout=PARAMIKO_CONNECT_TIMEOUT,
+        auth_timeout=PARAMIKO_CONNECT_TIMEOUT,
+        compress=False)
+    transport = client.get_transport()
+    try:
+        transport.default_window_size = PARAMIKO_WINDOW_BYTES
+        transport.default_max_packet_size = 32768
+    except Exception: pass
+    if PARAMIKO_DISABLE_REKEY:
+        try:
+            pk = transport.packetizer
+            if hasattr(pk, "REKEY_BYTES"): pk.REKEY_BYTES = 1 << 40
+            if hasattr(pk, "REKEY_PACKETS"): pk.REKEY_PACKETS = 1 << 40
+        except Exception: pass
     return client
 
 
-def _disconnect(conn: Any, release: bool = True) -> None:
-    if conn is None:
-        return
-    try:
-        conn.disconnect()
-    except Exception:
-        pass
-    if release:
-        _session_slot(False)
-
-
-def _session_is_alive(conn: Any) -> bool:
-    """Bug B5: a single 0.3 s read produced false negatives while the switch
-    was busy installing.  Loop for up to 3.0 s before declaring death.
-
-    Prefers the framework's liveness probe; if this netmiko build does not
-    expose one, fall back to a plain write/read round trip so the check still
-    works on any transport object.
-    """
-    if conn is None:
+def transfer_via_paramiko_tuned(ip, user, pw, fw_file, host):
+    if not USE_PARAMIKO_TUNED:
+        return transfer_via_scp(ip, user, pw, fw_file, host)
+    local_file = os.path.join(FIRMWARE_DIR, fw_file)
+    if not os.path.isfile(local_file):
+        wlog(host, "local firmware missing: %s" % local_file, "ERROR")
         return False
-    probe = getattr(conn, "is_alive", None)
-    deadline = time.time() + 3.0
-    while time.time() < deadline:
+    if not _verify_firmware_hash(fw_file, host): return False
+    fw_size = get_firmware_size(fw_file) or os.path.getsize(local_file)
+    wlog(host, "Paramiko tuned SCP -> %s:%s (chunk=%dKB, window=%dMB)"
+         % (ip, fw_file, PARAMIKO_CHANNEL_CHUNK//1024,
+            PARAMIKO_WINDOW_BYTES//(1024*1024)), "STEP")
+    set_state(host, "TRANSFER", "SCP-tuned", progress=0)
+    client = None
+    try:
+        client = _build_optimized_paramiko_client(ip, user, pw)
+        transport = client.get_transport()
         try:
-            if callable(probe):
-                if probe():
+            probe_chan = transport.open_session()
+            probe_chan.settimeout(PARAMIKO_READ_TIMEOUT)
+            probe_chan.exec_command(
+                "show running-config | include ip scp server")
+            probe_chan.recv(4096); probe_chan.close()
+        except Exception: pass
+        channel = transport.open_session()
+        channel.settimeout(PARAMIKO_READ_TIMEOUT)
+        channel.exec_command("scp -t flash:%s" % fw_file)
+        try: ack = channel.recv(1)
+        except Exception as e:
+            wlog(host, "SCP target ack failed: %s: %s"
+                 % (type(e).__name__, str(e)[:80] or "(no message)"), "ERROR")
+            return False
+        if not ack or ack[0] != 0:
+            try: err = channel.recv(256) or b""
+            except Exception: err = b""
+            wlog(host, "SCP target-mode rejected: %s"
+                 % err.decode('utf-8', 'replace')[:120], "ERROR")
+            return False
+        import stat as _stat
+        mode = _stat.S_IRUSR | _stat.S_IWUSR | _stat.S_IRGRP | _stat.S_IROTH
+        header = "C%04o %d %s\n" % (mode, fw_size,
+                                    os.path.basename(fw_file))
+        channel.sendall(header.encode())
+        try: ack = channel.recv(1)
+        except Exception: ack = b""
+        if not ack or ack[0] != 0:
+            wlog(host, "SCP header rejected", "ERROR"); return False
+        start = time.time(); sent = 0
+        last_report = start; last_pct = -1
+        chunk_size = PARAMIKO_CHANNEL_CHUNK
+        with open(local_file, "rb") as f:
+            while True:
+                if SHUTDOWN_REQ.is_set():
+                    wlog(host, "SCP-tuned aborted (shutdown)", "WARN")
+                    try: channel.close()
+                    except Exception: pass
+                    return False
+                buf = f.read(chunk_size)
+                if not buf: break
+                try: channel.sendall(buf)
+                except Exception as e:
+                    wlog(host, "SCP send error at %d bytes: %s: %s"
+                         % (sent, type(e).__name__,
+                            str(e)[:100] or "(no message)"), "ERROR")
+                    return False
+                sent += len(buf)
+                now = time.time()
+                if now - last_report > 3 and fw_size:
+                    pct = int(100.0 * sent / fw_size)
+                    if pct != last_pct:
+                        last_pct = pct
+                        with STATE_LOCK:
+                            if host in PEER_STATES:
+                                PEER_STATES[host]["progress"] = float(pct)
+                        last_report = now
+        channel.sendall(b"\x00")
+        try: ack = channel.recv(1)
+        except Exception: ack = b""
+        if not ack or ack[0] != 0:
+            wlog(host, "SCP EOF not acked by switch", "ERROR")
+            return False
+        try: channel.close()
+        except Exception: pass
+        try: client.close()
+        except Exception: pass
+        client = None
+        elapsed = time.time() - start
+        mbps = fw_size / max(elapsed, 1) / 1e6 if fw_size else 0
+        wlog(host, "Paramiko tuned SCP -- %.0fs (%.2f MB/s)"
+             % (elapsed, mbps), "OK")
+        return True
+    except Exception as e:
+        detail = str(e)[:140] or "(no message)"
+        wlog(host, "Paramiko tuned SCP failed: %s: %s"
+             % (type(e).__name__, detail), "ERROR")
+        return False
+    finally:
+        if client:
+            try: client.close()
+            except Exception: pass
+
+
+def transfer_firmware(ip, user, pw, fw_file, host, model=""):
+    if DRY_RUN:
+        wlog(host, "DRY-RUN: skipping firmware transfer", "INFO")
+        return True
+    if PARAMIKO_PRIMARY and USE_PARAMIKO_TUNED:
+        if transfer_via_paramiko_tuned(ip, user, pw, fw_file, host):
+            return True
+        wlog(host, "Paramiko tuned failed -- falling back to pscp", "WARN")
+    if USE_PSCP:
+        if transfer_via_pscp(ip, user, pw, fw_file, host):
+            return True
+        if PSCP_TRANSFER_FALLBACK:
+            if USE_PARAMIKO_TUNED:
+                wlog(host, "pscp failed -- falling back to tuned", "WARN")
+                if transfer_via_paramiko_tuned(ip, user, pw, fw_file, host):
                     return True
-            else:
-                conn.write_channel("\n")
-                if conn.read_channel():
-                    return True
-        except Exception as exc:
-            if _is_dead_socket_error(str(exc)):
-                return False
-        time.sleep(0.3)
+            wlog(host, "pscp failed -- falling back to legacy", "WARN")
+    if transfer_via_scp(ip, user, pw, fw_file, host):
+        return True
     return False
 
 
-def robust_reconnect(host: str, ip: str, user: str, pw: str, enable_pw: str = "",
-                     max_attempts: int = RECONNECT_MAX_ATTEMPTS,
-                     delay: int = RECONNECT_DELAY_SEC) -> Any:
-    for attempt in range(1, max(1, int(max_attempts)) + 1):
+def validate_transfer_size(conn, host, fw_file):
+    fw_size = get_firmware_size(fw_file)
+    if not fw_size:
+        wlog(host, "  No local size reference", "WARN"); return True
+    try:
+        out = conn.send_command(
+            "dir flash: | include %s" % re.escape(fw_file),
+            read_timeout=60)
+        feed_live_log(host, "[verify] dir flash:\n%s" % out)
+        remote_size = _parse_file_size_from_dir(out, fw_file)
+        if remote_size is None:
+            wlog(host, "  Could not parse remote size", "ERROR")
+            return False
+        if remote_size == fw_size:
+            wlog(host, "  Size validated: %d bytes" % remote_size, "OK")
+            return True
+        wlog(host, "  SIZE MISMATCH: %d != %d" % (remote_size, fw_size),
+             "ERROR")
+        return False
+    except Exception as e:
+        wlog(host, "  Size validation error: %s" % e, "ERROR")
+        return False
+
+
+def validate_transfer_hash(conn, host, fw_file):
+    if not VERIFY_TRANSFER_HASH: return True
+    expected = FIRMWARE_SHA256.get(fw_file)
+    if not expected:
+        wlog(host, "  No local SHA256 reference -- skipping", "WARN")
+        return True
+    try:
+        wlog(host, "  verify /sha256 (5-15 min)", "STEP")
+        set_state(host, "MD5", "verify sha256")
+        set_cmd(host, "verify /sha256 flash:%s" % fw_file)
+        out = conn.send_command("verify /sha256 flash:%s" % fw_file,
+                                read_timeout=1800)
+        feed_live_log(host, "[verify-sha256] %s" % out)
+        m = re.search(r"SHA256 hash of [^:]+:\s*([0-9a-fA-F]{64})", out)
+        if not m: m = re.search(r"\b([0-9a-fA-F]{64})\b", out)
+        if not m:
+            wlog(host, "  Could not parse SHA256 -- allowing", "WARN")
+            return True
+        remote = m.group(1).lower()
+        if remote == expected.lower():
+            wlog(host, "  SHA256 verified (%s...)" % remote[:16], "OK")
+            return True
+        wlog(host, "  SHA256 MISMATCH: remote=%s... local=%s..."
+             % (remote[:16], expected[:16]), "ERROR")
+        return False
+    except Exception as e:
+        wlog(host, "  SHA256 verify failed: %s -- allowing" % str(e)[:80],
+             "WARN")
+        return True
+
+
+def _best_effort_wipe(ip, user, pw, fw_file, host, reason="wipe"):
+    conn = None
+    try:
+        conn = do_connect(ip, user, pw)
+        tacacs_enable(conn, host, ssh_pw=pw)
+        if is_privileged(conn):
+            _delete_firmware_from_flash(conn, host, fw_file)
+        else:
+            wlog(host, "  %s: not priv-15, skipping wipe" % reason, "WARN")
+    except Exception as e:
+        wlog(host, "  %s failed: %s" % (reason, str(e)[:80]), "WARN")
+    finally:
+        if conn:
+            try: conn.disconnect()
+            except Exception: pass
+
+
+def _transfer_with_wipe_retry(ip, user, pw, fw_file, host, model=""):
+    local_path = os.path.join(FIRMWARE_DIR, fw_file)
+    local_size = (os.path.getsize(local_path)
+                  if os.path.isfile(local_path) else 0)
+    for attempt in range(1, TRANSFER_RETRY_ATTEMPTS + 1):
         if SHUTDOWN_REQ.is_set():
-            return None
+            wlog(host, "Shutdown -- aborting transfer retries", "WARN")
+            return False
+        wlog(host, "--- Transfer attempt %d/%d ---"
+             % (attempt, TRANSFER_RETRY_ATTEMPTS), "STEP")
+        conn = None
         try:
-            conn = do_connect(ip, host, user, pw, enable_pw)
-            dev_log(host, "OK", "reconnect attempt %d succeeded" % attempt)
-            return conn
-        except Exception as exc:
-            dev_log(host, "WARN", "reconnect attempt %d/%d failed: %s"
-                    % (attempt, max_attempts, exc))
-            if _is_dead_socket_error(str(exc)) or "authentication" in str(exc).lower():
+            conn = robust_reconnect(
+                ip, user, pw, host,
+                purpose="pre-transfer wipe (attempt %d)" % attempt)
+            if conn:
+                _delete_firmware_from_flash(conn, host, fw_file)
+        except Exception as e:
+            wlog(host, "Pre-transfer wipe failed: %s" % str(e)[:80], "WARN")
+        finally:
+            if conn:
+                try: conn.disconnect()
+                except Exception: pass
+        transfer_ok = transfer_firmware(ip, user, pw, fw_file, host,
+                                        model=model)
+        if not transfer_ok:
+            wlog(host, "  Transfer failed (attempt %d)" % attempt, "WARN")
+            _best_effort_wipe(ip, user, pw, fw_file, host,
+                              reason="post-fail wipe")
+            if attempt < TRANSFER_RETRY_ATTEMPTS:
+                time.sleep(TRANSFER_RETRY_DELAY_SEC)
+            continue
+        conn = robust_reconnect(ip, user, pw, host,
+                                purpose="post-transfer verify (attempt %d)"
+                                        % attempt)
+        if not conn:
+            wlog(host, "  Reconnect after transfer failed", "WARN")
+            _best_effort_wipe(ip, user, pw, fw_file, host,
+                              reason="verify-reconnect wipe")
+            if attempt < TRANSFER_RETRY_ATTEMPTS:
+                time.sleep(TRANSFER_RETRY_DELAY_SEC)
+            continue
+        try:
+            if not file_in_flash(conn, fw_file):
+                wlog(host, "  File not in flash after transfer", "WARN")
+                if attempt < TRANSFER_RETRY_ATTEMPTS:
+                    time.sleep(TRANSFER_RETRY_DELAY_SEC)
+                continue
+            if not validate_transfer_size(conn, host, fw_file):
+                wlog(host, "  Size mismatch -- wiping", "WARN")
+                _delete_firmware_from_flash(conn, host, fw_file)
+                if attempt < TRANSFER_RETRY_ATTEMPTS:
+                    time.sleep(TRANSFER_RETRY_DELAY_SEC)
+                continue
+            if not validate_transfer_hash(conn, host, fw_file):
+                wlog(host, "  Hash mismatch -- wiping", "WARN")
+                _delete_firmware_from_flash(conn, host, fw_file)
+                if attempt < TRANSFER_RETRY_ATTEMPTS:
+                    time.sleep(TRANSFER_RETRY_DELAY_SEC)
+                continue
+            wlog(host, "Transfer OK on attempt %d" % attempt, "OK")
+            return True
+        finally:
+            try: conn.disconnect()
+            except Exception: pass
+    wlog(host, "Transfer FAILED after %d attempts"
+         % TRANSFER_RETRY_ATTEMPTS, "ERROR")
+    return False
+
+
+def _probe_install_status(ip, user, pw, host, target_ver,
+                          prev_indeterminate=0):
+    c = None
+    try:
+        last_err = None
+        for attempt in range(PROBE_CONNECT_RETRIES):
+            try:
+                c = do_connect(ip, user, pw)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < PROBE_CONNECT_RETRIES - 1:
+                    time.sleep(PROBE_CONNECT_DELAY_SEC)
+        if c is None:
+            err_name = type(last_err).__name__ if last_err else "?"
+            wlog(host, "Probe: connect failed after %d attempts (%s) -- "
+                       "indeterminate" % (PROBE_CONNECT_RETRIES, err_name),
+                 "WARN")
+            return (True, "connect failed (%s)" % err_name,
+                    prev_indeterminate + 1)
+        try:
+            tacacs_enable(c, host, ssh_pw=pw)
+        except Exception:
+            pass
+        if not is_privileged(c):
+            wlog(host, "Probe: not priv-15 -- indeterminate (may be transient)",
+                 "WARN")
+            return (True, "not priv-15 (transient?)",
+                    prev_indeterminate + 1)
+        try:
+            ver = c.send_command("show version | include Version",
+                                 read_timeout=60)
+            feed_live_log(host, "[probe] show version\n%s" % ver)
+            if _norm_ver(parse_running_version(ver)) == _norm_ver(target_ver):
+                try:
+                    up = c.send_command("show version | include uptime is",
+                                        read_timeout=30)
+                    feed_live_log(host, "[probe] uptime\n%s" % up)
+                    m = re.search(r"uptime is (.+)", up)
+                    uptime_min = (parse_uptime_minutes(m.group(1))
+                                  if m else None)
+                    if uptime_min is not None and uptime_min < 30:
+                        return (True,
+                                "already on %s (rebooted %d min ago)"
+                                % (target_ver, uptime_min), 0)
+                except Exception:
+                    pass
+                return True, "already on %s" % target_ver, 0
+        except Exception as e:
+            return (True, "version check error (%s)" % type(e).__name__,
+                    prev_indeterminate + 1)
+        try:
+            summ = c.send_command("show install summary", read_timeout=60)
+            feed_live_log(host, "[probe] show install summary\n%s" % summ)
+        except Exception as e:
+            return (True, "install summary error (%s)" % type(e).__name__,
+                    prev_indeterminate + 1)
+
+        if re.search(r"install operation in progress|operation in progress",
+                     summ, re.IGNORECASE):
+            return True, "install still running", 0
+
+        entries = _parse_install_summary(summ)
+        if entries:
+            tkey = _norm_ver(target_ver)
+            target_status = entries.get(tkey)
+            blocking = [v for v, s in entries.items()
+                        if v != tkey and s in ("C", "A", "U")]
+            if target_status == "C" and not blocking:
+                return True, "image committed on %s" % target_ver, 0
+            if target_status == "I":
+                return True, "image inactive (added, awaiting activate)", 0
+            if target_status == "U":
+                return True, "image uncommitted (in progress)", 0
+            if target_status == "A":
+                return True, "image activated, commit pending", 0
+            if any(s == "I" for s in entries.values()):
+                return True, "image inactive (added, awaiting activate)", 0
+            if any(s == "U" for s in entries.values()):
+                return True, "image uncommitted (in progress)", 0
+            if any(s == "A" for s in entries.values()):
+                return True, "image activated, commit pending", 0
+
+        try:
+            log = c.send_command("show install log", read_timeout=60)
+            feed_live_log(host, "[probe] show install log\n%s" % log)
+            if not re.search(r"% Invalid input|% Incomplete", log,
+                             re.IGNORECASE):
+                lines = log.splitlines()
+                start_idx = -1
+                for i in range(len(lines) - 1, -1, -1):
+                    if re.search(
+                            r"install_(?:add|activate|commit|remove|"
+                            r"abort|rollback).*?:\s*START",
+                            lines[i], re.IGNORECASE):
+                        start_idx = i
+                        break
+                current = ("\n".join(lines[start_idx:])
+                           if start_idx >= 0 else "\n".join(lines[-40:]))
+                low_cur = current.lower()
+                if re.search(r"install_\w+\]\s*:\s*end\s+failed",
+                             low_cur, re.IGNORECASE):
+                    return False, "install log shows FAILED (current op)", 0
+                if re.search(r"install_\w+\]\s*:\s*end\s+success",
+                             low_cur, re.IGNORECASE):
+                    return True, "install op ended SUCCESS", 0
+                if start_idx >= 0:
+                    return True, "current install op in progress", 0
+        except Exception:
+            pass
+        return True, "indeterminate", prev_indeterminate + 1
+    except Exception as e:
+        err_name = type(e).__name__
+        wlog(host, "Probe: %s: %s -- indeterminate"
+             % (err_name, str(e)[:80]), "WARN")
+        return True, "probe error (%s)" % err_name, prev_indeterminate + 1
+    finally:
+        if c:
+            try: c.disconnect()
+            except Exception: pass
+
+
+def _safe_manual_reload(conn, host):
+    wlog(host, "Issuing manual reload (fallback)", "STEP")
+    try:
+        drain_channel(conn, 2, host=host)
+        set_cmd(host, "reload")
+        conn.write_channel("reload\n")
+        buffer = ""
+        deadline = time.time() + 90
+        sent_save_no = sent_confirm = False
+        while time.time() < deadline:
+            try: chunk = conn.read_channel()
+            except Exception: break
+            if not chunk:
+                time.sleep(0.5); continue
+            feed_live_log(host, chunk)
+            buffer = (buffer + chunk)[-2000:]
+            low = buffer.lower()
+            if any(k in low for k in _RELOAD_MARKERS):
+                wlog(host, "Reload accepted by switch", "OK")
+                return True
+            if (not sent_save_no
+                    and ("system configuration has been modified" in low
+                         or "save?" in low)):
+                conn.write_channel("no\n"); sent_save_no = True
+                time.sleep(1); buffer = ""; continue
+            if (not sent_confirm
+                    and ("proceed with reload" in low
+                         or "[confirm]" in low)):
+                conn.write_channel("\n"); sent_confirm = True
+                time.sleep(1); buffer = ""; continue
+        wlog(host, "Manual reload did not confirm", "WARN")
+        return False
+    except Exception as e:
+        wlog(host, "Manual reload error: %s" % str(e)[:80], "WARN")
+        return False
+
+
+def run_install(conn, cmd, host, state, ip, user, pw, target_ver,
+                is_issu=False, fw_file=None):
+    set_state(host, "INSTALL", "starting")
+    set_cmd(host, cmd)
+    state["install_started"] = True
+    state["last_probe"] = 0.0
+    state["indeterminate_streak"] = 0
+    state["last_probe_msg"] = ""
+    state["probe_msg_counts"] = {}
+    state["activate_nudged"] = False
+    state["activate_attempts"] = 0
+    state.setdefault("add_seen", False)
+    state.setdefault("activate_seen", False)
+    state.setdefault("commit_seen", False)
+    state.setdefault("op_success_probes", 0)
+    state.setdefault("commit_nudge_count", 0)
+    if fw_file is None:
+        m = re.search(r"flash:(\S+\.bin)", cmd)
+        if m: fw_file = m.group(1)
+    drain_channel(conn, 5, host=host)
+    wlog(host, "INSTALL: %s" % cmd, "CMD")
+    try:
+        conn.write_channel(cmd + "\n")
+    except Exception as e:
+        return False, "write failed: %s" % e, conn
+    start = time.time()
+    last_output = time.time()
+    buffer, last_y = "", 0.0
+    success = reload_seen = False
+    success_at = None
+    _DONE = ("already on ", "image committed on ")
+
+    def _close_and_return(ok, msg, rebooted=True):
+        if rebooted:
+            state["reboot_detected"] = True
+        try: conn.disconnect()
+        except Exception: pass
+        return ok, msg, None
+
+    while time.time() - start < INSTALL_TOTAL_TIMEOUT:
+        if SHUTDOWN_REQ.is_set():
+            return False, "shutdown requested", conn
+        try:
+            chunk = conn.read_channel()
+            if chunk: feed_live_log(host, chunk)
+        except Exception as e:
+            emsg = str(e).lower()
+            if success or reload_seen:
+                wlog(host, "Session closed after install -- reboot in progress",
+                     "OK")
+                return _close_and_return(True, "", rebooted=True)
+            if ("tacacs" in emsg or "authorization failed" in emsg
+                    or "command authorization" in emsg):
+                wlog(host, "TACACS+ dropped session: %s" % str(e)[:80],
+                     "ERROR")
+                try: conn.disconnect()
+                except Exception: pass
+                return False, "TACACS+ dropped session", None
+            wlog(host, "Install session lost: %s" % str(e)[:80], "WARN")
+            try: conn.disconnect()
+            except Exception: pass
+            new_conn = robust_reconnect(ip, user, pw, host,
+                                        purpose="mid-install")
+            if not new_conn:
+                return _close_and_return(True, "", rebooted=True)
+            try:
+                if committed_on_target(new_conn, target_ver):
+                    wlog(host, "Target committed after reconnect", "OK")
+                    return True, "", new_conn
+            except Exception:
                 pass
-        SHUTDOWN_REQ.wait(delay)
+            return False, "install session lost; state unknown", new_conn
+        if chunk:
+            last_output = time.time()
+            buffer = (buffer + chunk)[-4000:]
+            low = buffer.lower()
+            for k in _AUTHZ_MARKERS:
+                if k in low: return False, "TACACS+ denied command", conn
+            for k in _REJECT_MARKERS:
+                if k in low:
+                    return False, "command rejected (%s)" % k, conn
+            for k in _SPACE_MARKERS:
+                if k in low:
+                    msg = ("insufficient_space: install engine rejected "
+                           "install add: %s" % k)
+                    wlog(host, "  %s" % msg, "ERROR")
+                    return False, msg, conn
+            if any(k in low for k in _ALREADY_ADDED_MARKERS):
+                return False, ("already_added_refused: engine refused "
+                               "add because .pkg set is already on flash"), conn
+            if re.search(r"failed:\s*install", low):
+                return False, "install reported FAILED", conn
+            tail = low[-400:]
+            hit = next((p for p in _PROMPT_MARKERS if p in tail), None)
+            if hit and time.time() - last_y > 10:
+                conn.write_channel("y\n"); last_y = time.time()
+                buffer = ""
+                wlog(host, "Prompt ('%s') -> y" % hit, "OK")
+                continue
+            if any(k in low for k in _RELOAD_MARKERS):
+                reload_seen = True
+                state["reboot_detected"] = True
+            if re.search(r"success:\s*install_add", low) \
+                    and not state["add_seen"]:
+                state["add_seen"] = True
+                wlog(host, "Install add SUCCESS", "OK")
+            if re.search(r"success:\s*install_activate", low) \
+                    and not state["activate_seen"]:
+                state["activate_seen"] = True
+                wlog(host, "Install activate SUCCESS", "OK")
+                if is_issu and not success:
+                    success = True; success_at = time.time()
+            if re.search(r"success:\s*install_commit", low) \
+                    and not state["commit_seen"]:
+                state["commit_seen"] = True
+                success = True; success_at = time.time()
+                wlog(host, "Install commit SUCCESS", "OK")
+
+        if success and is_issu:
+            set_state(host, "INSTALL", "ISSU verify")
+            deadline = time.time() + ISSU_VERIFY_TIMEOUT
+            consecutive_errs = 0
+            while time.time() < deadline:
+                if SHUTDOWN_REQ.is_set():
+                    return False, "shutdown requested", conn
+                time.sleep(20)
+                try:
+                    if committed_on_target(conn, target_ver):
+                        wlog(host, "ISSU complete -- no reload", "OK")
+                        return True, "", conn
+                    consecutive_errs = 0
+                except Exception as e:
+                    consecutive_errs += 1
+                    wlog(host, "ISSU verify error (%d/%d): %s"
+                         % (consecutive_errs, ISSU_VERIFY_MAX_ERRORS,
+                            str(e)[:80]), "WARN")
+                    if consecutive_errs >= ISSU_VERIFY_MAX_ERRORS:
+                        return (False,
+                                "ISSU verify failed %dx consecutively: %s"
+                                % (ISSU_VERIFY_MAX_ERRORS, str(e)[:80]),
+                                conn)
+            return False, "ISSU never committed within timeout", conn
+
+        if reload_seen and not is_issu:
+            time.sleep(3)
+            return _close_and_return(True, "", rebooted=True)
+
+        if success and not is_issu and time.time() - success_at > 180:
+            already_on_target = False
+            try:
+                vo = conn.send_command("show version | include Version",
+                                       read_timeout=30)
+                if _norm_ver(parse_running_version(vo)) \
+                        == _norm_ver(target_ver):
+                    already_on_target = True
+                    wlog(host, "Already on target after commit -- no reload "
+                               "needed", "OK")
+            except Exception:
+                pass
+            if already_on_target:
+                return _close_and_return(True, "", rebooted=False)
+            wlog(host, "Commit seen but device not yet on target after 180s "
+                       "-- issuing manual reload", "WARN")
+            _safe_manual_reload(conn, host)
+            return _close_and_return(True, "", rebooted=True)
+
+        if not chunk:
+            silence = time.time() - last_output
+            if (not success and silence > INSTALL_PROBE_INTERVAL
+                    and time.time() - state.get("last_probe", 0)
+                        > INSTALL_PROBE_INTERVAL):
+                state["last_probe"] = time.time()
+                set_state(host, "INSTALL",
+                          "probe (silent %ds)" % int(silence))
+                wlog(host, "Install silent %ds -- probing status"
+                     % int(silence), "INFO")
+                streak = state.get("indeterminate_streak", 0)
+                probe_ok, probe_msg, new_streak = _probe_install_status(
+                    ip, user, pw, host, target_ver, streak)
+                state["indeterminate_streak"] = new_streak
+                cnts = state["probe_msg_counts"]
+                cnts[probe_msg] = cnts.get(probe_msg, 0) + 1
+                same_total = cnts[probe_msg]
+                if probe_ok and any(m in probe_msg for m in _DONE):
+                    wlog(host, "Probe confirms on target -- exiting "
+                               "install loop", "OK")
+                    return _close_and_return(True, "", rebooted=False)
+                if probe_ok and new_streak == 0:
+                    prev_msg = state.get("last_probe_msg")
+                    state["last_probe_msg"] = probe_msg
+                    if probe_msg != prev_msg:
+                        last_output = time.time()
+                    if "image inactive" in probe_msg:
+                        try:
+                            if _state_needs_precommit(conn, host):
+                                wlog(host, "  probe found U state -- "
+                                           "pre-committing first", "WARN")
+                                ok_pc, err_pc = \
+                                    _run_install_commit_for_precommit(
+                                        conn, host)
+                                if not ok_pc:
+                                    wlog(host, "  pre-commit failed: %s"
+                                         % err_pc, "WARN")
+                        except Exception:
+                            pass
+                        state["activate_attempts"] += 1
+                        if state["activate_attempts"] == 1:
+                            accepted = _nudge_install_activate(
+                                conn, host, fw_file)
+                        else:
+                            accepted = _try_all_activate_forms(
+                                conn, host, fw_file)
+                        if accepted:
+                            state["activate_nudged"] = True
+                            last_output = time.time()
+                            dead = False
+                            try:
+                                tr = getattr(conn, "remote_conn", None)
+                                tr = getattr(tr, "transport", None)
+                                if tr is None or not tr.is_active():
+                                    dead = True
+                            except Exception:
+                                dead = True
+                            if dead:
+                                wlog(host, "  activate nudged, transport "
+                                           "inactive -- reload in progress",
+                                     "OK")
+                                return _close_and_return(
+                                    True, "", rebooted=True)
+                            try:
+                                conn.read_channel()
+                            except Exception:
+                                wlog(host, "  activate nudged, session "
+                                           "closed -- reload in progress",
+                                     "OK")
+                                return _close_and_return(
+                                    True, "", rebooted=True)
+                        elif state["activate_attempts"] >= 3:
+                            _run_install_abort_and_reissue(
+                                conn, host, fw_file)
+                            state["activate_attempts"] = 0
+                            last_output = time.time()
+                    elif ("image uncommitted" in probe_msg
+                          or "commit pending" in probe_msg):
+                        try:
+                            if _state_needs_precommit(conn, host):
+                                wlog(host, "  probe found U state -- "
+                                           "pre-committing", "WARN")
+                                _run_install_commit_for_precommit(
+                                    conn, host)
+                        except Exception:
+                            pass
+                        state["commit_nudge_count"] += 1
+                        if state["commit_nudge_count"] >= 3:
+                            wlog(host, "  Uncommitted -- nudging "
+                                       "install commit", "WARN")
+                            try:
+                                conn.write_channel("install commit\n")
+                                time.sleep(3)
+                                try: conn.read_channel()
+                                except Exception: pass
+                            except Exception as e:
+                                wlog(host, "  commit nudge failed: %s"
+                                     % str(e)[:80], "WARN")
+                            state["commit_nudge_count"] = 0
+                    elif "install op ended SUCCESS" in probe_msg:
+                        state["op_success_probes"] += 1
+                        if state["op_success_probes"] >= 5:
+                            try:
+                                vo = conn.send_command(
+                                    "show version | include Version",
+                                    read_timeout=30)
+                                if _norm_ver(parse_running_version(vo)) \
+                                        == _norm_ver(target_ver):
+                                    wlog(host, "Version on target after "
+                                               "add-success -- exiting", "OK")
+                                    return _close_and_return(True, "",
+                                                             rebooted=False)
+                            except Exception:
+                                pass
+                            state["op_success_probes"] = 0
+                if same_total >= 12:
+                    wlog(host, "Probe returned '%s' %d times -- forcing "
+                               "version check" % (probe_msg, same_total),
+                         "WARN")
+                    try:
+                        vo = conn.send_command(
+                            "show version | include Version",
+                            read_timeout=30)
+                        if _norm_ver(parse_running_version(vo)) \
+                                == _norm_ver(target_ver):
+                            wlog(host, "Version on target -- exiting "
+                                       "install loop", "OK")
+                            return _close_and_return(True, "",
+                                                     rebooted=False)
+                    except Exception:
+                        pass
+                    return (False,
+                            "install stuck on '%s' for %d probes"
+                            % (probe_msg, same_total), conn)
+                if probe_ok and new_streak != 0:
+                    wlog(host, "Probe: %s (streak %d)"
+                         % (probe_msg, new_streak), "WARN")
+                    if new_streak >= 10:
+                        return (False,
+                                "install never started (indeterminate "
+                                "for %ds)"
+                                % (new_streak * INSTALL_PROBE_INTERVAL),
+                                conn)
+                elif not probe_ok:
+                    wlog(host, "Probe failed: %s" % probe_msg, "WARN")
+                    return False, "install probe: %s" % probe_msg, conn
+            if not success and silence > INSTALL_SILENT_TIMEOUT:
+                return (False,
+                        "no install output for %ds" % INSTALL_SILENT_TIMEOUT,
+                        conn)
+            time.sleep(0.5)
+    return False, "install timeout", conn
+
+
+def _issue_rollback_commands(conn, host):
+    for cmd in ("install rollback to committed", "install rollback to base"):
+        try:
+            drain_channel(conn, 2, host=host)
+            set_cmd(host, cmd)
+            conn.write_channel(cmd + "\n")
+            time.sleep(3)
+            got = ""
+            try: got = conn.read_channel() or ""
+            except Exception: pass
+            feed_live_log(host, got)
+            low = got.lower()
+            if ("% invalid input" in low or "unrecognized" in low
+                    or "% incomplete" in low):
+                wlog(host, "  %s not accepted -- trying alternate" % cmd,
+                     "WARN")
+                continue
+            return True, cmd
+        except Exception as e:
+            wlog(host, "  %s error: %s" % (cmd, str(e)[:80]), "WARN")
+    return False, ""
+
+
+def attempt_rollback(conn, host, ip=None, user=None, pw=None,
+                     original_version=None):
+    if not PRESERVE_ROLLBACK:
+        wlog(host, "Rollback impossible: old packages not preserved", "ERROR")
+        return False
+    wlog(host, "AUTO-ROLLBACK", "STEP")
+    set_state(host, "ROLLBACK", "issuing")
+    issued = False
+    ok, cmd = _issue_rollback_commands(conn, host)
+    if not ok:
+        wlog(host, "Neither rollback syntax accepted", "ERROR")
+        return False
+    wlog(host, "Rollback accepted: %s" % cmd, "OK")
+    try:
+        buffer, last_y = "", 0.0
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            try: chunk = conn.read_channel()
+            except Exception:
+                wlog(host, "Session closed during rollback -- reloading", "OK")
+                issued = True; break
+            if chunk:
+                feed_live_log(host, chunk)
+                buffer = (buffer + chunk)[-3000:]
+                low = buffer.lower()
+                if re.search(r"failed:\s*install", low):
+                    wlog(host, "Rollback FAILED", "ERROR"); return False
+                if any(k in low for k in ("initiating reload",
+                                          "reload requested",
+                                          "restarting system", "will reload")):
+                    issued = True; break
+                if (re.search(r"\[y/n\]|\(y/n\)|do you want to proceed",
+                              low[-300:]) and time.time() - last_y > 10):
+                    conn.write_channel("y\n"); last_y = time.time()
+                    buffer = ""; continue
+            time.sleep(0.5)
+    except Exception as e:
+        wlog(host, "Rollback error: %s" % str(e)[:100], "ERROR")
+    if not issued: return False
+    if not (ip and user and pw and original_version): return True
+    wlog(host, "Waiting for rollback reboot (target %s)" % original_version,
+         "INFO")
+    try:
+        try: conn.disconnect()
+        except Exception: pass
+        if not wait_for_ping_down(ip, host, timeout_sec=PING_DOWN_TIMEOUT_SEC):
+            wlog(host, "Switch never went down after rollback", "WARN")
+        if not wait_for_ping_up(ip, host, timeout_sec=PING_UP_TIMEOUT_SEC):
+            wlog(host, "Switch did not come back", "ERROR")
+            return False
+        if not wait_for_ssh_ready(ip, host):
+            wlog(host, "SSH not ready after rollback", "ERROR")
+            return False
+        c2 = robust_reconnect(ip, user, pw, host,
+                              purpose="post-rollback verify")
+        if not c2:
+            wlog(host, "Reconnect failed after rollback", "ERROR")
+            return False
+        try:
+            out = c2.send_command("show version | include Version",
+                                  read_timeout=60)
+            feed_live_log(host, "[rollback-verify] show version\n%s" % out)
+            if _norm_ver(parse_running_version(out)) \
+                    == _norm_ver(original_version):
+                wlog(host, "Rollback verified -- back on %s"
+                     % original_version, "OK")
+                return True
+            wlog(host, "Rollback did NOT restore %s" % original_version,
+                 "ERROR")
+            return False
+        finally:
+            try: c2.disconnect()
+            except Exception: pass
+    except Exception as e:
+        wlog(host, "Rollback verify error: %s" % str(e)[:100], "ERROR")
+        return False
+
+
+def _verify_after_reboot_impl(conn, ip, target_ver, host, user, pw, st,
+                              pre_config, fw_file):
+    try:
+        out = conn.send_command("show version | include Version")
+        feed_live_log(host, "[verify] show version\n%s" % out)
+        st["post_version"] = parse_running_version(out)
+        if _norm_ver(st["post_version"]) != _norm_ver(target_ver):
+            st["error"] = ("version mismatch: %s != %s"
+                           % (st.get("post_version") or '?', target_ver))
+            wlog(host, st["error"], "ERROR")
+            if AUTO_ROLLBACK_ON_FAIL and st.get("reboot_detected"):
+                if attempt_rollback(conn, host, ip=ip, user=user, pw=pw,
+                                    original_version=st.get("start_version",
+                                                            "")):
+                    st["error"] += " (auto-rollback issued and verified)"
+                else:
+                    st["error"] += " (auto-rollback FAILED)"
+            return False
+        drain_syslog_after_reboot(conn, host)
+
+        if not _finalize_install_commit(conn, host, target_ver,
+                                        fw_file=fw_file or ""):
+            st["error"] = "commit could not be verified"
+            st["verify_pending"] = True
+            wlog(host, "  upgrade NOT durable -- commit missing. "
+                       "Device will revert on next reload.", "ERROR")
+            return False
+        wlog(host, "  commit finalized -- upgrade is durable", "OK")
+
+        issues = []
+        for i in range(1, HEALTH_RETRIES + 1):
+            ok, issues = post_upgrade_health_check(conn, host, target_ver)
+            if ok: break
+            wlog(host, "Health %d/%d: %s"
+                 % (i, HEALTH_RETRIES, "; ".join(issues)), "WARN")
+            if i < HEALTH_RETRIES: time.sleep(HEALTH_RETRY_DELAY_SEC)
+        else:
+            st["error"] = "health check failed: " + "; ".join(issues)
+            wlog(host, st["error"], "ERROR")
+            st["verify_pending"] = True
+            return False
+        if pre_config and not SKIP_CONFIG_DRIFT_CHECK:
+            try:
+                post_cfg = conn.send_command("show running-config",
+                                             read_timeout=120)
+                drift = config_drift_check(pre_config, post_cfg, host)
+                if drift:
+                    st["drift"] = drift[:20]
+                    st["config_diff_lines"] = len(drift)
+            except Exception as e:
+                wlog(host, "Config drift check skipped: %s" % str(e)[:80],
+                     "WARN")
+        wlog(host, "Upgrade verified on %s" % target_ver, "OK")
+        try: post_upgrade_cleanup(conn, host)
+        except Exception as e:
+            wlog(host, "Cleanup non-fatal: %s" % str(e)[:80], "WARN")
+        return True
+    except Exception as e:
+        st["error"] = "post-reboot verify error: %s" % str(e)[:150]
+        st["verify_pending"] = True
+        return False
+
+
+def wait_reboot_and_verify(ip, target_ver, host, user, pw, st, is_issu=False,
+                           pre_config="", fw_file=""):
+    if not is_issu and ssh_port_open(ip, 3):
+        peek = None
+        try:
+            peek = do_connect(ip, user, pw)
+            vo = peek.send_command("show version | include Version",
+                                   read_timeout=30)
+            if _norm_ver(parse_running_version(vo)) \
+                    == _norm_ver(target_ver):
+                wlog(host, "Device already on target (fast reboot) -- "
+                           "skipping ping-down wait", "OK")
+                st["reboot_detected"] = True
+                set_state(host, "VERIFY", "post-upgrade")
+                return _verify_after_reboot_impl(
+                    peek, ip, target_ver, host, user, pw, st,
+                    pre_config, fw_file)
+        except Exception as e:
+            wlog(host, "  fast-reboot probe skipped: %s" % str(e)[:80],
+                 "WARN")
+        finally:
+            if peek is not None:
+                try: peek.disconnect()
+                except Exception: pass
+
+    if is_issu:
+        wlog(host, "ISSU path -- skipping reboot wait", "INFO")
+        set_state(host, "VERIFY", "post-ISSU")
+    else:
+        set_state(host, "REBOOT", "wait down")
+        set_cmd(host, "ping (wait down)")
+        went_down = wait_for_ping_down(ip, host)
+        if not went_down:
+            wlog(host, "Device did not go down -- checking anyway", "WARN")
+        set_state(host, "REBOOT", "wait up")
+        came_back = wait_for_ping_up(ip, host)
+        if not came_back:
+            st["error"] = "device did not return after reboot"
+            st["verify_pending"] = True
+            return False
+        if not wait_for_ping_stable(ip, host):
+            st["error"] = "boot loop detected (ping flapping)"
+            st["verify_pending"] = True
+            return False
+        set_state(host, "REBOOT", "wait ssh")
+        set_cmd(host, "ssh reconnect")
+        if not wait_for_ssh_ready(ip, host):
+            st["error"] = "SSH did not return"
+            st["verify_pending"] = True
+            return False
+        wlog(host, "Settling %ds before verification"
+             % POST_REBOOT_SETTLE_SEC, "INFO")
+        set_state(host, "REBOOT", "settling")
+        time.sleep(POST_REBOOT_SETTLE_SEC)
+    set_state(host, "VERIFY", "post-upgrade")
+    conn = robust_reconnect(ip, user, pw, host,
+                            max_attempts=POST_REBOOT_MAX_ATTEMPTS,
+                            delay=POST_REBOOT_DELAY_SEC, purpose="post-reboot")
+    if not conn:
+        st["error"] = "could not reconnect after reboot"
+        st["verify_pending"] = True
+        return False
+    try:
+        return _verify_after_reboot_impl(
+            conn, ip, target_ver, host, user, pw, st,
+            pre_config, fw_file)
+    finally:
+        try: conn.disconnect()
+        except Exception: pass
+
+
+def transfer_worker(dev, user, pw, location_name=""):
+    loc = location_name or dev.get("_location", "")
+    host, ip = dev["hostname"], dev["ip"]
+    set_state(host, "QUEUE", "waiting slot")
+    result = {"dev": dev, "success": False, "error": "", "fw_file": "",
+              "target_ver": "", "start_ver": "", "skipped": False,
+              "pre_config": "", "clock_corrected": False}
+    conn = None
+    model = ""
+    if SHUTDOWN_REQ.is_set():
+        result["error"] = "shutdown requested"; return result
+    if DO_RESET_DEVICE_LOGS and not DRY_RUN: reset_device_logs(host)
+    if loc: _update_checkpoint(loc, host, "transfer_start")
+    try:
+        try:
+            conn = do_connect(ip, user, pw)
+        except Exception as e:
+            tag = _classify_connect_error(e)
+            if tag:
+                wlog(host, "%s: %s" % (tag, str(e)[:160]), "ERROR")
+                result["error"] = tag
+                if loc: _update_checkpoint(loc, host, "failed", tag)
+                return result
+            raise
+        tacacs_enable(conn, host, ssh_pw=pw)
+        try: conn.set_base_prompt()
+        except Exception: pass
+        if not is_privileged(conn):
+            result["error"] = "not priv 15"
+            if loc: _update_checkpoint(loc, host, "failed", "not priv 15")
+            return result
+        model = get_model(conn)
+        fw = pick_firmware(model)
+        if not fw:
+            result["error"] = "unsupported model '%s'" % model
+            wlog(host, "Unsupported model '%s' -- refusing" % model, "ERROR")
+            if loc: _update_checkpoint(loc, host, "failed", result["error"])
+            return result
+        fw_file, target_ver = fw
+        result["fw_file"], result["target_ver"] = fw_file, target_ver
+        if _is_large_model(model) and SERIAL_TRANSFER_LARGE_MODELS:
+            wlog(host, "Large model %s -- pool sized by LARGE_MODEL_PARALLEL=%d"
+                 % (model, LARGE_MODEL_PARALLEL), "INFO")
+        try:
+            cnt, states = _stack_member_count(conn, host)
+            if cnt > 1:
+                wlog(host, "  Stack: %d members -- %s" % (cnt, states),
+                     "INFO")
+        except Exception: pass
+        ok, reason, current_ver, clock_fixed = precheck_device(
+            conn, host, fw_file, target_ver)
+        result["start_ver"] = current_ver
+        result["clock_corrected"] = clock_fixed
+        if not ok:
+            result["error"] = reason
+            if loc: _update_checkpoint(loc, host, "failed", reason)
+            return result
+        if reason == "already_on_target":
+            result["success"] = True; result["skipped"] = True
+            if loc: _update_checkpoint(loc, host, "verified",
+                                       "already_on_target")
+            return result
+
+        if reason == "already_added_needs_activate":
+            result["success"] = True
+            result["already_added"] = True
+            if loc: _update_checkpoint(loc, host, "transferred")
+            wlog(host, "TARGET .PKG SET PRESENT -- SKIPPING TRANSFER "
+                       "AND PURGE", "OK")
+            set_state(host, "READY", "activate pending")
+            return result
+
+        if reason.startswith("already_on_target_needs_"):
+            needs_finalize = "needs_finalize" in reason
+            needs_cleanup = "needs_cleanup" in reason
+            wlog(host, "POST-UPGRADE FIXUP (%s)" % reason, "OK")
+            set_state(host, "VERIFY", "fixup")
+            fix_ok = True
+            if needs_finalize:
+                if not _finalize_install_commit(conn, host, target_ver,
+                                                fw_file=fw_file):
+                    result["error"] = ("fixup: commit could not be "
+                                       "verified")
+                    result["success"] = False
+                    fix_ok = False
+            if fix_ok and needs_cleanup:
+                set_state(host, "VERIFY", "revert temp config")
+                ok_count, fail_count, _unknown = revert_device_temp_changes(
+                    conn, host)
+                if fail_count:
+                    wlog(host, "  revert partial: ok=%d fail=%d"
+                         % (ok_count, fail_count), "WARN")
+                else:
+                    wlog(host, "  residual temp config reverted", "OK")
+                try:
+                    conn.send_command("write memory", read_timeout=60)
+                except Exception:
+                    pass
+            if fix_ok:
+                result["success"] = True
+                result["fixup_done"] = True
+                set_state(host, "DONE", "fixup complete")
+                if loc: _update_checkpoint(loc, host, "verified", "fixup")
+                wlog(host, "fixup complete -- device secured and durable",
+                     "OK")
+            return result
+
+        if DO_BACKUP and not DRY_RUN:
+            try:
+                cfg = conn.send_command("show running-config",
+                                        read_timeout=120)
+                result["pre_config"] = cfg
+                fn = ("%s_%s_%s.cfg"
+                      % (host, current_ver,
+                         datetime.now().strftime("%Y%m%d_%H%M%S")))
+                with open(os.path.join(BACKUP_DIR, fn), "w",
+                          encoding="utf-8") as f:
+                    f.write(cfg)
+                wlog(host, "Backup saved: %s" % fn, "OK")
+            except Exception as e:
+                wlog(host, "Backup skipped: %s" % e, "WARN")
+        if PRE_SAVE_CONFIG and not DRY_RUN:
+            try:
+                wr = conn.send_command("write memory", read_timeout=60)
+                if "error" in wr.lower() or "fail" in wr.lower():
+                    wlog(host, "Pre-temp write memory: %s"
+                         % wr.strip()[:80], "WARN")
+            except Exception as e:
+                wlog(host, "Pre-temp write memory error: %s" % str(e)[:80],
+                     "WARN")
+        fw_already_present = False
+        if not DRY_RUN:
+            tune_ssh_for_bulk_transfer(conn, host, model)
+            apply_cheap_crypto_tuning(conn, host, model)
+            if not ensure_scp_server_enabled(conn, host):
+                result["error"] = "scp server enable failed"
+                if loc:
+                    _update_checkpoint(loc, host, "failed", result["error"])
+                return result
+            if not any(ch.get("type") == "exec_timeout"
+                       for ch in get_temp_changes(host)):
+                orig = get_vty_exec_timeout(conn, host)
+                if orig:
+                    all_already = all(
+                        b.get("minutes") == 60 and b.get("seconds") == 0
+                        for b in orig["blocks"]
+                        if not b.get("was_default"))
+                    if all_already and orig["blocks"]:
+                        wlog(host, "  exec-timeout already 60 0 -- skipping",
+                             "INFO")
+                    else:
+                        try:
+                            track_temp_change(host, "exec_timeout", orig)
+                            cmds = []
+                            for b in orig["blocks"]:
+                                cmds += ["line vty %s" % b["vty"],
+                                         "exec-timeout 60 0", "exit"]
+                            conn.send_config_set(cmds)
+                            wlog(host, "Temp exec-timeout 60 0 set", "INFO")
+                        except Exception as e:
+                            wlog(host, "Failed temp exec-timeout: %s" % e,
+                                 "WARN")
+                else:
+                    wlog(host, "Could not read VTY config -- skipping", "WARN")
+            try:
+                wlog(host, "Saving config (install precondition)...", "INFO")
+                wr = conn.send_command("write memory", read_timeout=120)
+                if "error" in wr.lower() or "fail" in wr.lower():
+                    wlog(host, "write memory: %s" % wr.strip()[:80], "WARN")
+                else:
+                    wlog(host, "Config saved", "OK")
+            except Exception as e:
+                wlog(host, "write memory failed: %s" % str(e)[:80], "WARN")
+            if file_in_flash(conn, fw_file):
+                if validate_transfer_size(conn, host, fw_file):
+                    wlog(host, "%s already in flash -- skipping transfer"
+                         % fw_file, "OK")
+                    fw_already_present = True
+                else:
+                    wlog(host, "%s present but wrong size -- wiping"
+                         % fw_file, "WARN")
+                    _delete_firmware_from_flash(conn, host, fw_file)
+            else:
+                wlog(host, "  %s not in flash -- will transfer" % fw_file,
+                     "INFO")
+        try: conn.disconnect()
+        except Exception: pass
+        conn = None
+        if fw_already_present:
+            result["success"] = True
+            if not QUIET_SKIPPED:
+                wlog(host, "DEVICE READY FOR INSTALL", "OK")
+            set_state(host, "READY", "handing to install pool")
+            if loc: _update_checkpoint(loc, host, "transferred")
+            return result
+        if DRY_RUN:
+            wlog(host, "DRY-RUN: skipping transfer retry logic", "INFO")
+            result["success"] = True; return result
+        if not _transfer_with_wipe_retry(ip, user, pw, fw_file, host,
+                                         model=model):
+            result["error"] = ("transfer failed after %d attempts"
+                               % TRANSFER_RETRY_ATTEMPTS)
+            if loc: _update_checkpoint(loc, host, "failed", result["error"])
+            return result
+
+        if ALLOW_ACTIVE_PKG_PURGE and not DRY_RUN:
+            conn2 = None
+            try:
+                conn2 = robust_reconnect(ip, user, pw, host,
+                                         purpose="post-transfer pkg purge")
+                if conn2:
+                    fw_size = get_firmware_size(fw_file)
+                    extraction = int(fw_size * EXTRACTION_OVERHEAD_FACTOR)
+                    need = extraction + STACK_MEMBER_HEADROOM
+                    free = get_flash_free_bytes(conn2)
+                    if free < need:
+                        wlog(host, "  Space still tight (%.0f MB < %.0f MB) "
+                                   "-- invoking active-pkg purge"
+                             % (free/1e6, need/1e6), "WARN")
+                        set_state(host, "PKG-PURGE", "active .pkg purge")
+                        _ok, _msg = _pre_install_pkg_purge(
+                            conn2, host, fw_file, target_ver)
+                        wlog(host, "  active-pkg purge: %s" % _msg,
+                             "OK" if _ok else "WARN")
+                    else:
+                        wlog(host, "  Space OK (%.0f MB >= %.0f MB) -- "
+                                   "skipping active-pkg purge"
+                             % (free/1e6, need/1e6), "INFO")
+            except Exception as e:
+                wlog(host, "  post-transfer pkg purge error: %s"
+                     % str(e)[:120], "WARN")
+            finally:
+                if conn2:
+                    try: conn2.disconnect()
+                    except Exception: pass
+
+        result["success"] = True
+        if not QUIET_SKIPPED:
+            wlog(host, "DEVICE READY FOR INSTALL", "OK")
+        set_state(host, "READY", "handing to install pool")
+        if loc: _update_checkpoint(loc, host, "transferred")
+        return result
+    except Exception as e:
+        result["error"] = str(e)[:200]
+        if loc: _update_checkpoint(loc, host, "failed", result["error"])
+        return result
+    finally:
+        if conn:
+            try: conn.disconnect()
+            except Exception: pass
+
+
+def install_worker(dev, user, pw, transfer_result, location_name=""):
+    loc = location_name or dev.get("_location", "")
+    host, ip = dev["hostname"], dev["ip"]
+    fw_file = transfer_result["fw_file"]
+    target_ver = transfer_result["target_ver"]
+    start_ver = transfer_result.get("start_ver", "")
+    pre_config = transfer_result.get("pre_config", "")
+    st = {"hostname": host, "ip": ip, "start_version": start_ver,
+          "target_version": target_ver, "fw_file": fw_file,
+          "status": "failed", "duration_sec": 0,
+          "md5_ok": False, "install_started": False, "reboot_detected": False,
+          "post_version": "", "error": "", "verify_pending": False,
+          "stage": "install",
+          "clock_corrected": transfer_result.get("clock_corrected", False)}
+    start = time.time()
+    def _fail(msg):
+        st["error"] = msg
+        if loc: _update_checkpoint(loc, host, "failed", msg)
+        return (dev, "failed", time.time() - start, st, msg)
+    if SHUTDOWN_REQ.is_set(): return _fail("shutdown requested")
+    if DRY_RUN:
+        wlog(host, "DRY-RUN: skipping install", "INFO")
+        st["status"] = "success"
+        if loc: _update_checkpoint(loc, host, "verified")
+        return (dev, "success", time.time() - start, st, "")
+
+    if transfer_result.get("already_on_target_fixup"):
+        conn = None
+        try:
+            conn = robust_reconnect(ip, user, pw, host, purpose="fixup")
+            if not conn:
+                return _fail("reconnect failed before fixup")
+            if transfer_result.get("needs_finalize"):
+                set_state(host, "VERIFY", "commit finalize")
+                wlog(host, "FIXUP: install commit", "STEP")
+                if not _finalize_install_commit(conn, host, target_ver,
+                                                fw_file=fw_file):
+                    return _fail("commit could not be verified (fixup)")
+                st["post_version"] = target_ver
+                wlog(host, "commit finalized", "OK")
+            if transfer_result.get("needs_cleanup"):
+                set_state(host, "VERIFY", "revert temp config")
+                wlog(host, "FIXUP: revert residual temp config", "STEP")
+                ok_count, fail_count, _u = revert_device_temp_changes(
+                    conn, host)
+                if fail_count:
+                    wlog(host, "  revert partial: ok=%d fail=%d"
+                         % (ok_count, fail_count), "WARN")
+                else:
+                    wlog(host, "residual temp config reverted", "OK")
+                try:
+                    conn.send_command("write memory", read_timeout=60)
+                except Exception:
+                    pass
+            st["status"] = "success"
+            st["stage"] = "install"
+            if not st.get("post_version"):
+                st["post_version"] = target_ver
+            if loc: _update_checkpoint(loc, host, "verified")
+            return (dev, "success", time.time() - start, st, "")
+        except Exception as e:
+            return _fail(str(e)[:200])
+        finally:
+            if conn:
+                try: conn.disconnect()
+                except Exception: pass
+
+    conn = None
+    try:
+        conn = robust_reconnect(ip, user, pw, host, purpose="install phase")
+        if not conn: return _fail("reconnect failed before install")
+
+        if transfer_result.get("already_added"):
+            wlog(host, "Target .pkg already on flash -- issuing `install "
+                       "activate` then `install commit` (no re-add)", "OK")
+            ok1, err1, conn = _run_install_activate_only(
+                conn, host, st, ip, user, pw, target_ver, fw_file=fw_file)
+            if not ok1:
+                return _fail("activate failed: %s" % err1)
+            ok2, err2, conn = _run_install_commit_only(
+                conn, host, st, ip, user, pw, target_ver)
+            if not ok2:
+                return _fail("commit failed: %s" % err2)
+            if conn:
+                try: conn.disconnect()
+                except Exception: pass
+                conn = None
+            if not wait_reboot_and_verify(ip, target_ver, host, user, pw,
+                                          st, is_issu=False,
+                                          pre_config=pre_config,
+                                          fw_file=fw_file):
+                return (dev, "failed", time.time() - start, st,
+                        st.get("error", ""))
+            st["status"] = "success"
+            if loc: _update_checkpoint(loc, host, "verified")
+            return (dev, "success", time.time() - start, st, "")
+
+        if DO_VERIFY_MD5:
+            set_state(host, "MD5", "verify")
+            set_cmd(host, "verify /md5 flash:%s" % fw_file)
+            local_path = os.path.join(FIRMWARE_DIR, fw_file)
+            if not os.path.isfile(local_path):
+                wlog(host, "  MD5 skipped -- local firmware missing", "WARN")
+            else:
+                expected = cached_md5(local_path)
+                out = ""
+                try:
+                    out = conn.send_command(
+                        "verify /md5 flash:%s" % fw_file,
+                        read_timeout=1800)
+                    feed_live_log(host, "[verify] verify /md5\n%s" % out)
+                except Exception as e:
+                    msg = str(e)
+                    if "Pattern not detected" in msg:
+                        wlog(host, "  MD5 prompt pattern failed -- "
+                                   "retrying with send_command_timing",
+                             "WARN")
+                        try:
+                            out = conn.send_command_timing(
+                                "verify /md5 flash:%s" % fw_file,
+                                read_timeout=1800,
+                                strip_prompt=False,
+                                strip_command=False)
+                            feed_live_log(host,
+                                          "[verify] verify /md5 (timing)\n%s"
+                                          % out)
+                        except Exception as e2:
+                            wlog(host, "  MD5 timing retry failed: %s -- "
+                                       "skipping (non-fatal)"
+                                 % str(e2)[:80], "WARN")
+                            out = ""
+                    else:
+                        wlog(host, "  MD5 verify error: %s -- skipping "
+                                   "(non-fatal)" % msg[:80], "WARN")
+                        out = ""
+                if not out:
+                    wlog(host, "  MD5 not confirmed -- continuing "
+                               "(transfer SHA256 already validated)", "WARN")
+                elif expected.lower() in out.lower():
+                    st["md5_ok"] = True
+                    wlog(host, "MD5 verified", "OK")
+                else:
+                    m = re.search(
+                        r"verify /md5 \([^)]+\)\s*=\s*([0-9a-fA-F]{32})",
+                        out)
+                    if m and m.group(1).lower() != expected.lower():
+                        return _fail("MD5 mismatch: got %s expected %s"
+                                     % (m.group(1).lower(), expected.lower()))
+                    wlog(host, "  MD5 not parseable -- continuing", "WARN")
+
+        issu_ok, issu_reasons = False, ["--skip-issu"]
+        if not SKIP_ISSU:
+            issu_ok, issu_reasons = check_issu_eligibility(conn, host)
+
+        if issu_ok:
+            wlog(host, "ISSU eligible -- zero-downtime path", "OK")
+            install_cmd = ("install add file flash:%s activate issu commit"
+                           % fw_file)
+        else:
+            wlog(host, "ISSU not eligible (%s) -- reload path"
+                 % "; ".join(issu_reasons), "INFO")
+            install_cmd = "install add file flash:%s activate commit" % fw_file
+
+        success, err, conn = run_install(conn, install_cmd, host, st,
+                                         ip, user, pw, target_ver,
+                                         is_issu=issu_ok, fw_file=fw_file)
+        if not success:
+            if err and "already_added_refused" in err:
+                wlog(host, "Engine refused re-add -- switching to "
+                           "activate-only path", "WARN")
+                if conn is None:
+                    conn = robust_reconnect(ip, user, pw, host,
+                                            purpose="activate-only retry")
+                if conn:
+                    ok1, err1, conn = _run_install_activate_only(
+                        conn, host, st, ip, user, pw, target_ver,
+                        fw_file=fw_file)
+                    if ok1:
+                        ok2, err2, conn = _run_install_commit_only(
+                            conn, host, st, ip, user, pw, target_ver)
+                        if ok2:
+                            if conn:
+                                try: conn.disconnect()
+                                except Exception: pass
+                                conn = None
+                            if wait_reboot_and_verify(
+                                    ip, target_ver, host, user, pw, st,
+                                    is_issu=False, pre_config=pre_config,
+                                    fw_file=fw_file):
+                                st["status"] = "success"
+                                if loc:
+                                    _update_checkpoint(loc, host, "verified")
+                                return (dev, "success",
+                                        time.time() - start, st, "")
+                            return (dev, "failed", time.time() - start, st,
+                                    st.get("error", ""))
+                        return _fail("activate-only commit failed: %s" % err2)
+                    return _fail("activate-only failed: %s" % err1)
+                return _fail(err)
+            try:
+                if conn and not st.get("reboot_detected"):
+                    still_running = False
+                    try:
+                        probe_ok, probe_msg, _ = _probe_install_status(
+                            ip, user, pw, host, target_ver)
+                        if probe_ok and "install still running" in probe_msg:
+                            still_running = True
+                            wlog(host, "  Install still running -- skipping "
+                                       "remove-inactive", "WARN")
+                    except Exception: pass
+                    if not still_running:
+                        wlog(host, "  Clearing stale super-package", "INFO")
+                        _run_install_remove_inactive(
+                            conn, host, allow_abort=False)
+            except Exception as e:
+                wlog(host, "  Post-fail cleanup skipped: %s" % str(e)[:80],
+                     "WARN")
+            return _fail(err)
+        if conn:
+            try: conn.disconnect()
+            except Exception: pass
+            conn = None
+        if not wait_reboot_and_verify(ip, target_ver, host, user, pw, st,
+                                      is_issu=issu_ok, pre_config=pre_config,
+                                      fw_file=fw_file):
+            return (dev, "failed", time.time() - start, st,
+                    st.get("error", ""))
+        st["status"] = "success"
+        if loc: _update_checkpoint(loc, host, "verified")
+        return (dev, "success", time.time() - start, st, "")
+    except Exception as e:
+        return _fail(str(e)[:200])
+    finally:
+        if conn:
+            try: conn.disconnect()
+            except Exception: pass
+
+
+def pre_scan_devices(devices, user=None, pw=None):
+    reachable, unreachable = [], []
+    if not devices: return reachable, unreachable
+    def _chk(d):
+        if SHUTDOWN_REQ.is_set(): return d, None, ""
+        ok = ssh_port_open(d["ip"], timeout=5)
+        model = ""
+        if ok and user and pw:
+            c_ = None
+            try:
+                c_ = do_connect(d["ip"], user, pw)
+                tacacs_enable(c_, d["hostname"], ssh_pw=pw)
+                model = get_model(c_) or ""
+            except Exception: model = ""
+            finally:
+                if c_:
+                    try: c_.disconnect()
+                    except Exception: pass
+        return d, ok, model
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        for d, ok, model in ex.map(_chk, devices):
+            if ok is None: continue
+            if model: d["_model"] = model
+            (reachable if ok else unreachable).append(d)
+    small = [d for d in reachable if not _is_large_model(d.get("_model", ""))]
+    large = [d for d in reachable if _is_large_model(d.get("_model", ""))]
+    return small + large, unreachable
+
+
+def _row(dev, status, stage="", error="", st=None, duration=0,
+         attempts=1, transfer=None):
+    st = st or {}; transfer = transfer or {}
+    return {
+        "hostname": dev["hostname"], "ip": dev["ip"], "status": status,
+        "stage": stage,
+        "start_version": st.get("start_version")
+                         or transfer.get("start_ver", ""),
+        "target_version": st.get("target_version")
+                          or transfer.get("target_ver", ""),
+        "post_version": st.get("post_version", ""),
+        "fw_file": st.get("fw_file") or transfer.get("fw_file", ""),
+        "md5_ok": st.get("md5_ok", False),
+        "install_started": st.get("install_started", False),
+        "reboot_detected": st.get("reboot_detected", False),
+        "verify_pending": st.get("verify_pending", False),
+        "clock_corrected": bool(st.get("clock_corrected")
+                                or transfer.get("clock_corrected", False)),
+        "config_diff_lines": st.get("config_diff_lines", 0),
+        "duration_sec": int(duration), "attempts": attempts, "error": error,
+    }
+
+
+def is_retryable(row):
+    if row["status"] != "failed":
+        return False
+    err = (row.get("error") or "").lower()
+    if any(row["error"].startswith(p)
+           for p in NON_RETRYABLE_PREFIXES):
+        return False
+    if row["stage"] == "transfer" and not row["install_started"]:
+        return True
+    if row["stage"] == "install":
+        recoverable = (
+            "image inactive" in err
+            or "install stuck" in err
+            or "cannot activate" in err
+            or "commit could not be verified" in err
+            or "version mismatch" in err
+        )
+        non_recoverable = (
+            "md5 mismatch" in err
+            or "tacacs+ denied" in err
+            or "partial activation" in err
+            or "two committed versions" in err
+            or "insufficient_space" in err
+        )
+        return recoverable and not non_recoverable
+    return False
+
+
+def _collect_transfer_result(fut, dev, results, ifut, install_pool,
+                             user, pw, attempt_no, location_name=""):
+    host = dev["hostname"]
+    try: tr = fut.result()
+    except Exception as e:
+        tr = {"success": False, "error": str(e)[:200], "skipped": False}
+    if not tr.get("success"):
+        results[host] = _row(dev, "failed", "transfer",
+                             tr.get("error", "?"),
+                             attempts=attempt_no, transfer=tr)
+        set_state(host, "FAILED", tr.get("error", "")[:30])
+        return
+    if tr.get("skipped"):
+        results[host] = _row(dev, "skipped", "precheck",
+                             "already on target",
+                             attempts=attempt_no, transfer=tr)
+        clear_state(host)
+        return
+    if tr.get("fixup_done"):
+        results[host] = _row(dev, "success", "verify", "",
+                             attempts=attempt_no, transfer=tr)
+        set_state(host, "DONE", "fixup complete")
+        return
+    ifut[install_pool.submit(install_worker, dev, user, pw, tr,
+                             location_name)] = (dev, tr)
+
+
+def run_pass(devices, user, pw, results, attempt_no, location_name=""):
+    small, large = [], []
+    for d in devices:
+        (large if _is_large_model(d.get("_model", "")) else small).append(d)
+    if not SERIAL_TRANSFER_LARGE_MODELS:
+        small, large = devices, []
+
+    def _model_counts(lst):
+        cnt = {}
+        for d in lst:
+            m = d.get("_model", "unknown")
+            cnt[m] = cnt.get(m, 0) + 1
+        return ", ".join("%s x%d" % (k, v) for k, v in sorted(cnt.items()))
+
+    print("\n  === Transfer plan (pass %d) ===" % attempt_no)
+    if small:
+        print("    Phase 1 -- %d small model(s), parallel=%d [%s]"
+              % (len(small), TRANSFER_SLOTS, _model_counts(small)))
+    if large:
+        print("    Phase 2 -- %d large model(s), parallel=%d [%s]"
+              % (len(large), LARGE_MODEL_PARALLEL, _model_counts(large)))
+    print()
+    master_log("PASS %d plan: small=%d large=%d"
+               % (attempt_no, len(small), len(large)))
+
+    with ThreadPoolExecutor(max_workers=INSTALL_WORKERS,
+                            thread_name_prefix="inst") as ip_:
+        ifut = {}
+
+        def _consume_one(f):
+            pair = ifut.pop(f, None)
+            if pair is None:
+                return
+            d, tr = pair
+            host = d["hostname"]
+            try:
+                _, status, dur, st, err = f.result()
+            except Exception as e:
+                status, dur, st, err = "failed", 0, {}, str(e)[:200]
+            results[host] = _row(
+                d, "success" if status == "success" else "failed",
+                "install", err, st=st, duration=dur,
+                attempts=attempt_no, transfer=tr)
+            set_state(host, "DONE" if status == "success" else "FAILED",
+                      "upgraded" if status == "success" else err[:30])
+
+        def _drain_install(block):
+            keys = list(ifut.keys())
+            if not keys:
+                return
+            if block:
+                for f in as_completed(keys):
+                    _consume_one(f)
+            else:
+                for f in keys:
+                    if f.done():
+                        _consume_one(f)
+
+        def _run_phase(dev_list, workers, prefix):
+            if not dev_list:
+                return
+            with ThreadPoolExecutor(max_workers=max(1, workers),
+                                    thread_name_prefix=prefix) as tp:
+                tfut = {tp.submit(transfer_worker, d, user, pw,
+                                  location_name): d for d in dev_list}
+                pending = set(tfut.keys())
+                while pending:
+                    done, pending = wait(pending, timeout=10,
+                                         return_when=FIRST_COMPLETED)
+                    for f in done:
+                        dev = tfut.pop(f, None)
+                        if dev is None:
+                            continue
+                        _collect_transfer_result(
+                            f, dev, results, ifut, ip_,
+                            user, pw, attempt_no, location_name)
+                    _drain_install(block=False)
+
+        if small:
+            _run_phase(small, TRANSFER_SLOTS, "xfer")
+        if large:
+            workers = max(1, LARGE_MODEL_PARALLEL)
+            master_log("TRANSFER PHASE 2 start: %d large, parallel=%d"
+                       % (len(large), workers))
+            _run_phase(large, workers, "xfer-large")
+            master_log("TRANSFER PHASE 2 end: %d large" % len(large))
+
+        _drain_install(block=True)
+
+
+def _print_location_progress(by_loc, results):
+    print("\n  -- Location progress --")
+    for loc in sorted(by_loc.keys()):
+        total = len(by_loc[loc])
+        done = sum(1 for d in by_loc[loc]
+                   if results.get(d["hostname"], {}).get("status")
+                   in ("success", "skipped", "failed"))
+        succ = sum(1 for d in by_loc[loc]
+                   if results.get(d["hostname"], {}).get("status")
+                   in ("success", "skipped"))
+        fail = sum(1 for d in by_loc[loc]
+                   if results.get(d["hostname"], {}).get("status") == "failed")
+        marker = ("OK" if done == total and fail == 0
+                  else "!!" if fail else "..")
+        print("    %s %-20s %d/%d done (success=%d failed=%d)"
+              % (marker, loc, done, total, succ, fail))
+    print()
+
+
+def _report_fields():
+    return ["hostname", "ip", "status", "stage", "start_version",
+            "target_version", "post_version", "fw_file", "md5_ok",
+            "install_started", "reboot_detected", "verify_pending",
+            "clock_corrected", "config_diff_lines",
+            "duration_sec", "attempts", "error", "revert_verified"]
+
+
+def write_location_report(location_name, results, revert_verify=None,
+                          force=False):
+    key = "%s" % location_name
+    with CSV_WRITTEN_LOCK:
+        if key in CSV_WRITTEN and not force: return None
+        CSV_WRITTEN.add(key)
+    try:
+        os.makedirs(REPORT_DIR, exist_ok=True)
+        csv_path = os.path.join(REPORT_DIR,
+                                "%s_%s.csv" % (location_name, RUN_ID))
+        json_path = os.path.join(REPORT_DIR,
+                                 "%s_%s.json" % (location_name, RUN_ID))
+        fields = _report_fields()
+        for r in results.values():
+            if revert_verify and r["hostname"] in revert_verify:
+                r["revert_verified"] = ("OK"
+                                        if revert_verify[r["hostname"]]["ok"]
+                                        else "FAILED")
+            else: r["revert_verified"] = "N/A"
+        with CSV_LOCK:
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+                w.writeheader()
+                for r in sorted(results.values(),
+                                key=lambda x: x["hostname"]):
+                    w.writerow(r)
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump({"location": location_name, "run_id": RUN_ID,
+                           "revert_verify": revert_verify or {},
+                           "results": sorted(results.values(),
+                                             key=lambda x: x["hostname"])},
+                          f, indent=2)
+        print("  Report: %s" % csv_path)
+        return csv_path
+    except Exception as e:
+        master_log("Report write failed for %s: %s" % (location_name, e))
+        return None
+
+
+def run_location(location_name, devices, user, pw,
+                 resume_checkpoint=False, retry_failed=False):
+    print("\n" + "=" * 70)
+    print("  LOCATION: %s (%d devices)%s%s%s"
+          % (location_name, len(devices),
+             "  [DRY-RUN]" if DRY_RUN else "",
+             "  [RESUME]" if resume_checkpoint else "",
+             "  [RETRY-FAILED]" if retry_failed else ""))
+    print("=" * 70)
+    master_log("LOCATION START: %s devices=%d" % (location_name, len(devices)))
+    if retry_failed:
+        failed_set = _failed_hosts_from_last_report(location_name)
+        if failed_set:
+            print("  Filter: %d host(s) failed last run" % len(failed_set))
+            devices = [d for d in devices if d["hostname"] in failed_set]
+            print("  -> %d device(s) to retry" % len(devices))
+        else: print("  No failed devices from last run -- running full set")
+    if resume_checkpoint:
+        ckpt = _load_checkpoint(location_name)
+        verified = {h for h, v in ckpt.items()
+                    if v.get("stage") == "verified"}
+        if verified:
+            print("  Checkpoint: %d host(s) already verified" % len(verified))
+            devices = [d for d in devices if d["hostname"] not in verified]
+            print("  -> %d device(s) remaining" % len(devices))
+    if not devices:
+        print("  Nothing to do for this location.")
+        return {}, False, {}
+    results, aborted = {}, False
+    revert_verify = {}
+    try:
+        prepare_rollback_doc(devices, location_name)
+        reachable, unreachable = pre_scan_devices(devices, user, pw)
+        for d in unreachable:
+            results[d["hostname"]] = _row(d, "failed", "prescan",
+                                          "unreachable on tcp/22")
+            wlog(d["hostname"], "Unreachable on port 22", "ERROR")
+            _update_checkpoint(location_name, d["hostname"], "failed",
+                               "unreachable")
+        pending, attempt = reachable, 0
+        while pending and not SHUTDOWN_REQ.is_set():
+            attempt += 1
+            run_pass(pending, user, pw, results, attempt, location_name)
+            failed = [d for d in pending
+                      if results[d["hostname"]]["status"] == "failed"]
+            if (attempt == 1 and len(pending) >= ABORT_GATE_MIN_DEVICES
+                    and len(failed) / len(pending) > ABORT_GATE_THRESHOLD):
+                aborted = True
+                print("\n  ABORT GATE: %d/%d failed"
+                      % (len(failed), len(pending)))
+                master_log("ABORT GATE at %s" % location_name)
+                break
+            retry = [d for d in failed
+                     if is_retryable(results[d["hostname"]])]
+            if (not RETRY_FAILED_DEVICES or not retry
+                    or attempt > MAX_RETRIES or SHUTDOWN_REQ.is_set()):
+                break
+            print("\n  Retrying %d device(s) in %ds (retry %d/%d)"
+                  % (len(retry), RETRY_DELAY_SEC, attempt, MAX_RETRIES))
+            SHUTDOWN_REQ.wait(RETRY_DELAY_SEC)
+            pending = retry
+    except Exception as e:
+        master_log("Location %s raised: %s" % (location_name, e))
+        print("\n  Location %s raised: %s" % (location_name, e))
+    finally:
+        for d in devices:
+            results.setdefault(d["hostname"],
+                               _row(d, "failed", "not_run",
+                                    "not processed (shutdown/crash?)"))
+        try:
+            revert_verify = revert_location_temp_changes(devices, user, pw,
+                                                         location_name) or {}
+        except Exception as e:
+            master_log("Revert/verify raised: %s" % e)
+        write_location_report(location_name, results, revert_verify)
+        master_log("LOCATION END: %s" % location_name)
+    return results, aborted, revert_verify
+
+
+def _run_pooled(loc_devices, user, pw,
+                resume_checkpoint=False, retry_failed=False):
+    flat, by_loc = [], {}
+    for loc, devs in loc_devices.items():
+        by_loc[loc] = []
+        for d in devs:
+            td = {"hostname": d["hostname"], "ip": d["ip"], "_location": loc}
+            flat.append(td); by_loc[loc].append(td)
+    if retry_failed:
+        for loc in list(by_loc):
+            fs = _failed_hosts_from_last_report(loc)
+            if fs:
+                by_loc[loc] = [d for d in by_loc[loc]
+                               if d["hostname"] in fs]
+        flat = [d for loc in by_loc for d in by_loc[loc]]
+    if resume_checkpoint:
+        for loc in list(by_loc):
+            ckpt = _load_checkpoint(loc)
+            verified = {h for h, v in ckpt.items()
+                        if v.get("stage") == "verified"}
+            if verified:
+                by_loc[loc] = [d for d in by_loc[loc]
+                               if d["hostname"] not in verified]
+        flat = [d for loc in by_loc for d in by_loc[loc]]
+    if not flat:
+        print("  Nothing to do (all devices filtered).")
+        return {}, {}
+    for loc, devs in by_loc.items():
+        if devs: prepare_rollback_doc(devs, loc)
+    results = {}
+    reachable, unreachable = pre_scan_devices(flat, user, pw)
+    for d in unreachable:
+        results[d["hostname"]] = _row(d, "failed", "prescan",
+                                      "unreachable on tcp/22")
+        wlog(d["hostname"], "Unreachable on port 22", "ERROR")
+        _update_checkpoint(d["_location"], d["hostname"], "failed",
+                           "unreachable")
+    aborted_locs = set()
+    pending = reachable
+    attempt = 0
+    while pending and not SHUTDOWN_REQ.is_set():
+        attempt += 1
+        run_pass(pending, user, pw, results, attempt, location_name="")
+        _print_location_progress(by_loc, results)
+        for loc, devs in by_loc.items():
+            if loc in aborted_locs: continue
+            hosts_in = {d["hostname"] for d in devs}
+            pend_in = [d for d in pending if d["hostname"] in hosts_in]
+            if not pend_in: continue
+            fail_in = [d for d in pend_in
+                       if results.get(d["hostname"], {})
+                                 .get("status") == "failed"]
+            if (attempt == 1
+                    and len(pend_in) >= ABORT_GATE_MIN_DEVICES
+                    and len(fail_in) / max(len(pend_in), 1)
+                        > ABORT_GATE_THRESHOLD):
+                print("\n  ABORT GATE (%s): %d/%d failed -- skipping "
+                      "retries for this location"
+                      % (loc, len(fail_in), len(pend_in)))
+                master_log("ABORT GATE %s: %d/%d"
+                           % (loc, len(fail_in), len(pend_in)))
+                aborted_locs.add(loc)
+        failed = [d for d in pending
+                  if results.get(d["hostname"], {}).get("status") == "failed"
+                  and d.get("_location") not in aborted_locs]
+        retry = [d for d in failed
+                 if is_retryable(results.get(d["hostname"], {}))]
+        if (not RETRY_FAILED_DEVICES or not retry
+                or attempt > MAX_RETRIES or SHUTDOWN_REQ.is_set()):
+            break
+        print("\n  Retrying %d device(s) in %ds (retry %d/%d)"
+              % (len(retry), RETRY_DELAY_SEC, attempt, MAX_RETRIES))
+        SHUTDOWN_REQ.wait(RETRY_DELAY_SEC)
+        pending = retry
+    print("\n" + "=" * 70)
+    print("  POOLED RUN COMPLETE -- writing per-location reports")
+    print("=" * 70)
+    all_results, all_revert = {}, {}
+    for loc, devs in by_loc.items():
+        loc_res = {}
+        for d in devs:
+            r = results.get(d["hostname"])
+            if r is None:
+                r = _row(d, "failed", "not_run",
+                         "not processed (pooled run)")
+            loc_res[d["hostname"]] = r
+        all_results[loc] = loc_res
+        try:
+            rv = revert_location_temp_changes(devs, user, pw, loc) or {}
+        except Exception as e:
+            master_log("Revert for %s raised: %s" % (loc, e))
+            rv = {}
+        all_revert[loc] = rv
+        write_location_report(loc, loc_res, rv)
+    return all_results, all_revert
+
+
+def _fmt_duration(seconds):
+    seconds = int(seconds or 0)
+    if seconds < 60:
+        return "%ds" % seconds
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return "%dm%02ds" % (m, s)
+    h, m = divmod(m, 60)
+    return "%dh%02dm%02ds" % (h, m, s)
+
+
+def _device_line(r):
+    host = (r.get("hostname") or "?")[:30]
+    ip = (r.get("ip") or "?")[:15]
+    st = r.get("status", "?")
+    sv = r.get("start_version") or "?"
+    tv = r.get("target_version") or "?"
+    dur = _fmt_duration(r.get("duration_sec", 0))
+    if st == "success":
+        arrow = "%s -> %s" % (sv, tv) if sv != tv else tv
+        flags = []
+        if r.get("reboot_detected"): flags.append("reboot")
+        if r.get("md5_ok"):          flags.append("md5-ok")
+        if r.get("clock_corrected"): flags.append("clock-fix")
+        fs = ("  [" + ", ".join(flags) + "]") if flags else ""
+        mark = c("OK", "green")
+        return "%s %-30s %-15s %-28s %9s%s" % (mark, host, ip, arrow, dur, fs)
+    if st == "skipped":
+        mark = c("--", "yellow")
+        return "%s %-30s %-15s already on %-16s %9s" % (mark, host, ip, tv,
+                                                        dur)
+    stage = r.get("stage", "")
+    err = (r.get("error") or "?")[:60]
+    tag = "[%s] " % stage if stage else ""
+    mark = c("!!", "red")
+    return "%s %-30s %-15s %s%s" % (mark, host, ip, tag, err)
+
+
+def _load_previous_run_summary():
+    if not os.path.isdir(REPORT_DIR): return None
+    try:
+        names = sorted((f for f in os.listdir(REPORT_DIR)
+                        if f.startswith("run_summary_")
+                        and f.endswith(".json")
+                        and RUN_ID not in f), reverse=True)
+    except OSError:
+        return None
+    for name in names:
+        try:
+            with open(os.path.join(REPORT_DIR, name), "r",
+                      encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            continue
     return None
 
 
-def _fresh_conn(old: Any, host: str, ip: str, user: str, pw: str,
-                enable_pw: str = "", attempts: int = 3, delay: int = 15) -> Any:
-    """Drop *old* (releasing its session slot) and return a new session."""
-    _disconnect(old)
-    return robust_reconnect(host, ip, user, pw, enable_pw, attempts, delay)
+def detect_anomalies(all_results, prev_summary):
+    if not prev_summary: return []
+    prev_by = {r["hostname"]: r for r in prev_summary.get("results", [])}
+    issues = []
+    for loc, res in all_results.items():
+        for host, r in res.items():
+            prev = prev_by.get(host)
+            if not prev: continue
+            if (r["status"] == "success" and prev.get("post_version")
+                    and r.get("post_version")
+                    and r["post_version"] < prev["post_version"]):
+                issues.append((host, "version regressed: %s -> %s"
+                               % (prev["post_version"], r["post_version"])))
+            if (prev.get("status") == "success" and r["status"] == "failed"
+                    and r.get("install_started")
+                    and not prev.get("install_started")):
+                issues.append((host, "failed this run (was success last): %s"
+                               % (r.get("error") or "?")[:60]))
+    return issues
 
 
-def _poll_read(conn: Any) -> str:
-    """Non blocking-ish channel read used by all long command loops."""
+def trend_report(all_results, lookback=5):
+    if not os.path.isdir(REPORT_DIR): return
     try:
-        data = conn.read_channel()
-        return data or ""
-    except Exception as exc:
-        if _is_dead_socket_error(str(exc)):
-            raise
-        return ""
-
-
-def _last_line(buf: str) -> str:
-    if not buf or not buf.strip():
-        return ""
-    return buf.rstrip().splitlines()[-1].strip()
-
-
-def _drain_and_answer_prompts(conn: Any, max_seconds: float = 30.0) -> str:
-    """Read the channel until the device prompt comes back.
-
-    Bug B16: return as soon as ``#``/``>`` ends the last line with no pending
-    y/n, instead of burning the whole max_seconds budget.
-    """
-    deadline = time.time() + max_seconds
-    buf = ""
-    answered: Dict[str, int] = {}
-    while time.time() < deadline:
-        if SHUTDOWN_REQ.is_set():
-            break
+        files = sorted((f for f in os.listdir(REPORT_DIR)
+                        if f.startswith("run_summary_")
+                        and f.endswith(".json")
+                        and RUN_ID not in f), reverse=True)[:lookback]
+    except OSError:
+        return
+    if len(files) < 2: return
+    history = {}
+    for fn in files:
         try:
-            data = _poll_read(conn)
+            with open(os.path.join(REPORT_DIR, fn), "r",
+                      encoding="utf-8") as f:
+                data = json.load(f)
         except Exception:
-            break
-        if data:
-            buf = (buf + data)[-4000:]
-        line = _last_line(buf)
-        if _YN_RE.search(line):
-            answered[line] = answered.get(line, 0) + 1
-            if answered[line] <= 2:
+            continue
+        for r in data.get("results", []):
+            history.setdefault(r["hostname"], []).append(r["status"])
+    chronic = [(h, s) for h, s in history.items() if s.count("failed") >= 2]
+    if chronic:
+        print("\n  CHRONIC FAILURES (last %d runs):" % len(files))
+        for h, seq in sorted(chronic):
+            print("      ! %s: %s" % (h, "/".join(seq)))
+
+
+def print_summary(all_results, all_revert=None):
+    all_revert = all_revert or {}
+    ok = skipped = failed = 0
+    print("\n" + "=" * 78)
+    print("  FINAL SUMMARY -- DEVICE DETAIL  (v%s)" % VERSION_STRING)
+    print("=" * 78)
+    for loc in sorted(all_results.keys()):
+        res = all_results[loc]
+        cnt = {"success": 0, "skipped": 0, "failed": 0}
+        for r in res.values():
+            cnt[r["status"]] = cnt.get(r["status"], 0) + 1
+        ok += cnt["success"]; skipped += cnt["skipped"]; failed += cnt["failed"]
+        rv = all_revert.get(loc, {})
+        rc = sum(1 for x in rv.values() if x.get("ok"))
+        rf = sum(1 for x in rv.values() if not x.get("ok"))
+        hdr = ("-- %s  (%d device(s) -- success=%d skipped=%d failed=%d"
+               % (loc, len(res), cnt["success"], cnt["skipped"],
+                  cnt["failed"]))
+        if rv: hdr += "  revert_ok=%d revert_fail=%d" % (rc, rf)
+        hdr += ") --"
+        print("\n  %s" % hdr)
+        print("  " + "-" * 76)
+        print("  %2s%-30s %-15s Detail" % ("", "Hostname", "IP"))
+        print("  " + "-" * 76)
+        for want in ("success", "skipped", "failed"):
+            for r in sorted((x for x in res.values() if x["status"] == want),
+                            key=lambda x: x["hostname"]):
+                print("  " + _device_line(r))
+        for h, rvr in sorted(rv.items()):
+            if not rvr.get("ok"):
+                print("      revert failed: %s -- %s"
+                      % (h, rvr.get("message", "")[:60]))
+    total = ok + skipped + failed
+    print("\n" + "=" * 78)
+    print("  TOTAL  success=%d  skipped=%d  failed=%d  (of %d)"
+          % (ok, skipped, failed, total))
+    print("=" * 78)
+    cf = sum(1 for loc in all_results.values()
+             for r in loc.values() if r.get("clock_corrected"))
+    if cf:
+        print("\n  %d device(s) had clock drift corrected during pre-check"
+              % cf)
+    manual = []
+    for loc in sorted(all_results.keys()):
+        for r in sorted(all_results[loc].values(),
+                        key=lambda x: x["hostname"]):
+            if r["status"] == "failed":
+                manual.append((loc, r))
+    if manual:
+        print("\n  %d device(s) NEED MANUAL ATTENTION:" % len(manual))
+        for loc, r in manual:
+            ip = r.get("ip", "?")
+            stage = r.get("stage", "?")
+            err = (r.get("error") or "?")[:80]
+            print("      !! %-30s (%s) [%s]" % (r["hostname"], ip, loc))
+            print("          stage=%s  error=%s" % (stage, err))
+            if r.get("install_started"):
+                print("          install was started -- check `show install log`")
+            if r.get("verify_pending"):
+                print("          verify_pending=True -- reconcilable next run")
+    try:
+        prev = _load_previous_run_summary()
+        if prev:
+            anom = detect_anomalies(all_results, prev)
+            if anom:
+                print("\n  ANOMALIES vs previous run (%s):"
+                      % prev.get("run_id", "?"))
+                for h, m in anom:
+                    print("      ! %s: %s" % (h, m))
+    except Exception: pass
+    try: trend_report(all_results, lookback=5)
+    except Exception: pass
+    with TEMP_CHANGES_LOCK:
+        pending = sorted(h for h, e in TEMP_CHANGES.items()
+                         if e.get("changes"))
+    if pending:
+        print("\n  %d device(s) still have un-reverted temp config "
+              "changes -- run with --recover" % len(pending))
+        for h in pending:
+            print("      - %s" % h)
+    print("=" * 78 + "\n")
+    return failed
+
+
+def _reconcile_failed_devices(all_results, all_revert, user, pw):
+    if not RECONCILE_FAILED_AT_END:
+        return all_results, all_revert
+    candidates = []
+    for loc, res in all_results.items():
+        for host, r in res.items():
+            if r.get("status") != "failed": continue
+            eligible = (r.get("verify_pending")
+                        or r.get("stage") in ("install", "verify", "reboot"))
+            if not eligible: continue
+            ip = r.get("ip", "")
+            target_ver = r.get("target_version", "")
+            if not ip or not target_ver: continue
+            candidates.append((loc, host, ip, target_ver, r))
+    if not candidates:
+        print("\n  Reconcile: no verify-pending failures to recheck")
+        return all_results, all_revert
+    print("\n" + "=" * 70)
+    print("  RECONCILE -- rechecking %d failed device(s)" % len(candidates))
+    print("=" * 70)
+    reconciled = 0; still_failed = 0
+    reconciled_locs = set()
+    for loc, host, ip, target_ver, r in candidates:
+        print("\n  [%s] %s -- checking for %s..." % (host, ip, target_ver),
+              flush=True)
+        c_ = None
+        ok_now = False
+        try:
+            c_ = do_connect(ip, user, pw)
+            tacacs_enable(c_, host, ssh_pw=pw)
+            if not is_privileged(c_):
+                print("    not priv-15 -- cannot verify"); continue
+            out = c_.send_command("show version | include Version",
+                                  read_timeout=60)
+            post_ver = parse_running_version(out)
+            print("    running version: %s" % post_ver)
+            if _norm_ver(post_ver) == _norm_ver(target_ver):
                 try:
-                    conn.write_channel("y\n" if "yes/no" in line.lower() else "\n")
-                except Exception:
-                    pass
-                time.sleep(0.5)
-                continue
-        if line and _PROMPT_TAIL_RE.search(buf) and not _YN_RE.search(line):
-            return buf
-        time.sleep(0.4)
-    return buf
+                    b = c_.send_command("show boot | include BOOT",
+                                        read_timeout=30)
+                    if "packages.conf" not in b:
+                        print("    boot var not packages.conf"); continue
+                except Exception: pass
+                fw_file = ""
+                try:
+                    fwm = pick_firmware(get_model(c_) or "")
+                    if fwm: fw_file = fwm[0]
+                except Exception: pass
+                if not _finalize_install_commit(c_, host, target_ver,
+                                                fw_file=fw_file):
+                    print("    device is on target but NOT committed -- "
+                          "will revert on next reload")
+                    r["error"] = ("on target but commit not verified -- "
+                                  "will revert on next reload")
+                    r["verify_pending"] = True
+                    continue
+                ok_now = True
+            else:
+                print("    still not on %s" % target_ver)
+        except Exception as e:
+            print("    connection failed: %s: %s"
+                  % (type(e).__name__, str(e)[:80]))
+        finally:
+            if c_:
+                try: c_.disconnect()
+                except Exception: pass
+        if ok_now:
+            print("    RECONCILED -- device is on %s" % target_ver)
+            r["status"] = "success"
+            r["stage"] = "install"
+            r["error"] = ""
+            r["post_version"] = target_ver
+            r["verify_pending"] = False
+            reconciled += 1
+            reconciled_locs.add(loc)
+        else:
+            still_failed += 1
+    print("\n" + "-" * 70)
+    print("  Reconciled (now success) : %d" % reconciled)
+    print("  Still failed             : %d" % still_failed)
+    print("-" * 70 + "\n")
+    for loc in reconciled_locs:
+        loc_res = all_results.get(loc, {})
+        rv = all_revert.get(loc, {})
+        write_location_report(loc, loc_res, rv, force=True)
+    return all_results, all_revert
 
 
-def _sh(conn: Any, cmd: str, read_timeout: int = 60, host: str = "") -> str:
-    """Short read-only command (``show ...``), safe against a dead session."""
-    if conn is None:
-        return ""
+def write_run_summary(all_results, all_revert, run_id, path):
     try:
-        out = conn.send_command(cmd, strip_prompt=True, strip_command=True,
-                                read_timeout=read_timeout)
-        return out or ""
-    except Exception as exc:
-        if host:
-            dev_log(host, "WARN", "command failed (%s): %s" % (cmd, exc))
-        return ""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        flat = []
+        for loc in sorted(all_results.keys()):
+            for r in sorted(all_results[loc].values(),
+                            key=lambda x: x["hostname"]):
+                row = dict(r); row["location"] = loc
+                flat.append(row)
+        summary = {
+            "run_id": run_id,
+            "timestamp": datetime.now().isoformat(),
+            "version_string": VERSION_STRING,
+            "totals": {
+                "success": sum(1 for r in flat if r["status"] == "success"),
+                "skipped": sum(1 for r in flat if r["status"] == "skipped"),
+                "failed":  sum(1 for r in flat if r["status"] == "failed"),
+                "total":   len(flat)},
+            "by_location": {
+                loc: {"success": sum(1 for r in all_results[loc].values()
+                                     if r["status"] == "success"),
+                      "skipped": sum(1 for r in all_results[loc].values()
+                                     if r["status"] == "skipped"),
+                      "failed": sum(1 for r in all_results[loc].values()
+                                    if r["status"] == "failed"),
+                      "revert_failed": sum(
+                          1 for x in all_revert.get(loc, {}).values()
+                          if not x.get("ok"))}
+                for loc in sorted(all_results.keys())},
+            "results": flat}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+        print("  Summary: %s" % path)
+        return path
+    except Exception as e:
+        master_log("run_summary err: %s" % e)
+        return None
 
 
-def _send_long(conn: Any, cmd: str, deadline_sec: int = 300, host: str = "",
-               answer_confirm: bool = True) -> Tuple[str, str]:
-    """Write one command and poll until the prompt returns.
+_HTML_TPL = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Cisco Upgrade Run {rid}</title>
+<style>
+ body {{ font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+         margin: 24px; color: #222; }}
+ h1 {{ font-size: 20px; margin-bottom: 4px; }}
+ .meta {{ color: #666; font-size: 13px; margin-bottom: 20px; }}
+ table {{ border-collapse: collapse; width: 100%; margin-bottom: 24px; }}
+ th, td {{ padding: 6px 10px; border-bottom: 1px solid #e5e5e5;
+           text-align: left; font-size: 13px; }}
+ th {{ background: #f5f5f5; font-weight: 600; }}
+ tr.s-success td:first-child {{ color: #1a7f37; }}
+ tr.s-failed  td:first-child {{ color: #b62324; }}
+ tr.s-skipped td:first-child {{ color: #8a6d00; }}
+ .totals {{ display: flex; gap: 20px; margin-bottom: 24px; font-size: 14px; }}
+ .totals span {{ padding: 4px 10px; border-radius: 4px; background: #f5f5f5; }}
+ .badge {{ display: inline-block; padding: 1px 6px; border-radius: 3px;
+           background: #eef; font-size: 11px; color: #335; }}
+</style></head><body>
+<h1>Cisco IOS-XE Upgrade -- Run {rid}</h1>
+<div class="meta">Version {ver} &middot; {ts}</div>
+<div class="totals">
+ <span>success={s}</span><span>skipped={k}</span>
+ <span>failed={f}</span><span>total={t}</span>
+</div>
+{blocks}
+</body></html>"""
 
-    Returns ``(tail_of_buffer, reason)`` with reason in
-    ``{"done", "fastfail", "timeout", "dead", "shutdown"}``.
+_HTML_LOC = """<h2>{loc} -- {n} device(s)</h2>
+<table><tr><th>Status</th><th>Hostname</th><th>IP</th>
+<th>Start</th><th>Target</th><th>Post</th><th>Duration</th><th>Error</th></tr>
+{rows}</table>"""
 
-    The buffer handed back is trimmed to 1200 chars (bug B12) so stale text can
-    never re-trigger the fast-fail detector, and the loop is shutdown aware so
-    Ctrl+C stays responsive during a ten minute ``install add``.
-    """
-    if conn is None:
-        return "", "dead"
+
+def _html_escape(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def write_html_report(all_results, path, run_id=None):
+    run_id = run_id or RUN_ID
     try:
-        conn.write_channel(cmd + "\n")
-    except Exception:
-        return "", "dead"
-    dev_log(host, "CMD", cmd) if host else None
-    deadline = time.time() + max(5, int(deadline_sec))
-    buf = ""
-    answered: Dict[str, int] = {}
-    last_data = time.time()
-    while time.time() < deadline:
-        if SHUTDOWN_REQ.is_set():
-            return _trim1200(buf), "shutdown"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tot = {"success": 0, "skipped": 0, "failed": 0}
+        blocks = []
+        for loc in sorted(all_results.keys()):
+            rows = []
+            for r in sorted(all_results[loc].values(),
+                            key=lambda x: x["hostname"]):
+                tot[r["status"]] = tot.get(r["status"], 0) + 1
+                dur = _fmt_duration(r.get("duration_sec", 0))
+                err = _html_escape(r.get("error", "")[:100])
+                flags = []
+                if r.get("reboot_detected"): flags.append("reboot")
+                if r.get("md5_ok"):          flags.append("md5")
+                if r.get("clock_corrected"): flags.append("clock")
+                fh = (" " + " ".join('<span class="badge">%s</span>' % f
+                                     for f in flags)) if flags else ""
+                rows.append(
+                    '<tr class="s-%s"><td>%s</td><td>%s%s</td><td>%s</td>'
+                    '<td>%s</td><td>%s</td><td>%s</td><td>%s</td>'
+                    '<td>%s</td></tr>'
+                    % (r["status"], r["status"],
+                       _html_escape(r["hostname"]), fh,
+                       _html_escape(r["ip"]),
+                       _html_escape(r.get("start_version", "")),
+                       _html_escape(r.get("target_version", "")),
+                       _html_escape(r.get("post_version", "")),
+                       dur, err))
+            blocks.append(_HTML_LOC.format(
+                loc=_html_escape(loc), n=len(all_results[loc]),
+                rows="\n".join(rows)))
+        html = _HTML_TPL.format(
+            rid=run_id, ver=VERSION_STRING,
+            ts=datetime.now().isoformat(timespec="seconds"),
+            s=tot["success"], k=tot["skipped"], f=tot["failed"],
+            t=sum(tot.values()), blocks="\n".join(blocks))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+        print("  HTML: %s" % path)
+        return path
+    except Exception as e:
+        master_log("HTML err: %s" % e)
+        return None
+
+
+def post_run_health_snapshot(all_results, user, pw, path):
+    devices = []
+    for loc, res in all_results.items():
+        for r in res.values():
+            if r["status"] in ("success", "skipped"):
+                devices.append((r["hostname"], r["ip"]))
+    if not devices: return
+    print("\n  -- Post-run health snapshot (%d device(s)) --" % len(devices))
+    def _chk(host, ip):
+        cc = None
         try:
-            data = _poll_read(conn)
-        except Exception:
-            return _trim1200(buf), "dead"
-        if data:
-            buf += data
-            buf = buf[-4000:]
-            last_data = time.time()
-            if host:
-                for line in data.splitlines():
-                    if line.strip():
-                        dev_live_log(host, line.strip())
-        tail = _trim1200(buf)
-        if _FAST_FAIL_RE.search(tail):
-            return tail, "fastfail"
-        if answer_confirm:
-            line = _last_line(buf)
-            if line and answered.get(line, 0) < 2:
-                # "install remove inactive" style prompts want an explicit
-                # y/yes; a bare "[confirm]" wants a newline.
-                if _SAVE_RE.search(line):
-                    answered[line] = answered.get(line, 0) + 1
-                    try:
-                        conn.write_channel("y\n")
-                    except Exception:
-                        pass
-                    last_data = time.time()
-                    time.sleep(0.5)
-                    continue
-                if _CONFIRM_RE.search(line):
-                    answered[line] = answered.get(line, 0) + 1
-                    try:
-                        conn.write_channel("\n")
-                    except Exception:
-                        pass
-                    last_data = time.time()
-                    time.sleep(0.5)
-                    continue
-        if _PROMPT_TAIL_RE.search(buf) and (time.time() - last_data) >= PROMPT_QUIET_SEC:
-            return tail, "done"
-        time.sleep(0.5)
-    return _trim1200(buf), "timeout"
-
-
-def _issue_reload(conn: Any, host: str) -> bool:
-    """Ask the switch to reload and answer its confirmation prompts."""
-    dev_log(host, "STEP", "issuing reload")
+            cc = do_connect(ip, user, pw)
+            tacacs_enable(cc, host, ssh_pw=pw)
+            ver = cc.send_command("show version | include Version",
+                                  read_timeout=60)
+            m = re.search(r"Version ([\w.()]+)", ver)
+            boot = cc.send_command("show boot | include BOOT",
+                                   read_timeout=60)
+            switch = ""
+            try:
+                switch = cc.send_command("show switch", read_timeout=60)
+            except Exception: pass
+            rows = _SWITCH_ROW_RE.findall(switch)
+            nr = sum(1 for _, st in rows
+                     if st.lower() not in ("ready", "standby"))
+            return {"hostname": host, "ip": ip,
+                    "version": m.group(1) if m else "?",
+                    "boot_ok": "packages.conf" in boot,
+                    "stack_members": len(rows), "stack_not_ready": nr,
+                    "ts": datetime.now().isoformat(timespec="seconds")}
+        except Exception as e:
+            return {"hostname": host, "ip": ip, "version": "?",
+                    "boot_ok": False, "stack_members": 0,
+                    "stack_not_ready": 0, "error": str(e)[:80],
+                    "ts": datetime.now().isoformat(timespec="seconds")}
+        finally:
+            if cc:
+                try: cc.disconnect()
+                except Exception: pass
+    snaps = []
+    with ThreadPoolExecutor(max_workers=min(20, len(devices))) as ex:
+        for f in as_completed([ex.submit(_chk, h, ip)
+                               for h, ip in devices]):
+            snaps.append(f.result())
     try:
-        conn.write_channel("reload\n")
-    except Exception:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"run_id": RUN_ID, "snapshots": snaps}, f, indent=2)
+        print("  Health: %s" % path)
+    except Exception as e:
+        master_log("health err: %s" % e)
+
+
+def save_inventory_cache(devices, path):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"ts": time.time(), "run_id": RUN_ID,
+                       "version_string": VERSION_STRING,
+                       "devices": devices}, f, indent=2)
+        print("  Inventory cache: %s" % path)
+        return True
+    except Exception as e:
+        master_log("inv err: %s" % e)
         return False
-    deadline = time.time() + 180
-    buf = ""
-    while time.time() < deadline:
+
+
+def load_inventory_cache(path, max_age_sec=86400):
+    if not os.path.isfile(path): return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        age = time.time() - data.get("ts", 0)
+        if age > max_age_sec:
+            print("  (Inventory cache is %.1fh old -- ignoring)"
+                  % (age/3600))
+            return None
+        print("  (Reusing inventory cache from %.0fm ago)" % (age/60))
+        return data.get("devices", [])
+    except Exception:
+        return None
+
+
+def filter_only_upgrade_needed(devices, user, pw):
+    need, target, unreach = [], [], []
+    def _chk(d):
+        host, ip = d["hostname"], d["ip"]
+        cc = None
         try:
-            data = _poll_read(conn)
+            cc = do_connect(ip, user, pw)
+            tacacs_enable(cc, host, ssh_pw=pw)
+            if not is_privileged(cc):
+                return d, "other", ""
+            model = get_model(cc) or ""
+            fw = pick_firmware(model)
+            if not fw:
+                return d, "other", "unsupported model '%s'" % model
+            _, tg = fw
+            ver = cc.send_command("show version | include Version",
+                                  read_timeout=60)
+            return d, ("target"
+                       if _norm_ver(parse_running_version(ver))
+                       == _norm_ver(tg) else "needs"), tg
+        except Exception as e:
+            return d, "unreach", str(e)[:80]
+        finally:
+            if cc:
+                try: cc.disconnect()
+                except Exception: pass
+    with ThreadPoolExecutor(max_workers=min(20, max(len(devices), 1))) as ex:
+        for d, st, info in ex.map(_chk, devices):
+            if st == "needs":    need.append((d, info))
+            elif st == "target": target.append((d, info))
+            elif st == "unreach": unreach.append((d, info))
+            else:                need.append((d, info))
+    return need, target, unreach
+
+
+def print_change_preview(all_devices, user, pw):
+    print("\n" + "=" * 70)
+    print("  CHANGE PREVIEW (read-only)")
+    print("=" * 70)
+    rows = []
+    def _chk(d):
+        host, ip = d["hostname"], d["ip"]
+        cc = None
+        try:
+            cc = do_connect(ip, user, pw)
+            tacacs_enable(cc, host, ssh_pw=pw)
+            model = get_model(cc) or "?"
+            fw = pick_firmware(model)
+            tg = fw[1] if fw else "?"
+            vo = cc.send_command("show version | include Version",
+                                 read_timeout=60)
+            cur = parse_running_version(vo) or "?"
+            action = ("skip (already on target)"
+                      if _norm_ver(cur) == _norm_ver(tg)
+                      else "upgrade -> %s" % tg if fw
+                      else "unsupported model")
+            return (host, ip, model, cur, tg, action)
+        except Exception as e:
+            return (host, ip, "?", "?", "?",
+                    "unreachable: %s" % str(e)[:40])
+        finally:
+            if cc:
+                try: cc.disconnect()
+                except Exception: pass
+    with ThreadPoolExecutor(max_workers=min(20,
+                                            max(len(all_devices), 1))) as ex:
+        for row in ex.map(_chk, all_devices):
+            rows.append(row)
+    wc = [r for r in rows if r[5].startswith("upgrade")]
+    ws = [r for r in rows if r[5].startswith("skip")]
+    wf = [r for r in rows if r[5].startswith("unreachable")
+          or r[5] == "unsupported model"]
+    print("  %2s %-30s %-15s %-18s %-12s Action"
+          % ("", "Hostname", "IP", "Model", "Current"))
+    print("  " + "-" * 100)
+    for host, ip, model, cur, tg, action in sorted(rows):
+        mk = (">" if action.startswith("upgrade")
+              else "-" if action.startswith("skip") else "X")
+        print("  %s  %-30s %-15s %-18s %-12s %s"
+              % (mk, host, ip, model, cur, action))
+    print("  " + "-" * 100)
+    print("  %d will upgrade, %d already on target, %d need attention"
+          % (len(wc), len(ws), len(wf)))
+    print("=" * 70 + "\n")
+    return wc, ws, wf
+
+
+def estimate_runtime(all_devices, user, pw):
+    print("\n" + "=" * 70)
+    print("  RUNTIME ESTIMATE (no changes made)")
+    print("=" * 70)
+    rows = []
+    def _chk(d):
+        host, ip = d["hostname"], d["ip"]
+        cc = None
+        try:
+            cc = do_connect(ip, user, pw)
+            tacacs_enable(cc, host, ssh_pw=pw)
+            model = get_model(cc) or "?"
+            fw = pick_firmware(model)
+            if not fw: return (host, ip, model, "?", 0)
+            fwf, tg = fw
+            vo = cc.send_command("show version | include Version",
+                                 read_timeout=60)
+            cur = parse_running_version(vo) or "?"
+            return (host, ip, model, cur, get_firmware_size(fwf))
         except Exception:
-            return True
-        if data:
-            buf = (buf + data)[-2000:]
-            for line in data.splitlines():
-                if line.strip():
-                    dev_live_log(host, line.strip())
-        low = buf.lower()
-        if "aborted" in low or "not reload" in low:
-            dev_log(host, "WARN", "reload was refused by the device")
-            return False
-        if re.search(r"\[confirm\]", buf, re.I):
-            try:
-                conn.write_channel("\n")
-            except Exception:
-                pass
-            buf += "\n"
-        if re.search(r"\[yes/no\]|\[y/n\]", buf, re.I):
-            try:
-                conn.write_channel("yes\n")
-            except Exception:
-                pass
-            buf += "\n"
-        if re.search(r"(reloading|restarting|%SYS-5-RELOAD|connection.*closed|shutting down)", buf, re.I):
-            return True
-        time.sleep(0.5)
+            return (host, ip, "?", "?", 0)
+        finally:
+            if cc:
+                try: cc.disconnect()
+                except Exception: pass
+    with ThreadPoolExecutor(max_workers=min(20,
+                                            max(len(all_devices), 1))) as ex:
+        rows = list(ex.map(_chk, all_devices))
+    total_s = 0
+    for host, ip, model, cur, sz in sorted(rows):
+        per = 30 + (sz / 20e6) + 120 + 600 + 480 + 180 + 90
+        total_s += per
+    parallel = max(1, min(TRANSFER_SLOTS, INSTALL_WORKERS))
+    wall = total_s / parallel
+    print("  %d device(s), ~%d concurrent pipelines" % (len(rows), parallel))
+    if rows:
+        print("  Per-device avg: %s"
+              % _fmt_duration(int(total_s / max(len(rows), 1))))
+    print("  Estimated wall time: %s (+/-40%%)" % _fmt_duration(int(wall)))
+    print("=" * 70 + "\n")
+    return 0
+
+
+def prompt_resume_or_abort(stale_files):
+    print("\n  Un-reverted temp-config state from an earlier run exists:")
+    for s in stale_files:
+        print("     - %s" % s)
+    print("\n  Options:")
+    print("    [R] Resume -- skip already-verified devices")
+    print("    [S] Skip failed -- retry only previously failed devices")
+    print("    [A] Abort -- exit cleanly (--recover to revert temp config)")
+    try:
+        ans = input("  Choice [R/S/A]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return "abort"
+    if ans.startswith("r"): return "resume"
+    if ans.startswith("s"): return "skip"
+    return "abort"
+
+
+_CONFIG_KEYS = {
+    "LOCATIONS_TO_RUN", "TRANSFER_SLOTS", "INSTALL_WORKERS",
+    "MAX_SAFE_SSH_SESSIONS", "PRESERVE_ROLLBACK", "MIN_FREE_BYTES",
+    "EXTRA_HEADROOM_BYTES", "STACK_MEMBER_HEADROOM", "RETRY_FAILED_DEVICES",
+    "MAX_RETRIES", "RETRY_DELAY_SEC", "ABORT_GATE_THRESHOLD",
+    "ABORT_GATE_MIN_DEVICES", "SCP_TIMEOUT_SEC", "SCP_MAX_ATTEMPTS",
+    "SCP_RETRY_DELAY", "SCP_STALL_TIMEOUT", "SCP_PROGRESS_POLL",
+    "ENABLE_SCP_MONITOR", "USE_PSCP", "PSCP_TRANSFER_FALLBACK",
+    "TRANSFER_RETRY_ATTEMPTS", "TRANSFER_RETRY_DELAY_SEC",
+    "TRANSFER_VERIFY_TIMEOUT", "VERIFY_TRANSFER_HASH",
+    "LARGE_MODEL_PARALLEL", "USE_PARAMIKO_TUNED", "PARAMIKO_PRIMARY",
+    "PARAMIKO_CHANNEL_CHUNK", "PARAMIKO_WINDOW_BYTES",
+    "PARAMIKO_DISABLE_REKEY", "CHEAP_CRYPTO_TUNING", "CHEAP_CIPHER",
+    "CHEAP_MAC", "PREFER_CHEAP_CIPHERS", "BULK_MODE_WINDOW_SIZE",
+    "LEGACY_WINDOW_SIZE", "RECONNECT_MAX_ATTEMPTS", "RECONNECT_DELAY_SEC",
+    "PING_TIMEOUT_MS", "PING_DOWN_POLL_SEC", "PING_DOWN_TIMEOUT_SEC",
+    "PING_UP_POLL_SEC", "PING_UP_TIMEOUT_SEC", "PING_STABILITY_SEC",
+    "POST_REBOOT_SSH_WAIT_SEC", "POST_REBOOT_SETTLE_SEC",
+    "POST_REBOOT_MAX_ATTEMPTS", "POST_REBOOT_DELAY_SEC",
+    "PROBE_CONNECT_RETRIES", "PROBE_CONNECT_DELAY_SEC",
+    "RECONCILE_FAILED_AT_END", "HEALTH_RETRIES", "HEALTH_RETRY_DELAY_SEC",
+    "INSTALL_TOTAL_TIMEOUT", "INSTALL_SILENT_TIMEOUT",
+    "INSTALL_PROBE_INTERVAL", "ISSU_VERIFY_TIMEOUT", "ISSU_VERIFY_MAX_ERRORS",
+    "COMMIT_VERIFY_TIMEOUT", "COMMIT_VERIFY_RETRY_SEC",
+    "SESSION_SLOT_ACQUIRE_TIMEOUT",
+    "DO_BACKUP", "DO_VERIFY_MD5", "WIPE_BEFORE_TRANSFER",
+    "DO_RESET_DEVICE_LOGS", "PRE_SAVE_CONFIG", "SKIP_CONFIG_DRIFT_CHECK",
+    "ALLOW_BUNDLE_MODE_CONVERSION", "POOL_LOCATIONS",
+    "REVERT_TEMP_CONFIG_POST_LOCATION", "REVERT_MAX_ATTEMPTS",
+    "REVERT_RETRY_DELAY_SEC", "REVERT_UPTIME_GATE_MIN",
+    "REVERT_WRITE_MEMORY", "REVERT_VERIFY_AFTER", "LIVE_LOG_PANEL_PHASES",
+    "LIVE_LOG_FEED_TRANSFER", "LARGE_MODEL_PREFIXES",
+    "SERIAL_TRANSFER_LARGE_MODELS", "BACKUP_MAX_FILES",
+    "BACKUP_MAX_SIZE_GB", "LOG_ARCHIVE_MAX_DAYS", "LOG_ARCHIVE_MAX_SIZE_GB",
+    "CLOCK_DRIFT_WARN_SEC", "CLOCK_DRIFT_FIX_SEC", "STRICT_FAMILY_CHECK",
+    "MONITOR_INTERVAL", "LOG_MAX_AGE_DAYS", "LOG_MAX_SIZE_GB",
+    "MODEL_FIRMWARE_MAP", "MODELS_REQUIRING_SSH_TUNE",
+    "FAMILY_SIZE_BOUNDS_STRICT", "MAX_FIRMWARE_BYTES",
+    "MIN_FIRMWARE_BYTES", "DASHBOARD_REPAINT_SEC",
+    "EXTRACTION_OVERHEAD_FACTOR", "ALLOW_ACTIVE_PKG_PURGE",
+}
+
+
+def apply_config_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print("  Could not read config file %s: %s" % (path, e))
+        return False
+    g = globals()
+    for k, v in data.items():
+        if k not in _CONFIG_KEYS:
+            print("  Config key not recognized: %s" % k); continue
+        if k == "MODEL_FIRMWARE_MAP":
+            v = [tuple(x) for x in v]
+            v.sort(key=lambda x: -len(x[0]))
+        if k in ("MODELS_REQUIRING_SSH_TUNE", "LARGE_MODEL_PREFIXES",
+                 "LIVE_LOG_PANEL_PHASES"):
+            v = tuple(v)
+        g[k] = v
+    print("  Loaded config: %s" % path)
     return True
 
 
-# ===========================================================================
-#  ICMP / CLOCK
-# ===========================================================================
-def _ping_once(ip: str, timeout_ms: int = PING_TIMEOUT_MS) -> bool:
-    if os.name == "nt":
-        cmd = ["ping", "-n", "1", "-w", str(timeout_ms), ip]
-    else:
-        cmd = ["ping", "-c", "1", "-W", str(max(1, timeout_ms // 1000)), ip]
-    try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE,
-                              stderr=subprocess.DEVNULL, timeout=15,
-                              creationflags=NO_WINDOW)
-        text = (proc.stdout or b"").decode("utf-8", "replace").lower()
-        if os.name == "nt":
-            # Windows ping exits 0 for "Destination host unreachable" replies.
-            return "ttl=" in text and "unreachable" not in text \
-                and "timed out" not in text
-        return proc.returncode == 0
-    except Exception:
-        return False
+_SIG_COUNT = [0]
 
 
-def ssh_port_open(ip: str, timeout: int = SSH_PORT_PROBE_SEC) -> bool:
-    """Cheap TCP/22 probe - far faster than letting netmiko time out."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(timeout)
-            return sock.connect_ex((ip, 22)) == 0
-    except OSError:
-        return False
-
-
-def ssh_reachable(ip: str, attempts: int = 2, gap: float = 2.0) -> bool:
-    """Two TCP/22 probes before declaring a device unreachable.
-
-    A single refused probe is not proof: a switch that is mid-boot or busy
-    installing can drop one SYN.  Requiring two failures keeps the fast path
-    without ever skipping a device that is actually answering.
-    """
-    for index in range(max(1, attempts)):
-        if ssh_port_open(ip):
-            return True
-        if index + 1 < max(1, attempts):
-            time.sleep(gap)
-    return False
-
-
-def _wait_ping(ip: str, expect_up: bool, timeout: int, poll: int, host: str = "") -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if SHUTDOWN_REQ.is_set():
-            return False
-        up = _ping_once(ip)
-        if up == expect_up:
-            return True
-        SHUTDOWN_REQ.wait(poll)
-    return False
-
-
-def _fetch_reference_utc() -> Optional[datetime]:
-    """UDP NTP query, with server fallback.
-
-    Every socket is closed in a ``finally`` block so a failed time source can
-    never leak a descriptor, and a working source is returned as soon as one
-    answers.
-    """
-    for server in NTP_SERVERS:
-        s = None
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(3.0)
-            packet = b"\x1b" + 47 * b"\0"
-            s.sendto(packet, (server, 123))
-            data, _ = s.recvfrom(1024)
-            if len(data) < 48:
-                continue
-            seconds = struct.unpack("!I", data[40:44])[0]
-            frac = struct.unpack("!I", data[44:48])[0]
-            epoch = seconds - 2208988800
-            if epoch <= 0:
-                continue
-            return datetime.fromtimestamp(epoch + (frac / 2.0 ** 32), tz=timezone.utc)
-        except Exception:
-            continue
-        finally:
-            try:
-                if s is not None:
-                    s.close()
-            except Exception:
-                pass
-    return None
-
-
-_TIMEZONE_RE = re.compile(
-    r"(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?\s+(\S+)\s+(\w{3})\s+(\w{3})\s+(\d{1,2})\s+(\d{4})")
-
-_MONTHS = {name: idx for idx, name in enumerate(
-    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1)}
-
-
-def _parse_show_clock(out: str) -> Optional[Dict[str, Any]]:
-    """Parse ``show clock`` -> naive UTC datetime + timezone text."""
-    m = _TIMEZONE_RE.search(out or "")
-    if not m:
-        return None
-    month = _MONTHS.get(m.group(6).capitalize())
-    if not month:
-        return None
-    try:
-        dt = datetime(int(m.group(8)), month, int(m.group(7)),
-                      int(m.group(1)), int(m.group(2)), int(m.group(3)))
-    except ValueError:
-        return None
-    return {"tz_text": m.group(4), "dt": dt, "raw": m.group(0).strip()}
-
-
-def _tz_is_utcish(tz_text: str) -> bool:
-    tz = (tz_text or "").upper()
-    if tz in ("UTC", "GMT", "Z", "UT"):
-        return True
-    return bool(re.match(r"^[+-]\d{1,2}(:\d{2})?$", tz))
-
-
-def fix_clock_drift(conn: Any, host: str) -> bool:
-    """NTP based drift correction; skipped when the device is not in UTC/GMT."""
-    try:
-        clock_out = _sh(conn, "show clock", 30, host)
-        parsed = _parse_show_clock(clock_out)
-        if not parsed:
-            return False
-        if not _tz_is_utcish(parsed["tz_text"]):
-            dev_log(host, "INFO", "clock drift check skipped (timezone %s)" % parsed["tz_text"])
-            return False
-        ref = _fetch_reference_utc()
-        if ref is None:
-            dev_log(host, "WARN", "clock drift check skipped (no NTP reference)")
-            return False
-        drift = abs((ref.replace(tzinfo=None) - parsed["dt"]).total_seconds())
-        if drift < CLOCK_DRIFT_FIX_SEC:
-            return False
-        stamp = ref.strftime("%H:%M:%S %d %b %Y")
-        out, why = _send_long(conn, "clock set %s" % stamp, 60, host)
-        dev_log(host, "OK", "clock drift %.0fs corrected to %s" % (drift, stamp))
-        return why in ("done", "timeout")
-    except Exception as exc:
-        dev_log(host, "WARN", "clock drift check failed: %s" % exc)
-        return False
-
-
-# ===========================================================================
-#  TEMP CHANGE TRACKING  (design rule P5)
-# ===========================================================================
-def temp_state_path(run_id: Optional[str] = None) -> Path:
-    return STATE_DIR / ("temp_changes_%s.json" % (run_id or RUN_ID))
-
-
-def track_temp_change(host: str, ctype: str, ip: str = "", **details: Any) -> None:
-    """Record one temporary change and flush it to disk immediately."""
-    with TEMP_LOCK:
-        entry = TEMP_CHANGES.setdefault(host, {"ip": ip, "changes": []})
-        if ip:
-            entry["ip"] = ip
-        entry["changes"].append({"type": ctype, "details": details,
-                                 "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
-    save_temp_changes()
-    dev_log(host, "INFO", "temp change recorded: %s %s" % (ctype, details))
-
-
-def save_temp_changes(path: Optional[Path] = None) -> None:
-    target = path or temp_state_path()
-    with TEMP_LOCK:
-        payload = json.dumps(TEMP_CHANGES, indent=2, sort_keys=True, default=str)
-    try:
-        _ensure_dir(target.parent)
-        tmp = str(target) + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(payload)
-        os.replace(tmp, str(target))
-    except Exception as exc:
-        log_master("ERROR", "could not persist temp changes: %s" % exc)
-
-
-def load_state_for_recovery() -> int:
-    """Read every ``state/temp_changes_*.json`` written by earlier runs.
-
-    Bug B7: this is called exactly ONCE, from main(), so state belonging to
-    location A can never leak into location B.
-    """
-    loaded = 0
-    files = sorted(glob.glob(str(STATE_DIR / "temp_changes_*.json")))
-    with TEMP_LOCK:
-        for path in files:
-            try:
-                with open(path, "r", encoding="utf-8") as fh:
-                    data = json.load(fh)
-            except Exception as exc:
-                log_master("WARN", "unreadable state file %s: %s" % (path, exc))
-                continue
-            if not isinstance(data, dict):
-                continue
-            for host, entry in data.items():
-                if not isinstance(entry, dict):
-                    continue
-                current = TEMP_CHANGES.setdefault(host, {"ip": entry.get("ip", ""), "changes": []})
-                if entry.get("ip"):
-                    current["ip"] = entry["ip"]
-                for change in entry.get("changes", []):
-                    if change not in current["changes"]:
-                        current["changes"].append(change)
-                loaded += 1
-            if path not in STATE_FILES_LOADED:
-                STATE_FILES_LOADED.append(path)
-    if loaded:
-        log_master("WARN", "recovered pending temp changes for %d host(s) from prior runs" % loaded)
-    return loaded
-
-
-def pending_temp_changes() -> Dict[str, List[Dict[str, Any]]]:
-    with TEMP_LOCK:
-        return {host: list(entry.get("changes", []))
-                for host, entry in TEMP_CHANGES.items() if entry.get("changes")}
-
-
-def clear_temp_changes(host: str) -> None:
-    with TEMP_LOCK:
-        entry = TEMP_CHANGES.get(host)
-        if entry:
-            entry["changes"] = []
-    save_temp_changes()
-
-
-# ===========================================================================
-#  SERVICE LOCKS  (design rule P4)
-# ===========================================================================
-def apply_service_locks(conn: Any, host: str) -> Dict[str, Any]:
-    """Disable every management plane service that can interrupt an install.
-
-    Always applied, on every device, including devices already on target:
-      * ``ip http server``        -> disabled (original state recorded)
-      * ``ip https server``       -> disabled (original state recorded)
-      * ``tftp-server ...``       -> every entry removed (entries recorded)
-      * ``ip scp server enable``  -> enabled (we need SCP for the transfer)
-    """
-    applied: Dict[str, Any] = {}
-    run = _sh(conn, "show running-config | include ^ip http", 60, host)
-    was_http = bool(re.search(r"^\s*ip http server\s*$", run, re.M))
-    was_https = bool(re.search(r"^\s*ip http secure-server\s*$|^\s*ip https server\s*$", run, re.M))
-    applied["http_server"] = {"was_enabled": was_http}
-    applied["https_server"] = {"was_enabled": was_https}
-
-    if was_http:
-        _send_long(conn, "configure terminal", 30, host, answer_confirm=False)
-        _send_long(conn, "no ip http server", 30, host, answer_confirm=False)
-        _send_long(conn, "end", 30, host, answer_confirm=False)
-        track_temp_change(host, "http_server", was_enabled=True)
-    else:
-        track_temp_change(host, "http_server", was_enabled=False)
-
-    if was_https:
-        _send_long(conn, "configure terminal", 30, host, answer_confirm=False)
-        _send_long(conn, "no ip http secure-server", 30, host, answer_confirm=False)
-        _send_long(conn, "end", 30, host, answer_confirm=False)
-        track_temp_change(host, "https_server", was_enabled=True)
-    else:
-        track_temp_change(host, "https_server", was_enabled=False)
-
-    tftp_out = _sh(conn, "show running-config | include ^tftp-server", 60, host)
-    was_entries = [ln.strip() for ln in (tftp_out or "").splitlines() if ln.strip().startswith("tftp-server")]
-    applied["tftp_server"] = {"was_entries": was_entries}
-    if was_entries:
-        _send_long(conn, "configure terminal", 30, host, answer_confirm=False)
-        for entry in was_entries:
-            _send_long(conn, "no %s" % entry, 30, host, answer_confirm=False)
-        _send_long(conn, "end", 30, host, answer_confirm=False)
-        track_temp_change(host, "tftp_server", was_entries=was_entries)
-    else:
-        track_temp_change(host, "tftp_server", was_entries=[])
-
-    scp_out = _sh(conn, "show running-config | include ^ip scp server", 60, host)
-    was_scp = bool(re.search(r"^\s*ip scp server enable\s*$", scp_out, re.M))
-    applied["scp_server"] = {"was_enabled": was_scp}
-    if not was_scp:
-        _send_long(conn, "configure terminal", 30, host, answer_confirm=False)
-        _send_long(conn, "ip scp server enable", 30, host, answer_confirm=False)
-        _send_long(conn, "end", 30, host, answer_confirm=False)
-        track_temp_change(host, "scp_server", was_enabled=False)
-    else:
-        track_temp_change(host, "scp_server", was_enabled=True)
-
-    return applied
-
-
-def apply_exec_timeout(conn: Any, host: str) -> None:
-    """Stop the vty from timing out mid install (recorded as a temp change)."""
-    original = ""
-    try:
-        out = _sh(conn, "show running-config | section line vty", 60, host)
-        m = re.search(r"exec-timeout\s+(\d+\s+\d+)", out or "")
-        original = m.group(1) if m else "10 0"
-    except Exception:
-        original = "10 0"
-    _send_long(conn, "configure terminal", 30, host, answer_confirm=False)
-    _send_long(conn, "line vty 0 15", 30, host, answer_confirm=False)
-    _send_long(conn, "exec-timeout 0 0", 30, host, answer_confirm=False)
-    _send_long(conn, "end", 30, host, answer_confirm=False)
-    track_temp_change(host, "exec_timeout", original=original, applied="0 0")
-
-
-def ssh_tune(conn: Any, host: str, model: str = "") -> None:
-    """Large chassis drop SSH sessions unless the key exchange is cheapened."""
-    if not any((model or "").upper().startswith(p) for p in MODELS_REQUIRING_SSH_TUNE):
-        return
-    _send_long(conn, "configure terminal", 30, host, answer_confirm=False)
-    _send_long(conn, "ip ssh server algorithm kex diffie-hellman-group-exchange-sha1",
-               30, host, answer_confirm=False)
-    _send_long(conn, "ip ssh server algorithm mac hmac-sha1", 30, host, answer_confirm=False)
-    _send_long(conn, "end", 30, host, answer_confirm=False)
-    track_temp_change(host, "ssh_tune", model=model)
-
-
-def cheap_crypto(conn: Any, host: str, version: str = "") -> None:
-    """Apply the cheaper crypto suite on >= 17.10 where AES-GCM stalls."""
-    if not CHEAP_CRYPTO_TUNING:
-        return
-    if _ver_tuple(version) < CHEAP_CRYPTO_MIN_VERSION:
-        return
-    _send_long(conn, "configure terminal", 30, host, answer_confirm=False)
-    for cmd in CHEAP_CRYPTO_APPLY:
-        _send_long(conn, cmd, 30, host, answer_confirm=False)
-    _send_long(conn, "end", 30, host, answer_confirm=False)
-    track_temp_change(host, "cheap_crypto", applied=list(CHEAP_CRYPTO_APPLY),
-                      cipher=CHEAP_CIPHER, mac=CHEAP_MAC)
-
-
-def revert_temp_config(conn: Any, host: str) -> Tuple[int, int]:
-    """Undo every temporary change for *host*.  Returns (ok_count, fail_count).
-
-    Inverse of apply_service_locks() + apply_exec_timeout() + ssh_tune() +
-    cheap_crypto(); idempotent, so it is safe on a device that never had the
-    change applied (for example after a reload wiped it).
-    """
-    ok = 0
-    fail = 0
-    with TEMP_LOCK:
-        entry = TEMP_CHANGES.get(host, {})
-        changes = list(entry.get("changes", []))
-    if not changes:
-        return (0, 0)
-    if conn is None:
-        return (0, len(changes))
-
-    def _do(cmds: List[str]) -> bool:
-        good = True
-        for cmd in cmds:
-            _out, why = _send_long(conn, cmd, 60, host, answer_confirm=False)
-            if why in ("dead", "shutdown"):
-                good = False
-                break
-        return good
-
-    for change in changes:
-        ctype = change.get("type")
-        details = change.get("details", {}) or {}
-        try:
-            if ctype == "http_server":
-                if details.get("was_enabled"):
-                    good = _do(["configure terminal", "ip http server", "end"])
-                    (ok, fail) = (ok + 1, fail) if good else (ok, fail + 1)
-            elif ctype == "https_server":
-                if details.get("was_enabled"):
-                    good = _do(["configure terminal", "ip http secure-server", "end"])
-                    (ok, fail) = (ok + 1, fail) if good else (ok, fail + 1)
-            elif ctype == "tftp_server":
-                entries = details.get("was_entries") or []
-                if entries:
-                    cmds = ["configure terminal"] + list(entries) + ["end"]
-                    good = _do(cmds)
-                    (ok, fail) = (ok + 1, fail) if good else (ok, fail + 1)
-            elif ctype == "scp_server":
-                if not details.get("was_enabled"):
-                    good = _do(["configure terminal", "no ip scp server enable", "end"])
-                    (ok, fail) = (ok + 1, fail) if good else (ok, fail + 1)
-            elif ctype == "exec_timeout":
-                original = details.get("original") or "10 0"
-                good = _do(["configure terminal", "line vty 0 15",
-                            "exec-timeout %s" % original, "end"])
-                (ok, fail) = (ok + 1, fail) if good else (ok, fail + 1)
-            elif ctype == "ssh_tune":
-                good = _do(["configure terminal", "no ip ssh server algorithm mac hmac-sha1",
-                            "no ip ssh server algorithm kex diffie-hellman-group-exchange-sha1",
-                            "end"])
-                (ok, fail) = (ok + 1, fail) if good else (ok, fail + 1)
-            elif ctype == "cheap_crypto":
-                good = _do(["configure terminal"] + list(CHEAP_CRYPTO_REVERT) + ["end"])
-                (ok, fail) = (ok + 1, fail) if good else (ok, fail + 1)
-            else:
-                dev_log(host, "WARN", "unknown temp change type %s" % ctype)
-        except Exception as exc:
-            fail += 1
-            dev_log(host, "WARN", "revert of %s failed: %s" % (ctype, exc))
-
-    if fail == 0:
-        clear_temp_changes(host)
-        dev_log(host, "OK", "temp config reverted (%d item(s))" % ok)
-        if REVERT_WRITE_MEMORY and ok:
-            _send_long(conn, "write memory", 120, host)
-    else:
-        dev_log(host, "WARN", "temp config revert incomplete: ok=%d fail=%d" % (ok, fail))
-    return (ok, fail)
-
-
-def revert_temp_config_with_retry(host: str, ip: str, user: str, pw: str,
-                                  enable_pw: str = "") -> Tuple[int, int, bool]:
-    """Revert with reconnect retries; used at the end of a location run."""
-    last = (0, 0)
-    for attempt in range(1, REVERT_MAX_ATTEMPTS + 1):
-        if SHUTDOWN_REQ.is_set():
-            return last[0], last[1], False
-        conn = None
-        try:
-            conn = do_connect(ip, host, user, pw, enable_pw, fast=True)
-            ok, fail = revert_temp_config(conn, host)
-            last = (ok, fail)
-            if fail == 0:
-                return ok, fail, True
-            dev_log(host, "WARN", "revert attempt %d/%d incomplete" % (attempt, REVERT_MAX_ATTEMPTS))
-        except Exception as exc:
-            dev_log(host, "WARN", "revert attempt %d/%d connect failed: %s"
-                    % (attempt, REVERT_MAX_ATTEMPTS, exc))
-        finally:
-            _disconnect(conn)
-        SHUTDOWN_REQ.wait(REVERT_RETRY_DELAY_SEC)
-    return last[0], last[1], False
-
-
-def verify_no_temp_changes(devices: List[Any], user: str, pw: str, location_name: str) -> Dict[str, Any]:
-    """Confirm nothing temporary is left behind on any device of the location.
-
-    On-target devices are included: they received the same service locks, so
-    they must be reverted and verified too (incl. on-target).
-    """
-    report: Dict[str, Any] = {}
-    leftovers = 0
-    for dev in devices:
-        host = getattr(dev, "hostname", str(dev))
-        with TEMP_LOCK:
-            entry = TEMP_CHANGES.get(host, {})
-            changes = list(entry.get("changes", []))
-        if changes:
-            leftovers += 1
-            types = sorted({c.get("type", "?") for c in changes})
-            report[host] = {"ok": False, "message": "temp changes still pending", "types": types}
-            _safe_print("  ! %-30s pending: %s" % (host[:30], ", ".join(types)))
-        else:
-            report[host] = {"ok": True, "message": "clean", "types": []}
-    if leftovers == 0:
-        _safe_print("  \u2713 Post-revert verification: no temp changes remain on any device "
-                    "(incl. on-target)")
-    else:
-        _safe_print("  ! %d device(s) in %s still carry temp changes -- see logs/errors.log"
-                    % (leftovers, location_name))
-    log_master("INFO", "post-revert verification for %s: %d leftover device(s)"
-               % (location_name, leftovers))
-    return report
-
-
-# ===========================================================================
-#  DEVICE PRE-CHECK, BACKUPS, HEALTH
-# ===========================================================================
-def pick_firmware(model: str) -> Tuple[str, str]:
-    """Return (fw_file, target_version) for a model string, longest prefix first."""
-    up = (model or "").upper()
-    for prefix, fw, ver in MODEL_FIRMWARE_MAP:
-        if up.startswith(prefix):
-            return (fw, ver)
-    return ("", TARGET_VERSION)
-
-
-def verify_model_firmware_consistency(model: str, fw_file: str,
-                                      target_ver: str) -> Tuple[bool, str]:
-    """Cross-check a model against the image mapped to it.
-
-    Catches the two mistakes that brick a maintenance window: a C9200 family
-    chassis being handed the full cat9k image (or the reverse), and a filename
-    that does not carry the target version.
-    """
-    if not model:
-        return (False, "model unknown")
-    if not fw_file:
-        return (False, "no firmware mapped for '%s'" % model)
-    tier, marker = model_family(model)
-    if tier == "unknown":
-        return (False, "model '%s' not in MODEL_FAMILY_MAP" % model)
-    if marker:
-        if marker not in fw_file:
-            return (False, "model '%s' (lite family) needs '%s' in the filename"
-                    % (model, marker))
-    elif "_lite_" in fw_file:
-        return (False, "model '%s' (full family) must not get the lite image" % model)
-    if target_ver and target_ver not in fw_file:
-        return (False, "target version %s not present in '%s'" % (target_ver, fw_file))
-    return (True, "ok")
-
-
-def preflight_firmware() -> Tuple[bool, List[str], List[str]]:
-    """Validate the local firmware tree before a single device is touched.
-
-    Returns ``(ok, errors, warnings)``.  A missing image or a family/name
-    mismatch is fatal; an unusual file size is only a warning, because the
-    exact byte count moves between maintenance releases and a stale bound must
-    never block a fleet.
-    """
-    errors: List[str] = []
-    warnings: List[str] = []
-    seen = set()
-    for prefix, fw_file, target_ver in MODEL_FIRMWARE_MAP:
-        if fw_file in seen:
-            continue
-        seen.add(fw_file)
-        path = FIRMWARE_DIR / fw_file
-        if not path.exists():
-            errors.append("missing firmware: %s" % path)
-            continue
-        try:
-            size = path.stat().st_size
-        except Exception as exc:
-            errors.append("cannot stat %s: %s" % (path.name, exc))
-            continue
-        FIRMWARE_SIZES[fw_file] = size
-        ok, reason = verify_model_firmware_consistency(prefix, fw_file, target_ver)
-        if not ok:
-            errors.append(reason)
-        tier, _marker = model_family(prefix)
-        low, high = FAMILY_SIZE_BOUNDS.get(tier, (0, 10 ** 12))
-        megabytes = size / 1e6
-        if not (low <= megabytes <= high):
-            message = ("%s is %.0f MB, outside the expected %d-%d MB for the "
-                       "%s family" % (fw_file, megabytes, low, high, tier))
-            if FAMILY_SIZE_BOUNDS_STRICT:
-                errors.append(message)
-            else:
-                warnings.append(message)
-        FIRMWARE_SIZES.setdefault(fw_file, size)
-    return (not errors, errors, warnings)
-
-
-def model_family(model: str) -> Tuple[str, Optional[str]]:
-    up = (model or "").upper()
-    for prefix, value in MODEL_FAMILY_MAP.items():
-        if up.startswith(prefix):
-            return value
-    return ("unknown", None)
-
-
-def is_large_model(model: str) -> bool:
-    up = (model or "").upper()
-    return any(up.startswith(p) for p in LARGE_MODEL_PREFIXES)
-
-
-def parse_model(show_version_out: str) -> str:
-    out = show_version_out or ""
-    for pattern in (r"[Mm]odel [Nn]umber\s*:\s*(\S+)",
-                    r"[Mm]odel [Nn]umber\s*:\s*(\S+)",
-                    r"^[Cc]isco (\S+).*[Pp]rocessor",
-                    r"PID:\s*(\S+)"):
-        m = re.search(pattern, out, re.M)
-        if m:
-            return m.group(1).strip().rstrip(",")
-    return ""
-
-
-def parse_free_bytes(dir_out: str) -> Optional[int]:
-    out = dir_out or ""
-    m = re.search(r"(\d[\d,]*)\s+bytes total\s*\((\d[\d,]*)\s+bytes free\)", out, re.I)
-    if m:
-        return int(m.group(2).replace(",", ""))
-    m = re.search(r"(\d[\d,]*)\s+bytes (?:available|free)", out, re.I)
-    if m:
-        return int(m.group(1).replace(",", ""))
-    m = re.search(r"free\s*[:\s]\s*(\d[\d,]*)", out, re.I)
-    if m:
-        return int(m.group(1).replace(",", ""))
-    return None
-
-
-def parse_dir_size(dir_out: str, name: str = "") -> Optional[int]:
-    """Bytes of one entry in ``dir flash:`` output.
-
-    Handles both ``idx  -rw-  <bytes>  Oct 10 2026 12:00:00  file.bin`` and the
-    shorter ``<bytes>  Oct 10 2026 12:00:00  file.bin`` forms.
-    """
-    for line in (dir_out or "").splitlines():
-        if name and name not in line:
-            continue
-        m = re.search(r"(\d[\d,]*)\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{4}", line)
-        if m:
-            return int(m.group(1).replace(",", ""))
-        m = re.search(r"(\d[\d,]*)\s+bytes\b", line)
-        if m and not name:
-            return int(m.group(1).replace(",", ""))
-    return None
-
-
-def parse_stack_members(show_switch_out: str) -> int:
-    count = 0
-    for line in (show_switch_out or "").splitlines():
-        if re.match(r"^\s*\*?\s*\d+\s+\S", line) and re.search(r"\b(Ready|Active|Standby|Member)\b",
-                                                              line, re.I):
-            count += 1
-    return count
-
-
-def _prompt_indicates_priv15(conn: Any) -> bool:
-    """Fall back to the prompt character when 'show privilege' is blocked.
-
-    Under TACACS+ command authorization the privilege query itself can be
-    denied, yet the session may still be privileged; ``hostname#`` proves it.
-    """
-    try:
-        prompt = conn.find_prompt() or ""
-        return prompt.strip().endswith("#")
-    except Exception:
-        return False
-
-
-def is_privileged(conn: Any, host: str = "") -> bool:
-    """True when the session really has privilege 15."""
-    if conn is None:
-        return False
-    try:
-        out = _sh(conn, "show privilege", 30, host)
-    except Exception:
-        out = ""
-    low = (out or "").lower()
-    if any(marker in low for marker in _AUTHZ_FAIL_MARKERS):
-        # Command was denied by the AAA server - trust the prompt instead.
-        return _prompt_indicates_priv15(conn)
-    m = re.search(r"privilege level is\s+(\d+)", low)
-    if m:
-        return int(m.group(1)) == 15
-    m = re.search(r"level\s+(\d+)\b", low)
-    if m:
-        return int(m.group(1)) == 15
-    if (out or "").strip():
-        return False
-    return _prompt_indicates_priv15(conn)
-
-
-def classify_connect_error(exc: Any) -> str:
-    """Map a transport failure onto the NON_RETRYABLE_PREFIXES vocabulary."""
-    msg = str(exc or "").lower()
-    if ("no acceptable kex" in msg or "incompatible ssh peer" in msg
-            or "kex algorithm" in msg):
-        return "SSH negotiation failed"
-    if "no acceptable host key" in msg or "host key" in msg:
-        return "SSH negotiation failed (host key)"
-    if "no acceptable cipher" in msg or "no acceptable mac" in msg:
-        return "SSH negotiation failed (crypto)"
-    if ("authentication failed" in msg or "auth fail" in msg
-            or "permission denied" in msg or "authentication exception" in msg):
-        return "TACACS+ denied"
-    return ""
-
-
-def enable_user_prompt(conn: Any, host: str, pw: str) -> bool:
-    """Interactive enable for TACACS+ boxes where netmiko's enable() stalls.
-
-    Handles the two-step ``Username:`` / ``Password:`` form used when the AAA
-    server wants a separate enable identity, and tolerates the case where the
-    only reply is an authorization failure (the caller then falls back to the
-    prompt character).
-    """
-    if conn is None or not pw:
-        return False
-    try:
-        _drain_and_answer_prompts(conn, 2.0)
-        conn.write_channel("enable\n")
-        time.sleep(1.5)
-        buf = _poll_read(conn) or ""
-        if re.search(r"username\s*[:>]", buf, re.I) and ENABLE_USER:
-            conn.write_channel(ENABLE_USER + "\n")
-            time.sleep(1.0)
-            buf += _poll_read(conn) or ""
-        if re.search(r"password\s*[:>]", buf, re.I):
-            conn.write_channel(pw + "\n")
-            time.sleep(2.0)
-            buf += _poll_read(conn) or ""
-        low = buf.lower()
-        if any(marker in low for marker in _AUTHZ_FAIL_MARKERS):
-            dev_log(host, "WARN", "enable denied by AAA (TACACS+ command auth?)")
-        return is_privileged(conn, host)
-    except Exception as exc:
-        if _is_dead_socket_error(str(exc)):
-            return False
-        return False
-
-
-def ensure_priv15(conn: Any, host: str) -> bool:
-    """Make sure the session is privileged, tolerating AAA oddities."""
-    if conn is None:
-        return False
-    if is_privileged(conn, host):
-        return True
-    try:
-        conn.enable()
-    except Exception:
-        pass
-    if is_privileged(conn, host):
-        return True
-    pw = ENABLE_PASSWORD or getattr(conn, "secret", "") or ""
-    if enable_user_prompt(conn, host, pw):
-        dev_log(host, "OK", "privilege 15 established via interactive enable")
-        return True
-    dev_log(host, "ERROR", "not priv 15 on %s" % host)
-    return False
-
-
-def precheck_device(conn: Any, host: str, ip: str = "") -> Dict[str, Any]:
-    """Read model, version, flash space and boot mode before touching anything."""
-    info: Dict[str, Any] = {"ok": False, "error": "", "model": "", "version": "",
-                            "fw_file": "", "target": TARGET_VERSION, "free_bytes": None,
-                            "needed_bytes": 0, "members": 1, "boot_mode": "unknown",
-                            "syntax": classify_install_syntax((0, 0, 0)), "clock_corrected": False}
-    try:
-        ver_out = _sh(conn, "show version", 120, host)
-        if not (ver_out or "").strip():
-            info["error"] = "unreachable: empty show version"
-            return info
-        info["version"] = parse_running_version(ver_out)
-        info["model"] = parse_model(ver_out) or info.get("model", "")
-        if not info["model"]:
-            info["model"] = "UNKNOWN"
-        fw, target = pick_firmware(info["model"])
-        info["fw_file"] = fw
-        info["target"] = target
-        info["family"] = model_family(info["model"])[0]
-        info["syntax"] = classify_install_syntax(_ver_tuple(info["version"]))
-        if not fw:
-            info["error"] = "unsupported model: %s (no firmware mapping)" % info["model"]
-            return info
-
-        if not ensure_priv15(conn, host):
-            info["error"] = "not priv 15 on %s" % host
-            return info
-
-        switch_out = _sh(conn, "show switch", 60, host)
-        info["members"] = max(1, parse_stack_members(switch_out))
-
-        dir_out = _sh(conn, "dir flash:", 120, host)
-        free = parse_free_bytes(dir_out)
-        info["free_bytes"] = free
-        fw_size = FIRMWARE_SIZES.get(fw, 0)
-        # The image itself must fit, plus headroom for the unpacked packages
-        # and one extra copy per additional stack member.
-        base = (max(MIN_FREE_BYTES, fw_size + EXTRA_HEADROOM_BYTES) if fw_size
-                else MIN_FREE_BYTES + EXTRA_HEADROOM_BYTES)
-        need = base + STACK_MEMBER_HEADROOM * (info["members"] - 1)
-        info["fw_size"] = fw_size
-        info["needed_bytes"] = need
-        if free is not None and free < need:
-            info["error"] = ("insufficient_space: %d free, %d needed on %s"
-                             % (free, need, host))
-            return info
-        if free is None:
-            dev_log(host, "WARN", "could not read flash free space; continuing")
-
-        boot_out = _sh(conn, "show boot | include BOOT", 60, host)
-        boot_line = ""
-        for line in (boot_out or "").splitlines():
-            if "BOOT" in line.upper() and "variable" in line.lower():
-                boot_line = line.strip()
-                break
-        if not boot_line:
-            boot_line = (boot_out or "").strip().splitlines()[-1] if (boot_out or "").strip() else ""
-        if "packages.conf" in boot_line:
-            info["boot_mode"] = "install"
-        elif ".bin" in boot_line:
-            info["boot_mode"] = "bundle"
-        else:
-            info["boot_mode"] = "unknown"
-        if info["boot_mode"] == "bundle":
-            if not ALLOW_BUNDLE_MODE_CONVERSION:
-                info["error"] = ("not_install_mode: bundle boot and conversion "
-                                 "is disabled (--no-bundle-mode)")
-                return info
-            ok, msg = ensure_install_mode(conn, host)
-            if not ok:
-                info["error"] = "not_install_mode: %s" % msg
-                return info
-            info["boot_mode"] = "install"
-
-        info["ok"] = True
-        return info
-    except Exception as exc:
-        info["error"] = _one_line("%s: %s" % (type(exc).__name__, exc))
-        return info
-
-
-def ensure_install_mode(conn: Any, host: str) -> Tuple[bool, str]:
-    """Convert a bundle-boot device to install mode (we never upgrade bundles)."""
-    dir_out = _sh(conn, "dir flash: | include packages.conf", 60, host)
-    if "packages.conf" not in (dir_out or ""):
-        return (False, "packages.conf missing on flash")
-    _send_long(conn, "configure terminal", 30, host, answer_confirm=False)
-    _send_long(conn, "no boot system", 30, host, answer_confirm=False)
-    _send_long(conn, "boot system flash:packages.conf", 30, host, answer_confirm=False)
-    _send_long(conn, "end", 30, host, answer_confirm=False)
-    dev_log(host, "OK", "boot variable switched to packages.conf (install mode)")
-    return (True, "install mode enabled")
-
-
-def _one_line(text: Any, limit: int = 200) -> str:
-    """Collapse a multi-line exception (netmiko loves those) into one line."""
-    flat = re.sub(r"\s+", " ", str(text or "")).strip()
-    return flat[:limit]
-
-
-def peek_device(ip: str, host: str, user: str, pw: str,
-                enable_pw: str = "") -> Dict[str, Any]:
-    """Cheap read-only sweep used by --check and the model pre-scan.
-
-    A TCP/22 probe runs first: on a 500 device fleet, waiting out a 30 s SSH
-    timeout for every powered-off switch dominates the run time.
-    """
-    conn = None
-    result = {"hostname": host, "ip": ip, "model": "", "version": "", "error": ""}
-    if not ssh_reachable(ip):
-        result["error"] = "unreachable on tcp/22"
-        return result
-    try:
-        conn = do_connect(ip, host, user, pw, enable_pw, fast=True)
-        if not ensure_priv15(conn, host):
-            result["error"] = "not priv 15"
-            ver_out = _sh(conn, "show version", 120, host)
-            result["version"] = parse_running_version(ver_out)
-            result["model"] = parse_model(ver_out)
-            return result
-        ver_out = _sh(conn, "show version", 120, host)
-        result["version"] = parse_running_version(ver_out)
-        result["model"] = parse_model(ver_out)
-        if not result["version"]:
-            result["error"] = "could not parse version"
-    except Exception as exc:
-        result["error"] = classify_connect_error(exc) or \
-            _one_line("%s: %s" % (type(exc).__name__, exc))
-    finally:
-        _disconnect(conn)
-    return result
-
-
-def backup_config(conn: Any, host: str) -> str:
-    """Snapshot the running config into backups\\<host>_<RUN_ID>_pre.cfg."""
-    text = _sh(conn, "show running-config", 180, host)
-    if text:
-        path = BACKUP_DIR / ("%s_%s_pre.cfg" % (host, RUN_ID))
-        try:
-            _ensure_dir(BACKUP_DIR)
-            with open(path, "w", encoding="utf-8", errors="replace") as fh:
-                fh.write(text)
-            dev_log(host, "OK", "running-config backed up to %s" % path.name)
-        except Exception as exc:
-            dev_log(host, "WARN", "backup failed: %s" % exc)
-    return text
-
-
-def _normalize_config(text: str) -> List[str]:
-    """Bug B14: drop the exact line ``end`` only.
-
-    Dropping every line that merely starts with "end" would destroy
-    ``endpoint-*`` / ``end-user-*`` style configuration lines.
-    """
-    out: List[str] = []
-    for line in (text or "").splitlines():
-        stripped = line.strip()
-        if stripped == "end":
-            continue
-        if not stripped:
-            continue
-        out.append(stripped)
-    return out
-
-
-def _is_drift_noise(line: str) -> bool:
-    """True for lines the orchestrator itself adds or removes.
-
-    The service locks and the SSH/crypto tuning are restored later, so seeing
-    them in a config diff is expected and must never be reported as drift.
-    """
-    body = line.lstrip("+-").strip()
-    return any(body.startswith(prefix) for prefix in DRIFT_NOISE_PREFIXES)
-
-
-def config_diff(pre: str, post: str) -> List[str]:
-    """Normalized config diff with the orchestrator's own changes filtered out."""
-    if not pre or not post:
-        return []
-    pre_set = set(_normalize_config(pre))
-    post_set = set(_normalize_config(post))
-    changed = sorted((pre_set - post_set) | (post_set - pre_set))
-    return [line for line in changed if not _is_drift_noise(line)]
-
-
-def config_diff_lines(pre: str, post: str) -> int:
-    return len(config_diff(pre, post))
-
-
-def health_check(conn: Any, host: str, expected_members: int = 1) -> Tuple[bool, str]:
-    intf = _sh(conn, "show ip interface brief", 90, host)
-    up = len(re.findall(r"\bup\s+up\b", intf or "", re.I))
-    sw = _sh(conn, "show switch", 60, host)
-    members = parse_stack_members(sw) if sw else expected_members
-    version = parse_running_version(_sh(conn, "show version | include Version", 60, host))
-    ok = up > 0 and members >= max(1, expected_members)
-    detail = "interfaces_up=%d stack_members=%d version=%s" % (up, members, version or "?")
-    return ok, detail
-
-
-# ===========================================================================
-#  SCP / SFTP TRANSFER
-# ===========================================================================
-def _pscp_pwfile() -> str:
-    return "%s%d_%d.tmp" % (_PWFILE_BASE, os.getpid(), threading.get_ident())
-
-
-def _write_pwfile(path: str, pw: str) -> bool:
-    try:
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(pw)
-        return True
-    except Exception:
-        return False
-
-
-def _kill_proc(proc: Any) -> None:
-    """terminate(), then kill() as the fallback (see ROBUSTNESS)."""
-    try:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            pass
-        if proc.poll() is None:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-
-def _parse_pscp_pct(text: str) -> Optional[float]:
-    m = re.search(r"(\d{1,3})\s*%", text or "")
-    if m:
-        try:
-            return float(m.group(1))
-        except Exception:
-            return None
-    return None
-
-
-def _remote_file_size(ip: str, user: str, pw: str, remote_name: str, host: str = "") -> Optional[int]:
-    """Probe the size of the partially transferred file on the switch.
-
-    Two attempts per probe; the caller runs this on its own connection so the
-    pscp pipe is never disturbed.
-    """
-    if ConnectHandler is None:
-        return None
-    if not SESSION_SEM.acquire(timeout=1):
-        return None
-    try:
-        for _attempt in range(2):
-            conn = None
-            try:
-                conn = do_connect(ip, host, user, pw, fast=True)
-                out = _sh(conn, "dir flash:%s" % remote_name, 60, host)
-                size = parse_dir_size(out, remote_name) if out else None
-                if size:
-                    return size
-            except Exception:
-                time.sleep(2)
-            finally:
-                _disconnect(conn)
-        return None
-    finally:
-        try:
-            SESSION_SEM.release()
-        except Exception:
-            pass
-    return None
-
-
-def _pscp_run_once(ip: str, user: str, pw: str, local_path: str, remote_name: str,
-                   host: str = "") -> Dict[str, Any]:
-    """One pscp attempt.
-
-    Bug B1: ``select.select()`` on a Windows pipe raises OSError(10038), so the
-    old code silently blocked in read() and the stall watchdog never fired.
-    A reader thread now drains proc.stdout into a bounded queue and the main
-    loop uses ``q.get(timeout=3.0)``.
-    """
-    result: Dict[str, Any] = {"ok": False, "error": "", "bytes": 0,
-                              "seconds": 0.0, "stalled": False, "output": []}
-    exe = str(PSCP_EXE)
-    if not os.path.exists(exe):
-        result["error"] = "pscp.exe not found at %s" % exe
-        return result
-    if not os.path.exists(local_path):
-        result["error"] = "firmware not found: %s" % local_path
-        return result
-
-    pwfile = _pscp_pwfile()
-    use_pwfile = _write_pwfile(pwfile, pw)
-    started = time.time()
-    try:
-        base = [exe, "-batch"]
-        if use_pwfile:
-            base += ["-pwfile", pwfile]
-        else:
-            base += ["-pw", pw]
-        cmd = base + ["-scp", "-unsafe", local_path, "%s@%s:flash:/%s" % (user, ip, remote_name)]
-        dev_log(host, "CMD", "pscp -> %s:flash:/%s" % (ip, remote_name))
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, bufsize=0)
-
-        q: "queue.Queue[bytes]" = queue.Queue(maxsize=1024)
-
-        def _reader() -> None:
-            try:
-                for chunk in iter(proc.stdout.readline, b""):
-                    try:
-                        q.put(chunk, timeout=1.0)
-                    except queue.Full:
-                        pass
-            except Exception:
-                pass
-            finally:
-                try:
-                    proc.stdout.close()
-                except Exception:
-                    pass
-
-        reader = threading.Thread(target=_reader, name="pscp-reader-%s" % (host or ip), daemon=True)
-        reader.start()
-
-        last_data = time.time()
-        last_probe = time.time()
-        last_size = 0
-        no_growth = 0
-        stdin_closed = False
-        while True:
-            if SHUTDOWN_REQ.is_set():
-                _kill_proc(proc)
-                result["error"] = "shutdown requested"
-                result["stalled"] = True
-                break
-            line = None
-            try:
-                line = q.get(timeout=3.0)
-            except queue.Empty:
-                line = None
-            if line is not None:
-                text = line.decode("utf-8", "replace").rstrip("\r\n")
-                if text:
-                    result["output"].append(text)
-                    if len(result["output"]) > 400:
-                        del result["output"][:200]
-                    last_data = time.time()
-                    if host:
-                        dev_live_log(host, text)
-                    if not stdin_closed:
-                        pct = _parse_pscp_pct(text)
-                        if pct is not None:
-                            set_phase(host, "TRANSFER", _progress_bar(pct), pct=pct)
-                        elif "password" in text.lower() or "are you sure" in text.lower():
-                            try:
-                                proc.stdin.write(b"y\n")
-                                if hasattr(proc.stdin, "flush"):
-                                    proc.stdin.flush()
-                            except Exception:
-                                pass
-            if proc.poll() is not None and q.empty() and not reader.is_alive():
-                break
-            now = time.time()
-            if line is None and (now - last_data) > SCP_STALL_TIMEOUT:
-                dev_log(host, "ERROR", "pscp produced no output for %ds; killing transfer"
-                        % SCP_STALL_TIMEOUT)
-                _kill_proc(proc)
-                result["error"] = "transfer stalled (>%ds without output)" % SCP_STALL_TIMEOUT
-                result["stalled"] = True
-                break
-            if line is None and (now - last_probe) > SCP_SIZE_CHECK_INTERVAL:
-                last_probe = now
-                size = _remote_file_size(ip, user, pw, remote_name, host)
-                if size is not None:
-                    if size > last_size:
-                        last_size = size
-                        no_growth = 0
-                        last_data = now  # remote side is making progress
-                    else:
-                        no_growth += 1
-                        if no_growth >= 3:
-                            dev_log(host, "ERROR", "remote file size static at %d for %d probes"
-                                    % (size, no_growth))
-                            _kill_proc(proc)
-                            result["error"] = "transfer stalled (remote size static)"
-                            result["stalled"] = True
-                            break
-
-        rc = proc.poll()
-        if rc is None:
-            try:
-                rc = proc.wait(timeout=20)
-            except Exception:
-                _kill_proc(proc)
-                rc = -1
-        result["seconds"] = round(time.time() - started, 1)
-        result["bytes"] = last_size or (os.path.getsize(local_path) if os.path.exists(local_path) else 0)
-        if result["error"]:
-            result["ok"] = False
-        elif rc == 0:
-            result["ok"] = True
-        else:
-            tail = "\n".join(result["output"][-6:])
-            result["error"] = "pscp exited %s: %s" % (rc, tail.strip()[-400:])
-            if "-pwfile" in cmd and re.search(r"(unknown option|illegal option|-pwfile)", tail, re.I):
-                result["retry_with_pw"] = True
-        return result
-    except Exception as exc:
-        result["error"] = _one_line("%s: %s" % (type(exc).__name__, exc))
-        return result
-    finally:
-        try:
-            if os.path.exists(pwfile):
-                os.remove(pwfile)
-        except Exception:
-            pass
-
-
-def _sftp_transfer(ip: str, user: str, pw: str, local_path: str, remote_name: str,
-                   host: str = "") -> Dict[str, Any]:
-    """paramiko SFTP fallback when pscp is unusable."""
-    out: Dict[str, Any] = {"ok": False, "error": "", "bytes": 0, "seconds": 0.0,
-                           "stalled": False, "output": []}
-    if paramiko is None:
-        out["error"] = "paramiko not installed for SFTP fallback"
-        return out
-    started = time.time()
-    client = None
-    sftp = None
-    try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(ip, username=user, password=pw, timeout=CONNECT_TIMEOUT_SEC,
-                       banner_timeout=CONNECT_TIMEOUT_SEC, auth_timeout=CONNECT_TIMEOUT_SEC,
-                       look_for_keys=False, allow_agent=False)
-        transport = client.get_transport()
-        if transport is not None:
-            transport.set_keepalive(30)
-        sftp = client.open_sftp()
-        total = os.path.getsize(local_path)
-        remote = "flash:/%s" % remote_name
-        sent = {"n": 0}
-
-        def _cb(done: int, _total: int) -> None:
-            sent["n"] = done
-            pct = (done / total * 100.0) if total else 0.0
-            set_phase(host, "TRANSFER", _progress_bar(pct), pct=pct)
-
-        sftp.put(local_path, remote, callback=_cb)
-        out["ok"] = True
-        out["bytes"] = sent["n"] or total
-        out["seconds"] = round(time.time() - started, 1)
-        return out
-    except Exception as exc:
-        out["error"] = "sftp fallback failed: %s: %s" % (type(exc).__name__, exc)
-        return out
-    finally:
-        for obj in (sftp, client):
-            try:
-                if obj is not None:
-                    obj.close()
-            except Exception:
-                pass
-
-
-def transfer_firmware(dev: Any, user: str, pw: str, fw_file: str) -> Dict[str, Any]:
-    """pscp with retries, with an SFTP fallback when pscp cannot be used."""
-    host = dev.hostname
-    local_path = str(FIRMWARE_DIR / fw_file)
-    if not os.path.exists(local_path):
-        return {"ok": False, "error": "firmware missing locally: %s" % local_path}
-    local_size = os.path.getsize(local_path)
-    last: Dict[str, Any] = {"ok": False, "error": "no attempt made"}
-    for attempt in range(1, max(1, TRANSFER_RETRY_ATTEMPTS) + 1):
-        if SHUTDOWN_REQ.is_set():
-            return {"ok": False, "error": "shutdown requested"}
-        set_phase(host, "TRANSFER", "attempt %d/%d" % (attempt, TRANSFER_RETRY_ATTEMPTS))
-        if USE_PSCP:
-            last = _pscp_run_once(dev.ip, user, pw, local_path, fw_file, host)
-            if last.get("retry_with_pw"):
-                last = _pscp_run_once(dev.ip, user, pw, local_path, fw_file, host)
-        if not last.get("ok") and PSCP_TRANSFER_FALLBACK:
-            dev_log(host, "WARN", "pscp failed (%s); trying SFTP fallback" % last.get("error"))
-            fallback = _sftp_transfer(dev.ip, user, pw, local_path, fw_file, host)
-            if fallback.get("ok"):
-                last = fallback
-        if last.get("ok"):
-            remote_size = _remote_file_size(dev.ip, user, pw, fw_file, host)
-            if remote_size is not None and abs(remote_size - local_size) > 4096:
-                last = {"ok": False, "error": "size mismatch: local=%d remote=%d"
-                        % (local_size, remote_size)}
-            else:
-                last["local_size"] = local_size
-                dev_log(host, "OK", "transfer complete in %.1fs" % last.get("seconds", 0.0))
-                return last
-        dev_log(host, "WARN", "transfer attempt %d/%d failed: %s"
-                % (attempt, TRANSFER_RETRY_ATTEMPTS, last.get("error")))
-        if attempt < TRANSFER_RETRY_ATTEMPTS:
-            SHUTDOWN_REQ.wait(TRANSFER_RETRY_DELAY_SEC)
-    return last
-
-
-def local_md5(path: str, chunk: int = 1024 * 1024) -> str:
-    digest = hashlib.md5()
-    with open(path, "rb") as fh:
-        while True:
-            block = fh.read(chunk)
-            if not block:
-                break
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _extract_md5(text: str) -> str:
-    m = re.search(r"=\s*([0-9a-fA-F]{32})\b", text or "")
-    if m:
-        return m.group(1).lower()
-    m = re.search(r"\b([0-9a-fA-F]{32})\b", text or "")
-    return m.group(1).lower() if m else ""
-
-
-def verify_firmware_md5(conn: Any, host: str, fw_file: str, local_path: str) -> Tuple[bool, str]:
-    """Hash verified transfer (VERIFY_TRANSFER_HASH); size check as the fallback."""
-    local_size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
-    dir_out = _sh(conn, "dir flash:%s" % fw_file, 60, host)
-    remote_size = parse_dir_size(dir_out, fw_file)
-    if remote_size is None:
-        return (False, "size mismatch: cannot read flash entry for %s" % fw_file)
-    if abs(remote_size - local_size) > 4096:
-        return (False, "size mismatch: local=%d remote=%d" % (local_size, remote_size))
-    if not VERIFY_TRANSFER_HASH:
-        return (True, "size ok (%d bytes)" % remote_size)
-    out, why = _send_long(conn, "verify /md5 flash:%s" % fw_file, MD5_DEADLINE_SEC, host)
-    if why in ("dead", "shutdown"):
-        return (False, "session lost during md5 verification")
-    remote_md5 = _extract_md5(out)
-    if not remote_md5:
-        dev_log(host, "WARN", "could not parse remote md5; accepting size match")
-        return (True, "size ok (%d bytes), md5 unparsed" % remote_size)
-    want = local_md5(local_path)
-    if remote_md5 != want:
-        return (False, "MD5 mismatch: local=%s remote=%s" % (want, remote_md5))
-    return (True, "md5 verified (%s)" % want)
-
-
-# ===========================================================================
-#  STATE CLASSIFIER  (design rule P1 -- exact rules from the specification)
-# ===========================================================================
-def _file_on_flash(conn: Any, host: str, fw_file: str) -> bool:
-    if not fw_file:
-        return False
-    out = _sh(conn, "dir flash: | include %s" % fw_file, 90, host)
-    if out and fw_file in out:
-        return True
-    if not out:
-        full = _sh(conn, "dir flash:", 120, host)
-        return fw_file in (full or "")
-    return False
-
-
-def classify_state(conn: Any, host: str, ip: str, target_ver: str, fw_file: str,
-                   st: Optional[Dict[str, Any]] = None,
-                   skip_log_check: bool = False) -> Tuple[str, Dict[str, Any]]:
-    """Read state (in order), then return exactly one classification."""
-    st = st if st is not None else {}
-    info: Dict[str, Any] = {"version": "", "target_status": None, "summary": {},
-                            "file_on_flash": False, "reason": ""}
-    if conn is None or not _session_is_alive(conn):
-        info["reason"] = "session dead"
-        return ("UNREACHABLE", info)
-
-    ver_out = _sh(conn, "show version | include Version", 90, host)
-    if not (ver_out or "").strip():
-        if not _session_is_alive(conn):
-            info["reason"] = "session died on show version"
-            return ("UNREACHABLE", info)
-        info["reason"] = "show version returned nothing"
-        return ("UNKNOWN", info)
-    running_ver = parse_running_version(ver_out)
-    if not running_ver:
-        info["reason"] = "unparseable version output"
-        return ("UNKNOWN", info)
-    info["version"] = running_ver
-    running_target = (_ver_tuple(running_ver) == _ver_tuple(target_ver))
-
-    boot_out = _sh(conn, "show boot | include BOOT", 60, host)
-    info["boot"] = (boot_out or "").strip()[-160:]
-
-    summary_out = _sh(conn, "show install summary", 120, host)
-    if not (summary_out or "").strip():
-        info["reason"] = "show install summary returned nothing"
-        return ("UNKNOWN", info)
-    summary = _parse_install_summary(summary_out)
-    info["summary"] = summary
-    info["summary_raw"] = _trim1200(summary_out)
-    target_status = _sum_status_for(summary, target_ver)
-    info["target_status"] = target_status
-
-    file_on_flash = _file_on_flash(conn, host, fw_file)
-    info["file_on_flash"] = file_on_flash
-
-    if running_target and summary_committed_on_target(summary, target_ver):
-        info["reason"] = "version and summary both on target"
-        return ("DONE_COMMITTED", info)
-
-    if running_target and target_status in ("A", "U"):
-        info["reason"] = "running target, summary %s" % target_status
-        return ("RUNNING_UNCOMMITTED", info)
-
-    if running_target and target_status is None:
-        info["reason"] = "running target, summary parser miss"
-        return ("RUNNING_UNKNOWN", info)
-
-    if target_status == "I":
-        info["reason"] = "target present but inactive"
-        return ("ACTIVATABLE_INACTIVE", info)
-
-    if target_status in ("A", "U") and not running_target:
-        info["reason"] = "summary %s, running %s" % (target_status, running_ver)
-        return ("ACTIVATED_NEEDS_RELOAD", info)
-
-    if target_status == "C" and not running_target:
-        info["reason"] = "summary committed, running %s" % running_ver
-        return ("COMMITTED_NEEDS_RELOAD", info)
-
-    # BROKEN fires only here: no DB entry, not running the target, file present
-    # on flash and the install log shows an engine exit(N).
-    if (target_status is None and not running_target and file_on_flash
-            and not skip_log_check and not st.get("escalated")):
-        log_out = _sh(conn, "show install log | include exit", 120, host)
-        info["install_log"] = _trim1200(log_out)
-        if "exit(" in (log_out or ""):
-            info["reason"] = "install log reports a failed engine run"
-            return ("BROKEN", info)
-
-    if file_on_flash and target_status is None:
-        info["reason"] = "file on flash, no install DB entry"
-        return ("NEEDS_ADD", info)
-
-    if not file_on_flash:
-        info["reason"] = "firmware not on flash"
-        return ("NEEDS_TRANSFER", info)
-
-    info["reason"] = "no rule matched"
-    return ("UNKNOWN", info)
-
-
-def _finalize_install_commit(conn: Any, host: str, target_ver: str,
-                             fw_file: str) -> Tuple[bool, str]:
-    """Confirm the target is committed.
-
-    The strict ``show install summary`` check comes first.  When it cannot
-    confirm, the commit command is issued (this is the RUNNING_UNCOMMITTED
-    action), and only then do the parser-independent signals get consulted:
-    ``show install active summary`` and ``show boot`` = packages.conf together
-    with ``show version`` = target.
-    """
-    out = _sh(conn, "show install summary", 120, host)
-    summary = _parse_install_summary(out)
-    if summary_committed_on_target(summary, target_ver):
-        return (True, "summary shows %s committed" % target_ver)
-
-    _out, why = _send_long(conn, "install commit", COMMIT_DEADLINE_SEC, host)
-    if why in ("dead", "shutdown"):
-        return (False, "session lost during install commit")
-
-    confirm = _sh(conn, "show install summary", 120, host)
-    confirm_summary = _parse_install_summary(confirm)
-    if summary_committed_on_target(confirm_summary, target_ver):
-        return (True, "install commit accepted")
-    if _sum_status_for(confirm_summary, target_ver) == "C":
-        return (True, "install commit accepted (summary)")
-
-    active = _sh(conn, "show install active summary", 120, host)
-    active_summary = _parse_install_summary(active)
-    if _sum_status_for(active_summary, target_ver) == "C" or \
-            summary_committed_on_target(active_summary, target_ver):
-        return (True, "active summary shows %s committed" % target_ver)
-
-    boot_out = _sh(conn, "show boot | include BOOT", 60, host)
-    ver_out = _sh(conn, "show version | include Version", 60, host)
-    running = parse_running_version(ver_out)
-    if (why == "done" and "packages.conf" in (boot_out or "")
-            and _ver_tuple(running) == _ver_tuple(target_ver)):
-        return (True, "commit accepted (boot=packages.conf, version=%s)" % running)
-    return (False, "commit not confirmed (%s)" % why)
-
-
-# ===========================================================================
-#  STATE MACHINE  (one read, one classify, one command, loop)
-# ===========================================================================
-def run_state_machine(conn: Any, host: str, ip: str, user: str, pw: str,
-                      target_ver: str, fw_file: str, syntax: Dict[str, Any],
-                      st: Dict[str, Any]) -> Tuple[bool, str, Any]:
-    """Drive one device to DONE_COMMITTED.
-
-    Returns ``(ok, error, conn)``.  ``conn`` is None when a reload was issued
-    and the caller must wait for the device and reconnect.
-    """
-    deadline = time.time() + STATE_MACHINE_DEADLINE
-    while True:
-        if SHUTDOWN_REQ.is_set():
-            return (False, "shutdown requested", conn)
-        # Bug B3: the escalation cap is checked at the TOP of the loop, before
-        # the classification, so a device wedged on ACTIVATABLE_INACTIVE cannot
-        # spin until STATE_MAX_SAME.
-        if st.get("escalations", 0) > MAX_ESCALATIONS:
-            return (False, "max escalations (%d) exceeded" % st.get("escalations", 0), conn)
-        if time.time() > deadline:
-            return (False, "state machine deadline (%ds) exceeded" % STATE_MACHINE_DEADLINE, conn)
-
-        state, info = classify_state(conn, host, ip, target_ver, fw_file, st,
-                                     skip_log_check=bool(st.get("escalated")))
-        if state == st.get("last_state"):
-            st["same"] = st.get("same", 0) + 1
-        else:
-            st["same"] = 0
-            st["last_state"] = state
-        if st["same"] >= STATE_MAX_SAME:
-            st["escalations"] = st.get("escalations", 0) + 1
-            st["same"] = 0
-            dev_log(host, "WARN", "state %s repeated %d times -> escalation %d"
-                    % (state, STATE_MAX_SAME, st["escalations"]))
-            if st["escalations"] > MAX_ESCALATIONS:
-                return (False, "stuck in %s for %d polls" % (state, STATE_MAX_SAME), conn)
-
-        set_phase(host, "INSTALL", state)
-        dev_log(host, "STEP", "state=%s version=%s summary=%s file=%s (%s)"
-                % (state, info.get("version"), info.get("summary"),
-                   info.get("file_on_flash"), info.get("reason")))
-
-        if state == "DONE_COMMITTED":
-            return (True, "", conn)
-
-        if state == "RUNNING_UNCOMMITTED":
-            ok, msg = _finalize_install_commit(conn, host, target_ver, fw_file)
-            st["attempts"] = st.get("attempts", 0) + 1
-            if ok:
-                dev_log(host, "OK", msg)
-                return (True, "", conn)
-            dev_log(host, "WARN", "commit finalisation: %s" % msg)
-
-        elif state == "RUNNING_UNKNOWN":
-            st["commit_tries"] = st.get("commit_tries", 0) + 1
-            _out, why = _send_long(conn, "install commit", COMMIT_DEADLINE_SEC, host)
-            if why == "dead":
-                conn = _fresh_conn(conn, host, ip, user, pw)
-                if conn is None:
-                    return (False, "unreachable during commit", None)
-            if st["commit_tries"] >= 3:
-                dev_log(host, "WARN", "accepting device after 3 unparsed commit attempts")
-                return (True, "", conn)
-
-        elif state == "ACTIVATABLE_INACTIVE":
-            accepted = False
-            forms = build_activate_cmds(fw_file, syntax)
-            for idx, cmd in enumerate(forms):
-                out, why = _send_long(conn, cmd, ACTIVATE_DEADLINE_SEC, host)
-                if why in ("dead", "shutdown"):
-                    conn = _fresh_conn(conn, host, ip, user, pw)
-                    if conn is None:
-                        return (False, "unreachable during activate", None)
-                    break
-                if why == "fastfail" and _ACTIVATE_REJECT_RE.search(out or ""):
-                    dev_log(host, "WARN", "activate form rejected: %s" % cmd)
-                    if idx + 1 < len(forms):
-                        continue
-                    st["escalations"] = st.get("escalations", 0) + 1
-                else:
-                    accepted = True
-                break
-            if not accepted:
-                st["attempts"] = st.get("attempts", 0) + 1
-
-        elif state in ("ACTIVATED_NEEDS_RELOAD", "COMMITTED_NEEDS_RELOAD"):
-            st["reloads"] = st.get("reloads", 0) + 1
-            if st["reloads"] > 1:
-                return (False, "reload loop detected (%s after reload)" % state, conn)
-            _issue_reload(conn, host)
-            _disconnect(conn)
-            return (True, "", None)
-
-        elif state == "BROKEN":
-            _send_long(conn, "install abort", 300, host)
-            _send_long(conn, "install remove inactive", 900, host)
-            st["escalated"] = True
-            st["escalations"] = st.get("escalations", 0) + 1
-            dev_log(host, "WARN", "install DB cleared (BROKEN) -> escalation %d"
-                    % st["escalations"])
-
-        elif state == "NEEDS_ADD":
-            out, why = _send_long(conn, "install add file flash:%s" % fw_file,
-                                  INSTALL_ADD_DEADLINE_SEC, host)
-            if why == "dead":
-                conn = _fresh_conn(conn, host, ip, user, pw)
-                if conn is None:
-                    return (False, "unreachable during install add", None)
-            elif why == "fastfail":
-                st["escalations"] = st.get("escalations", 0) + 1
-                dev_log(host, "ERROR", "install add failed: %s" % (out or "")[-300:])
-            st["attempts"] = st.get("attempts", 0) + 1
-
-        elif state == "NEEDS_TRANSFER":
-            return (False, "needs_transfer", conn)
-
-        elif state == "UNREACHABLE":
-            conn = _fresh_conn(conn, host, ip, user, pw)
-            if conn is None:
-                return (False, "unreachable", None)
-
-        elif state == "UNKNOWN":
-            pass
-
-        SHUTDOWN_REQ.wait(STATE_POLL_INTERVAL)
-
-
-# ===========================================================================
-#  POST RELOAD WORK
-# ===========================================================================
-def wait_reboot_and_verify(ip: str, target_ver: str, host: str, user: str, pw: str,
-                           st: Dict[str, Any], pre_config: str, fw_file: str,
-                           syntax: Dict[str, Any]) -> Tuple[bool, str, Any]:
-    """Ping down -> ping up -> SSH up -> settle -> finalise -> health check."""
-    set_phase(host, "REBOOT", "waiting for link down")
-    _wait_ping(ip, expect_up=False, timeout=PING_DOWN_TIMEOUT_SEC, poll=PING_DOWN_POLL_SEC, host=host)
-    set_phase(host, "REBOOT", "waiting for link up")
-    if not _wait_ping(ip, expect_up=True, timeout=PING_UP_TIMEOUT_SEC, poll=PING_UP_POLL_SEC, host=host):
-        return (False, "device did not come back (ping timeout)", None)
-
-    set_phase(host, "REBOOT", "waiting for ssh")
-    conn = None
-    deadline = time.time() + POST_REBOOT_SSH_WAIT_SEC
-    attempts = 0
-    while attempts < POST_REBOOT_MAX_ATTEMPTS and time.time() < deadline:
-        if SHUTDOWN_REQ.is_set():
-            return (False, "shutdown requested", None)
-        attempts += 1
-        if not ssh_port_open(ip, timeout=3):
-            # Port still closed: the box is mid-boot.  Probing first avoids
-            # burning auth attempts (and TACACS+ lockout counters) on a switch
-            # whose SSH daemon has not started yet.
-            SHUTDOWN_REQ.wait(POST_REBOOT_DELAY_SEC)
-            continue
-        try:
-            conn = do_connect(ip, host, user, pw, pw)
-        except Exception as exc:
-            dev_log(host, "INFO", "post-reboot ssh attempt %d: %s"
-                    % (attempts, classify_connect_error(exc) or
-                       _one_line(exc, 120)))
-            conn = None
-        if conn is not None:
-            break
-        SHUTDOWN_REQ.wait(POST_REBOOT_DELAY_SEC)
-    if conn is None:
-        return (False, "ssh did not return after reload", None)
-
-    set_phase(host, "VERIFY", "settling")
-    # Bug B8: shutdown aware wait keeps Ctrl+C responsive during the settle.
-    SHUTDOWN_REQ.wait(POST_REBOOT_SETTLE_SEC)
-    if SHUTDOWN_REQ.is_set():
-        return (False, "shutdown requested", conn)
-
-    set_phase(host, "VERIFY", "finalising install")
-    ok, err, conn = run_state_machine(conn, host, ip, user, pw, target_ver, fw_file, syntax, st)
-
-    set_phase(host, "VERIFY", "version check")
-    ver_out = _sh(conn, "show version | include Version", 90, host)
-    post_ver = parse_running_version(ver_out)
-    st["post_version"] = post_ver
-    if _ver_tuple(post_ver) != _ver_tuple(target_ver):
-        return (False, "post-reboot version %s != %s" % (post_ver or "?", target_ver), conn)
-
-    health_ok, health_msg = health_check(conn, host, st.get("members", 1))
-    dev_log(host, "OK" if health_ok else "WARN", "post-reboot health: %s" % health_msg)
-
-    if pre_config and not SKIP_CONFIG_DRIFT_CHECK:
-        post_config = _sh(conn, "show running-config", 180, host)
-        drift = config_diff(pre_config, post_config)
-        st["config_diff_lines"] = len(drift)
-        if drift:
-            dev_log(host, "WARN", "config drift: %d unexpected line(s): %s"
-                    % (len(drift), "; ".join(drift[:5])))
-
-    if not health_ok:
-        return (False, "post-reboot health check failed: %s" % health_msg, conn)
-    return (ok, err, conn)
-
-
-# ===========================================================================
-#  DEVICE MODEL AND RUN BOOKKEEPING
-# ===========================================================================
-@dataclass
-class Device:
-    hostname: str
-    ip: str
-    location: str = ""
-    model: str = ""
-    model_hint: str = ""
-    start_version: str = ""
-    fw_file: str = ""
-    target: str = TARGET_VERSION
-
-    def to_row(self) -> Dict[str, Any]:
-        return {"hostname": self.hostname, "ip": self.ip, "model": self.model or self.model_hint,
-                "start_version": self.start_version, "target_version": self.target,
-                "fw_file": self.fw_file, "location": self.location}
-
-
-@dataclass
-class RunCtx:
-    user: str = ""
-    pw: str = ""
-    enable_pw: str = ""
-    location: str = ""
-    run_id: str = RUN_ID
-
-
-RUN_RECORDS: Dict[str, Dict[str, Any]] = {}
-RUN_RECORDS_LOCK = threading.RLock()
-_CKPT_LOCK = threading.RLock()
-_CKPT_SEEN: Dict[str, str] = {}
-
-RECORD_FIELDS = ["hostname", "ip", "status", "stage", "start_version", "target_version",
-                 "post_version", "fw_file", "md5_ok", "install_started", "reboot_detected",
-                 "verify_pending", "clock_corrected", "config_diff_lines", "duration_sec",
-                 "attempts", "error"]
-
-
-def new_record(dev: Device, location: str) -> Dict[str, Any]:
-    rec = {k: "" for k in RECORD_FIELDS}
-    rec.update({"hostname": dev.hostname, "ip": dev.ip, "location": location,
-                "status": "PENDING", "stage": "QUEUE", "target_version": dev.target or TARGET_VERSION,
-                "md5_ok": "", "install_started": False, "reboot_detected": False,
-                "verify_pending": True, "clock_corrected": False, "config_diff_lines": 0,
-                "duration_sec": 0.0, "attempts": 0, "error": ""})
-    with RUN_RECORDS_LOCK:
-        RUN_RECORDS[dev.hostname] = rec
-    return rec
-
-
-def update_record(host: str, **fields: Any) -> None:
-    with RUN_RECORDS_LOCK:
-        rec = RUN_RECORDS.get(host)
-        if rec is None:
-            return
-        for key, value in fields.items():
-            if key in rec:
-                rec[key] = value
-        location = rec.get("location") or ""
-        stage = rec.get("stage") or ""
-    if location and stage and stage != _CKPT_SEEN.get(host):
-        _CKPT_SEEN[host] = stage
-        touch_device_checkpoint(location, host, stage, rec.get("error", "") or "")
-
-
-def snapshot_records() -> List[Dict[str, Any]]:
-    with RUN_RECORDS_LOCK:
-        return [dict(rec) for rec in RUN_RECORDS.values()]
-
-
-def retryable_failure(host: str) -> bool:
-    """True when a failed device is worth another attempt.
-
-    Only transfer-phase failures qualify: once ``install add`` has started, a
-    retry risks fighting a half-finished install engine run, which is exactly
-    what NON_RETRYABLE_PREFIXES guards against.
-    """
-    with RUN_RECORDS_LOCK:
-        rec = RUN_RECORDS.get(host)
-        if not rec:
-            return False
-        record = dict(rec)
-    if record.get("status") != "FAILED":
-        return False
-    if record.get("install_started"):
-        return False
-    if (record.get("stage") or "").upper() not in ("QUEUE", "PRE-CHECK", "SERVICE-LOCKS",
-                                                   "TRANSFER", "RETRY"):
-        return False
-    error = (record.get("error") or "").strip()
-    if not error:
-        return False
-    lowered = error.lower()
-    return not any(lowered.startswith(prefix.lower()) for prefix in NON_RETRYABLE_PREFIXES)
-
-
-class large_guard:
-    """Throttle the number of C9300/C9500 transfers running at once."""
-
-    def __init__(self, needed: bool) -> None:
-        self.needed = bool(needed)
-        self.held = False
-
-    def __enter__(self) -> "large_guard":
-        if self.needed:
-            self.held = LARGE_SEM.acquire(timeout=3600)
-        return self
-
-    def __exit__(self, *exc: Any) -> None:
-        if self.needed and self.held:
-            try:
-                LARGE_SEM.release()
-            except Exception:
-                pass
-
-
-# ===========================================================================
-#  WORKERS
-# ===========================================================================
-def transfer_worker(dev: Device, user: str, pw: str, location_name: str,
-                    enable_pw: str = "") -> Dict[str, Any]:
-    """Lock services, pre-check, transfer the image, hand the session over.
-
-    The session built here is the one install_worker reuses, so ``install add``
-    and ``install activate`` cannot race the install engine lock (rule P2).
-    """
-    host = dev.hostname
-    started = time.time()
-    result: Dict[str, Any] = {"ok": False, "host": host, "ip": dev.ip, "error": "",
-                              "conn": None, "fw_file": "", "pre": {}, "pre_config": "",
-                              "target": dev.target or TARGET_VERSION, "syntax": {},
-                              "md5_ok": False, "dry_run": bool(DRY_RUN),
-                              "needs_transfer": False, "model": "", "members": 1,
-                              "clock_corrected": False, "duration": 0.0}
-    archive_device_log(host)
-    rec = new_record(dev, location_name)
-    rec["start_version"] = dev.start_version
-    conn = None
-    try:
-        set_phase(host, "QUEUE", "waiting for slot")
-        if SHUTDOWN_REQ.is_set():
-            result["error"] = "shutdown requested"
-            return result
-        set_phase(host, "PRE-CHECK", "probing ssh")
-        if not ssh_reachable(dev.ip):
-            result["error"] = "unreachable on tcp/22"
-            update_record(host, status="FAILED", stage="PRE-CHECK",
-                          error=result["error"])
-            dev_log(host, "ERROR", result["error"])
-            return result
-        set_phase(host, "PRE-CHECK", "connecting")
-        conn = do_connect(dev.ip, host, user, pw, enable_pw)
-        dev.model_hint = dev.model_hint or ""
-        if not ensure_priv15(conn, host):
-            result["error"] = "not priv 15"
-            update_record(host, status="FAILED", stage="PRE-CHECK",
-                          error=result["error"])
-            _disconnect(conn)
-            return result
-        set_phase(host, "SERVICE-LOCKS", "disabling mgmt services")
-        apply_service_locks(conn, host)
-        apply_exec_timeout(conn, host)
-
-        set_phase(host, "PRE-CHECK", "reading inventory")
-        pre = precheck_device(conn, host, dev.ip)
-        result["pre"] = pre
-        dev.model = pre.get("model") or dev.model_hint
-        dev.start_version = pre.get("version") or dev.start_version
-        dev.fw_file = pre.get("fw_file") or ""
-        dev.target = pre.get("target") or TARGET_VERSION
-        result["model"] = dev.model
-        result["members"] = pre.get("members", 1)
-        result["target"] = dev.target
-        result["syntax"] = pre.get("syntax", classify_install_syntax(_ver_tuple(dev.start_version)))
-        result["fw_file"] = dev.fw_file
-        rec["model"] = dev.model
-        rec["start_version"] = dev.start_version
-        rec["target_version"] = dev.target
-        rec["fw_file"] = dev.fw_file
-        update_record(host, model=dev.model, start_version=dev.start_version,
-                      target_version=dev.target, fw_file=dev.fw_file)
-        if not pre.get("ok"):
-            result["error"] = pre.get("error") or "precheck failed"
-            update_record(host, status="FAILED", stage="PRE-CHECK",
-                          error=result["error"])
-            dev_log(host, "ERROR", "precheck failed: %s" % result["error"])
-            _disconnect(conn)
-            return result
-
-        ssh_tune(conn, host, dev.model)
-        cheap_crypto(conn, host, dev.start_version)
-        if _ver_tuple(dev.start_version) != (0, 0, 0):
-            result["syntax"] = classify_install_syntax(_ver_tuple(dev.start_version))
-
-        set_phase(host, "PRE-CHECK", "clock check")
-        result["clock_corrected"] = fix_clock_drift(conn, host)
-        update_record(host, clock_corrected=bool(result["clock_corrected"]))
-
-        set_phase(host, "PRE-CHECK", "backing up config")
-        result["pre_config"] = backup_config(conn, host)
-
-        on_flash = _file_on_flash(conn, host, dev.fw_file)
-        need_transfer = not on_flash
-        if on_flash and FIRMWARE_RECHECK_BEFORE_TRANSFER:
-            dir_out = _sh(conn, "dir flash:%s" % dev.fw_file, 60, host)
-            size = parse_dir_size(dir_out, dev.fw_file)
-            local_size = os.path.getsize(str(FIRMWARE_DIR / dev.fw_file)) if dev.fw_file else 0
-            if size is None or (local_size and abs(size - local_size) > 4096):
-                dev_log(host, "WARN", "firmware on flash is incomplete (size=%s); re-transferring" % size)
-                need_transfer = True
-            else:
-                need_transfer = False
-        result["needs_transfer"] = need_transfer
-
-        if DRY_RUN:
-            result["ok"] = True
-            result["dry_run"] = True
-            rec["status"] = "DRY-RUN"
-            rec["stage"] = "PRE-CHECK"
-            dev_log(host, "OK", "dry-run: would %s %s (model=%s running=%s)"
-                    % ("transfer" if need_transfer else "reuse", dev.fw_file, dev.model, dev.start_version))
-            result["duration"] = round(time.time() - started, 1)
-            return result
-
-        if need_transfer:
-            set_phase(host, "TRANSFER", "closing precheck session")
-            _disconnect(conn)
-            conn = None
-            with large_guard(is_large_model(dev.model)):
-                tr = transfer_firmware(dev, user, pw, dev.fw_file)
-            if not tr.get("ok"):
-                result["error"] = tr.get("error") or "transfer failed"
-                update_record(host, status="FAILED", stage="TRANSFER",
-                              error=result["error"])
-                dev_log(host, "ERROR", result["error"])
-                return result
-            set_phase(host, "TRANSFER", "reopening session")
-            conn = robust_reconnect(host, dev.ip, user, pw, enable_pw, 5, 20)
-            if conn is None:
-                result["error"] = "session lost after transfer"
-                update_record(host, status="FAILED", stage="TRANSFER",
-                              error=result["error"])
-                return result
-
-        result["ok"] = True
-        result["conn"] = conn
-        result["duration"] = round(time.time() - started, 1)
-        return result
-    except Exception as exc:
-        result["error"] = classify_connect_error(exc) or \
-            _one_line("%s: %s" % (type(exc).__name__, exc))
-        result["conn"] = None
-        dev_log(host, "ERROR", "transfer_worker crashed: %s" % traceback.format_exc(limit=3))
-        update_record(host, status="FAILED", stage="TRANSFER", error=result["error"])
-        _disconnect(conn)
-        return result
-
-
-def install_worker(dev: Device, user: str, pw: str, transfer_result: Dict[str, Any],
-                   location_name: str, enable_pw: str = "") -> Tuple[bool, Device, str, float, Dict[str, Any]]:
-    """Install phase for one device.  Always returns a 5-tuple, never raises."""
-    started = time.time()
-    host = dev.hostname
-    detail: Dict[str, Any] = {"hostname": host, "location": location_name, "state": ""}
-    conn = None
-    try:
-        if SHUTDOWN_REQ.is_set():
-            return (False, dev, "shutdown requested", round(time.time() - started, 1), detail)
-        if not transfer_result or not transfer_result.get("ok"):
-            return (False, dev, (transfer_result or {}).get("error", "transfer failed"),
-                    round(time.time() - started, 1), detail)
-        if DRY_RUN or CHECK_ONLY:
-            detail["dry_run"] = True
-            update_record(host, status="DRY-RUN", stage="DONE")
-            return (True, dev, "", round(time.time() - started, 1), detail)
-
-        fw_file = transfer_result.get("fw_file") or dev.fw_file
-        target = transfer_result.get("target") or dev.target or TARGET_VERSION
-        syntax = transfer_result.get("syntax") or classify_install_syntax(_ver_tuple(dev.start_version))
-        pre_config = transfer_result.get("pre_config", "")
-        members = transfer_result.get("members", 1)
-
-        conn = transfer_result.get("conn")
-        # Bug B17: only reconnect when the handed-over session is really dead.
-        if conn is None or not _session_is_alive(conn):
-            dev_log(host, "WARN", "session handed over by transfer phase is dead; reconnecting")
-            conn = _fresh_conn(conn, host, dev.ip, user, pw, enable_pw, 3, 15)
-            if conn is None:
-                update_record(host, status="FAILED", error="session lost before install")
-                return (False, dev, "session lost before install", round(time.time() - started, 1), detail)
-
-        # Clear whatever the transfer phase left in the channel buffer so stale
-        # text can never be mistaken for install output (bug B12 family).
-        _drain_and_answer_prompts(conn, 5.0)
-
-        md5_ok = bool(transfer_result.get("md5_ok"))
-        if not md5_ok and fw_file:
-            set_phase(host, "MD5", "verify /md5")
-            md5_ok, msg = verify_firmware_md5(conn, host, fw_file, str(FIRMWARE_DIR / fw_file))
-            update_record(host, md5_ok=md5_ok)
-            detail["md5"] = msg
-            if not md5_ok:
-                dev_log(host, "ERROR", msg)
-                update_record(host, status="FAILED", error=msg)
-                _disconnect(conn)
-                return (False, dev, msg, round(time.time() - started, 1), detail)
-            dev_log(host, "OK", msg)
-
-        st: Dict[str, Any] = {"escalations": 0, "same": 0, "last_state": "", "attempts": 0,
-                              "reloads": 0, "escalated": False, "commit_tries": 0,
-                              "members": members}
-        set_phase(host, "INSTALL", "state machine")
-        update_record(host, install_started=True, stage="INSTALL")
-        ok, err, conn = run_state_machine(conn, host, dev.ip, user, pw, target, fw_file, syntax, st)
-
-        if err == "needs_transfer":
-            detail["needs_transfer"] = True
-            update_record(host, stage="TRANSFER", status="RETRY")
-            _disconnect(conn)
-            return (False, dev, "needs_transfer", round(time.time() - started, 1), detail)
-
-        rebooted = conn is None
-        if ok and conn is None:
-            update_record(host, reboot_detected=True, stage="REBOOT")
-            ok, err, conn = wait_reboot_and_verify(dev.ip, target, host, user, pw, st,
-                                                   pre_config, fw_file, syntax)
-
-        post_version = st.get("post_version") or (target if ok else "")
-        update_record(host,
-                      status="DONE" if ok else "FAILED",
-                      stage="DONE" if ok else "INSTALL",
-                      post_version=post_version,
-                      attempts=st.get("attempts", 0),
-                      config_diff_lines=st.get("config_diff_lines", 0),
-                      verify_pending=False if ok else True,
-                      duration_sec=round(time.time() - started, 1),
-                      error="" if ok else err)
-        detail["state"] = st.get("last_state", "")
-        detail["post_version"] = post_version
-        detail["rebooted"] = rebooted
-        detail["attempts"] = st.get("attempts", 0)
-        return (ok, dev, err if not ok else "", round(time.time() - started, 1), detail)
-    except Exception as exc:
-        message = _one_line("%s: %s" % (type(exc).__name__, exc))
-        dev_log(host, "ERROR", "install_worker crashed: %s" % traceback.format_exc(limit=3))
-        update_record(host, status="FAILED", error=message,
-                      duration_sec=round(time.time() - started, 1))
-        return (False, dev, message, round(time.time() - started, 1), detail)
-    finally:
-        _disconnect(conn)
-
-
-# ===========================================================================
-#  REPORTS, ROLLBACK DOC, CHECKPOINTS
-# ===========================================================================
-def write_location_reports(location: str, records: List[Dict[str, Any]],
-                           revert_report: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
-    _ensure_dir(REPORT_DIR)
-    csv_path = REPORT_DIR / ("%s_%s.csv" % (location, RUN_ID))
-    json_path = REPORT_DIR / ("%s_%s.json" % (location, RUN_ID))
-    try:
-        with open(csv_path, "w", encoding="utf-8", newline="") as fh:
-            writer = csv.DictWriter(fh, fieldnames=RECORD_FIELDS, extrasaction="ignore")
-            writer.writeheader()
-            for rec in records:
-                writer.writerow({k: rec.get(k, "") for k in RECORD_FIELDS})
-    except Exception as exc:
-        log_master("ERROR", "csv report failed for %s: %s" % (location, exc))
-    payload = {
-        "run_id": RUN_ID,
-        "location": location,
-        "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "version": VERSION,
-        "target_version": TARGET_VERSION,
-        "devices": records,
-        "revert_verify": revert_report or {},
-        "totals": {
-            "total": len(records),
-            "done": sum(1 for r in records if r.get("status") == "DONE"),
-            "failed": sum(1 for r in records if r.get("status") == "FAILED"),
-        },
-    }
-    try:
-        with open(json_path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2, default=str)
-    except Exception as exc:
-        log_master("ERROR", "json report failed for %s: %s" % (location, exc))
-    return (str(csv_path), str(json_path))
-
-
-def write_rollback_doc(location: str, records: List[Dict[str, Any]]) -> str:
-    path = LOG_DIR / ("ROLLBACK_%s_%s.txt" % (location, RUN_ID))
-    lines = [
-        "MANUAL ROLLBACK PROCEDURE -- %s -- run %s" % (location, RUN_ID),
-        "=" * 78,
-        "Generated: %s   orchestrator v%s" % (time.strftime("%Y-%m-%d %H:%M:%S"), VERSION),
-        "",
-        "A rollback is only needed if a device fails to boot or fails health checks.",
-        "",
-        "Per device:",
-        "  1. console in (or SSH if the device is reachable)",
-        "  2. 'show boot'                    note the current BOOT variable",
-        "  3. 'show install summary'         note the inactive/committed packages",
-        "  4. 'install rollback to committed'   (reverts to the previous committed image)",
-        "  5. if the device will not boot: interrupt the boot loader and boot the old .bin",
-        "  6. 'show version' / 'show switch' to confirm the fleet is stable again",
-        "",
-        "Old images are preserved in flash (PRESERVE_ROLLBACK), so the previous",
-        "IOS-XE package is still available on each chassis.",
-        "",
-        "%-30s %-16s %-12s %-12s %s" % ("HOST", "STATUS", "START_VER", "POST_VER", "ERROR"),
-        "-" * 100,
-    ]
-    for rec in records:
-        lines.append("%-30s %-16s %-12s %-12s %s" % (rec.get("hostname", "")[:30],
-                                                     rec.get("status", ""),
-                                                     rec.get("start_version", ""),
-                                                     rec.get("post_version", "") or "-",
-                                                     rec.get("error", "")))
-    try:
-        _ensure_dir(path.parent)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(lines) + "\n")
-    except Exception as exc:
-        log_master("ERROR", "rollback doc failed: %s" % exc)
-    return str(path)
-
-
-def save_checkpoint(location: str, records: List[Dict[str, Any]]) -> None:
-    try:
-        _ensure_dir(CHECKPOINT_DIR)
-        path = CHECKPOINT_DIR / ("%s.json" % location)
-        payload = {"run_id": RUN_ID, "location": location,
-                   "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
-                   "done": [r["hostname"] for r in records if r.get("status") == "DONE"],
-                   "failed": [r["hostname"] for r in records if r.get("status") == "FAILED"]}
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2)
-    except Exception:
-        pass
-
-
-def touch_device_checkpoint(location: str, host: str, stage: str, error: str = "") -> None:
-    """Record one device's stage the moment it changes.
-
-    A crash, a power cut or a Ctrl+Break then leaves a checkpoint that says how
-    far each device actually got, instead of only what the end-of-run summary
-    would have said.
-    """
-    if not location or not host:
-        return
-    try:
-        _ensure_dir(CHECKPOINT_DIR)
-        path = CHECKPOINT_DIR / ("%s.json" % location)
-        with _CKPT_LOCK:
-            data: Dict[str, Any] = {}
-            if path.exists():
-                try:
-                    with open(path, "r", encoding="utf-8") as fh:
-                        loaded = json.load(fh)
-                    if isinstance(loaded, dict):
-                        data = loaded
-                except Exception:
-                    data = {}
-            stages = data.setdefault("devices", {})
-            entry = stages.setdefault(host, {})
-            entry["stage"] = stage
-            entry["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            if error:
-                entry["error"] = _one_line(error, 160)
-            data["run_id"] = RUN_ID
-            data["location"] = location
-            data["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            tmp = str(path) + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, indent=2)
-            os.replace(tmp, str(path))
-    except Exception:
-        pass
-
-
-def load_checkpoint(location: str) -> Dict[str, Any]:
-    path = CHECKPOINT_DIR / ("%s.json" % location)
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-# ===========================================================================
-#  LOCATION RUN
-# ===========================================================================
-def _collect_install_futures(ifut: Dict[Any, Any], results: List[Tuple[Any, ...]],
-                             location: str) -> None:
-    pending = dict(ifut)
-    while pending:
-        done, not_done = wait(list(pending.keys()), timeout=30, return_when=FIRST_COMPLETED)
-        for fut in done:
-            dev = pending.pop(fut)
-            try:
-                outcome = fut.result()
-            except Exception as exc:
-                outcome = (False, dev, "%s: %s" % (type(exc).__name__, exc), 0.0, {})
-            results.append(outcome)
-            ok, d, err, dur, _detail = outcome
-            set_phase(d.hostname, "DONE" if ok else "FAILED", "upgraded" if ok else (err or "failed")[:24])
-            log_console("OK" if ok else "FAIL", "%s %s" % (d.hostname, "upgraded" if ok else err))
-        if SHUTDOWN_REQ.is_set() and not done:
-            for fut in list(pending):
-                fut.cancel()
-            pending = {f: d for f, d in pending.items() if not f.cancelled()}
-            if not pending:
-                break
-    ifut.clear()
-
-
-def _run_transfer_phase(devices: List[Device], ctx: RunCtx, workers: int,
-                        ifut: Dict[Any, Any], results: List[Tuple[Any, ...]],
-                        install_pool: ThreadPoolExecutor) -> None:
-    if not devices:
-        return
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        futures = {pool.submit(transfer_worker, dev, ctx.user, ctx.pw, ctx.location,
-                               ctx.enable_pw): dev for dev in devices}
-        while futures:
-            done, _ = wait(list(futures.keys()), timeout=15, return_when=FIRST_COMPLETED)
-            for fut in done:
-                dev = futures.pop(fut)
-                try:
-                    tres = fut.result()
-                except Exception as exc:
-                    tres = {"ok": False,
-                            "error": _one_line("%s: %s" % (type(exc).__name__, exc)),
-                            "conn": None, "host": dev.hostname, "ip": dev.ip}
-                if not tres.get("ok"):
-                    update_record(dev.hostname, status="FAILED", stage="TRANSFER",
-                                  error=tres.get("error", "transfer failed"))
-                    set_phase(dev.hostname, "FAILED", (tres.get("error") or "transfer failed")[:24])
-                    results.append((False, dev, tres.get("error", "transfer failed"), 0.0, {}))
-                    continue
-                if tres.get("dry_run"):
-                    results.append((True, dev, "", tres.get("duration", 0.0), {"dry_run": True}))
-                    continue
-                fut2 = install_pool.submit(install_worker, dev, ctx.user, ctx.pw, tres,
-                                           ctx.location, ctx.enable_pw)
-                ifut[fut2] = dev
-            if SHUTDOWN_REQ.is_set() and not done:
-                break
-
-
-def run_location(location: str, devices: List[Device], ctx: RunCtx,
-                 skip_hosts: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-    """Upgrade one location end to end, then revert and verify its temp config.
-
-    Note: pending temp changes from earlier runs were already loaded once in
-    main(), so this function never touches persistent recovery state.
-    """
-    ctx.location = location
-    skip = set(skip_hosts or [])
-    targets = [d for d in devices if d.hostname not in skip]
-    log_master("INFO", "location %s: %d device(s) queued" % (location, len(targets)))
-    previous = load_checkpoint(location)
-    if previous:
-        _safe_print("  %s: previous checkpoint (run %s) had %d done / %d failed"
-                    % (location, previous.get("run_id", "?"),
-                       len(previous.get("done", [])), len(previous.get("failed", []))))
-    for dev in targets:
-        set_phase(dev.hostname, "QUEUE", "queued")
-        new_record(dev, location)
-
-    results: List[Tuple[Any, ...]] = []
-    ifut: Dict[Any, Any] = {}
-    install_pool = ThreadPoolExecutor(max_workers=INSTALL_WORKERS, thread_name_prefix="install")
-    try:
-        small = [d for d in targets if not is_large_model(d.model_hint)]
-        large = [d for d in targets if is_large_model(d.model_hint)]
-        aborted = False
-        if SERIAL_TRANSFER_LARGE_MODELS and large:
-            _run_transfer_phase(small, ctx, TRANSFER_SLOTS, ifut, results, install_pool)
-            _collect_install_futures(ifut, results, location)
-            aborted = _abort_gate(results, location)
-            if aborted:
-                for dev in large:
-                    update_record(dev.hostname, status="SKIPPED", error="abort gate tripped")
-                    set_phase(dev.hostname, "SKIPPED", "abort gate")
-                    results.append((False, dev, "abort gate tripped", 0.0, {}))
-            else:
-                _run_transfer_phase(large, ctx, LARGE_MODEL_PARALLEL, ifut, results, install_pool)
-        else:
-            _run_transfer_phase(targets, ctx, TRANSFER_SLOTS, ifut, results, install_pool)
-        _collect_install_futures(ifut, results, location)
-
-        # Retry passes.  Only transfer-phase failures qualify (see
-        # retryable_failure): once `install add` has started, another attempt
-        # would fight a half-finished install engine run.
-        attempt = 1
-        while (not aborted and not SHUTDOWN_REQ.is_set()
-               and attempt < max(1, MAX_RETRIES) + 1):
-            retry_devs = [dev for dev in targets
-                          if dev.hostname not in skip
-                          and retryable_failure(dev.hostname)]
-            if not retry_devs:
-                break
-            attempt += 1
-            log_master("WARN", "location %s: retry %d/%d for %d device(s)"
-                       % (location, attempt - 1, MAX_RETRIES, len(retry_devs)))
-            retry_hosts = {dev.hostname for dev in retry_devs}
-            results = [r for r in results if r[1].hostname not in retry_hosts]
-            for dev in retry_devs:
-                update_record(dev.hostname, status="RETRY", stage="QUEUE", error="")
-            SHUTDOWN_REQ.wait(RETRY_DELAY_SEC)
-            if SHUTDOWN_REQ.is_set():
-                break
-            _run_transfer_phase(retry_devs, ctx, TRANSFER_SLOTS, ifut, results, install_pool)
-            _collect_install_futures(ifut, results, location)
-    finally:
-        install_pool.shutdown(wait=True)
-
-    # ---- revert the temporary service changes on EVERY device (rule P4) ----
-    revert_report: Dict[str, Any] = {}
-    if REVERT_TEMP_CONFIG_POST_LOCATION and not DRY_RUN:
-        for dev in devices:
-            with TEMP_LOCK:
-                pending = list(TEMP_CHANGES.get(dev.hostname, {}).get("changes", []))
-            if not pending:
-                continue
-            set_phase(dev.hostname, "VERIFY", "reverting temp config")
-            ok_count, fail_count, clean = revert_temp_config_with_retry(
-                dev.hostname, dev.ip, ctx.user, ctx.pw, ctx.enable_pw)
-            revert_report[dev.hostname] = {"ok": clean, "message": "reverted %d item(s)" % ok_count,
-                                           "types": sorted({c.get("type", "?") for c in pending})}
-        if VERIFY_NO_TEMP_CHANGES:
-            verify_report = verify_no_temp_changes(devices, ctx.user, ctx.pw, location)
-            for host, entry in verify_report.items():
-                revert_report.setdefault(host, entry)
-
-    records = [rec for rec in snapshot_records() if rec.get("location") == location]
-    csv_path, json_path = write_location_reports(location, records, revert_report)
-    rollback = write_rollback_doc(location, records)
-    save_checkpoint(location, records)
-    _print_location_summary(location, records, csv_path, json_path, rollback)
-    return records
-
-
-def _abort_gate(results: List[Tuple[Any, ...]], location: str) -> bool:
-    """Stop a doomed location run instead of burning hours on a broken batch."""
-    if len(results) < ABORT_GATE_MIN_DEVICES:
-        return False
-    failed = sum(1 for ok, _dev, _err, _dur, _det in results if not ok and _err != "needs_transfer")
-    if failed / float(len(results)) > ABORT_GATE_THRESHOLD:
-        log_master("ERROR", "ABORT GATE: %d/%d devices failed in %s; stopping this location"
-                   % (failed, len(results), location))
-        _safe_print("  !! abort gate tripped for %s (%d/%d failed)" % (location, failed, len(results)))
-        return True
-    return False
-
-
-def _print_location_summary(location: str, records: List[Dict[str, Any]], csv_path: str,
-                            json_path: str, rollback: str) -> None:
-    done = sum(1 for r in records if r.get("status") == "DONE")
-    failed = sum(1 for r in records if r.get("status") == "FAILED")
-    _safe_print("")
-    _safe_print("  == %s ==  total=%d  done=%d  failed=%d" % (location, len(records), done, failed))
-    for rec in records:
-        _safe_print("    %-30s %-9s %-12s -> %-12s %s"
-                    % (str(rec.get("hostname"))[:30], rec.get("status", ""),
-                       rec.get("start_version", ""), rec.get("post_version", "") or "-",
-                       (rec.get("error") or "")[:60]))
-    _safe_print("    csv: %s" % csv_path)
-    _safe_print("    json: %s" % json_path)
-    _safe_print("    rollback: %s" % rollback)
-
-
-# ===========================================================================
-#  INVENTORY
-# ===========================================================================
-_IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
-
-
-def _looks_like_ip(text: str) -> bool:
-    return bool(_IP_RE.match((text or "").strip()))
-
-
-def parse_inventory_line(line: str) -> Optional[Tuple[str, str]]:
-    """Accept ``hostname,ip``, ``hostname ip``, ``ip hostname`` or a bare ip."""
-    raw = (line or "").strip()
-    if not raw or raw.startswith("#"):
-        return None
-    raw = raw.split("#")[0].strip().rstrip(",")
-    if not raw:
-        return None
-    if "," in raw or "\t" in raw or ";" in raw or "|" in raw:
-        parts = [p.strip() for p in re.split(r"[,\t;|]+", raw) if p.strip()]
-    else:
-        parts = raw.split()
-    if not parts:
-        return None
-    if len(parts) == 1:
-        return (parts[0], parts[0])
-    first, second = parts[0], parts[1]
-    if _looks_like_ip(first) and not _looks_like_ip(second):
-        return (second, first)
-    return (first, second)
-
-
-def load_location_devices(location: str) -> List[Device]:
-    path = LOCATIONS_DIR / ("%s.txt" % location)
-    devices: List[Device] = []
-    if not path.exists():
-        log_master("WARN", "inventory file missing: %s" % path)
-        _safe_print("  ! inventory file missing: %s" % path)
-        return devices
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                parsed = parse_inventory_line(line)
-                if parsed:
-                    devices.append(Device(hostname=parsed[0], ip=parsed[1], location=location,
-                                          target=TARGET_VERSION))
-    except Exception as exc:
-        log_master("ERROR", "cannot read %s: %s" % (path, exc))
-    return devices
-
-
-def load_hosts_devices(hosts: List[str], location: str = "adhoc") -> List[Device]:
-    devices: List[Device] = []
-    for item in hosts or []:
-        raw = (item or "").strip()
-        if not raw:
-            continue
-        if "=" in raw:
-            name, _, ip = raw.partition("=")
-            devices.append(Device(hostname=name.strip() or ip.strip(), ip=ip.strip(), location=location))
-            continue
-        parsed = parse_inventory_line(raw)
-        if parsed:
-            devices.append(Device(hostname=parsed[0], ip=parsed[1], location=location))
-    return devices
-
-
-def apply_filters(devices: List[Device], limit: Any, exclude: List[str]) -> List[Device]:
-    """Apply --exclude, then --limit.
-
-    ``--limit`` accepts either a count (``--limit 20``) or a hostname list
-    (``--limit SW1 SW2``); an all-digit list is read as a count, anything else
-    as an explicit selection.
-    """
-    ex = {e.strip().lower() for e in (exclude or []) if e.strip()}
-    kept: List[Device] = []
-    for dev in devices:
-        if dev.hostname.lower() in ex or dev.ip in ex:
-            continue
-        kept.append(dev)
-    if not limit:
-        return kept
-    values = [str(v).strip() for v in (limit if isinstance(limit, (list, tuple))
-                                       else [limit]) if str(v).strip()]
-    if not values:
-        return kept
-    if len(values) == 1 and values[0].isdigit():
-        return kept[:int(values[0])]
-    wanted = {v.lower() for v in values}
-    return [dev for dev in kept if dev.hostname.lower() in wanted]
-
-
-# ===========================================================================
-#  PRE-SCAN, CHECK MODE, RECOVERY, RECONCILE
-# ===========================================================================
-def prescan_models(devices: List[Device], ctx: RunCtx) -> Dict[str, Dict[str, Any]]:
-    """Read model + version from every device (read-only).  Feeds the
-    small/large phase split and the start_version column of the reports."""
-    out: Dict[str, Dict[str, Any]] = {}
-    if not devices:
-        return out
-    workers = max(1, min(TRANSFER_SLOTS, len(devices)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(peek_device, d.ip, d.hostname, ctx.user, ctx.pw,
-                               ctx.enable_pw): d for d in devices}
-        done_count = 0
-        while futures:
-            done, _ = wait(list(futures.keys()), timeout=30, return_when=FIRST_COMPLETED)
-            for fut in done:
-                dev = futures.pop(fut)
-                try:
-                    info = fut.result()
-                except Exception as exc:
-                    info = {"hostname": dev.hostname, "ip": dev.ip, "model": "",
-                            "version": "", "error": str(exc)}
-                out[dev.hostname] = info
-                dev.model_hint = info.get("model", "") or ""
-                dev.start_version = info.get("version", "") or ""
-                if not dev.start_version:
-                    dev.start_version = "unknown"
-                done_count += 1
-                _safe_print("  scanned %3d/%d  %-30s %-12s %s"
-                            % (done_count, len(devices), dev.hostname[:30],
-                               dev.start_version, info.get("model", "") or info.get("error", "")))
-            if SHUTDOWN_REQ.is_set() and not done:
-                break
-    return out
-
-
-def run_check(devices: List[Device], ctx: RunCtx) -> int:
-    """--check: read-only version sweep, no configuration changes at all."""
-    _safe_print("  read-only version sweep: %d device(s)" % len(devices))
-    info = prescan_models(devices, ctx)
-    bad = 0
-    for dev in devices:
-        row = info.get(dev.hostname, {})
-        fw, target = pick_firmware(row.get("model", ""))
-        on_target = _ver_tuple(row.get("version", "")) == _ver_tuple(target)
-        mark = "OK  " if on_target else "UPGD"
-        if row.get("error"):
-            mark = "ERR "
-            bad += 1
-        _safe_print("  %s %-30s %-16s -> %-10s %s"
-                    % (mark, dev.hostname[:30], row.get("version", "?"), target,
-                       row.get("model", "") or row.get("error", "")))
-    by_location: Dict[str, List[Device]] = {}
-    for dev in devices:
-        by_location.setdefault(dev.location, []).append(dev)
-    for location, devs in by_location.items():
-        rows = []
-        for dev in devs:
-            row = info.get(dev.hostname, {})
-            fw, target = pick_firmware(row.get("model", ""))
-            rec = {k: "" for k in RECORD_FIELDS}
-            rec.update({"hostname": dev.hostname, "ip": dev.ip,
-                        "status": "OK" if _ver_tuple(row.get("version", "")) == _ver_tuple(target) else "NEEDS-UPGRADE",
-                        "stage": "CHECK", "start_version": row.get("version", ""),
-                        "target_version": target, "fw_file": fw,
-                        "post_version": row.get("version", ""), "verify_pending": False,
-                        "error": row.get("error", "")})
-            rows.append(rec)
-        write_location_reports(location, rows, {})
-    return 1 if bad else 0
-
-
-def run_recovery(ctx: RunCtx, dry_run_revert: bool = False) -> int:
-    """--recover / --dry-run-revert: undo temp changes left by earlier runs."""
-    pending = pending_temp_changes()
-    if not pending:
-        _safe_print("  \u2713 no pending temp changes found in %s" % STATE_DIR)
-        return 0
-    _safe_print("  %d host(s) with pending temp changes:" % len(pending))
-    for host, changes in sorted(pending.items()):
-        types = sorted({c.get("type", "?") for c in changes})
-        ip = TEMP_CHANGES.get(host, {}).get("ip", "")
-        _safe_print("    %-30s ip=%-15s %s" % (host[:30], ip or "-", ", ".join(types)))
-    if dry_run_revert:
-        _safe_print("  dry-run-revert: nothing applied")
-        return 0
-
-    failures = 0
-    for host, changes in sorted(pending.items()):
-        with TEMP_LOCK:
-            ip = TEMP_CHANGES.get(host, {}).get("ip", "")
-        if not ip:
-            _safe_print("  ! %-30s no ip recorded -- revert manually" % host[:30])
-            failures += 1
-            continue
-        ok_count, fail_count, clean = revert_temp_config_with_retry(
-            host, ip, ctx.user, ctx.pw, ctx.enable_pw)
-        _safe_print("  %s %-30s reverted=%d failed=%d"
-                    % ("OK " if clean else "ERR", host[:30], ok_count, fail_count))
-        if not clean:
-            failures += 1
-    _safe_print("  recovery complete: %d host(s) still dirty" % failures)
-    return 1 if failures else 0
-
-
-def run_reconcile(devices: List[Device], ctx: RunCtx) -> Dict[str, Dict[str, Any]]:
-    """Post-run reconcile pass: re-read every device and report what is really
-    on it, so the JSON report never claims more than the device confirms."""
-    out: Dict[str, Dict[str, Any]] = {}
-    if not devices:
-        return out
-    _safe_print("")
-    _safe_print("  == reconcile pass (%d device(s)) ==" % len(devices))
-
-    def _one(dev: Device) -> Tuple[str, Dict[str, Any]]:
-        conn = None
-        entry: Dict[str, Any] = {"hostname": dev.hostname, "ip": dev.ip, "state": "", "version": "",
-                                 "summary": {}, "error": "", "recorded_status": "", "agree": False}
-        try:
-            conn = do_connect(dev.ip, dev.hostname, ctx.user, ctx.pw, ctx.enable_pw, fast=True)
-            state, info = classify_state(conn, dev.hostname, dev.ip, dev.target, dev.fw_file, {}, False)
-            entry["state"] = state
-            entry["version"] = info.get("version", "")
-            entry["summary"] = info.get("summary", {})
-        except Exception as exc:
-            entry["error"] = "%s: %s" % (type(exc).__name__, exc)
-        finally:
-            _disconnect(conn)
-        with RUN_RECORDS_LOCK:
-            rec = RUN_RECORDS.get(dev.hostname, {})
-        entry["recorded_status"] = rec.get("status", "")
-        entry["agree"] = (state_ok(entry) and rec.get("status") in ("DONE", "OK"))
-        return (dev.hostname, entry)
-
-    def state_ok(entry: Dict[str, Any]) -> bool:
-        return entry.get("state") in ("DONE_COMMITTED", "RUNNING_UNCOMMITTED", "RUNNING_UNKNOWN")
-
-    workers = max(1, min(TRANSFER_SLOTS, len(devices)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_one, dev): dev for dev in devices}
-        while futures:
-            done, _ = wait(list(futures.keys()), timeout=30, return_when=FIRST_COMPLETED)
-            for fut in done:
-                dev = futures.pop(fut)
-                try:
-                    host, entry = fut.result()
-                except Exception as exc:
-                    host, entry = dev.hostname, {"hostname": dev.hostname, "ip": dev.ip,
-                                                 "state": "UNKNOWN", "error": str(exc)}
-                out[host] = entry
-                _safe_print("    %-30s %-22s %-12s %s"
-                            % (host[:30], entry.get("state", "?"), entry.get("version", "-"),
-                               entry.get("error", "")))
-    return out
-
-
-# ===========================================================================
-#  LOCK / SIGNALS / CLEANUP
-# ===========================================================================
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except Exception:
-        return False
-
-
-def acquire_lock() -> bool:
-    try:
-        _ensure_dir(BASE_DIR)
-        if LOCK_FILE.exists():
-            text = ""
-            try:
-                with open(str(LOCK_FILE), "r", encoding="utf-8", errors="replace") as fh:
-                    text = fh.read().strip()
-            except Exception:
-                text = ""
-            pid = 0
-            for token in re.split(r"\s+", text):
-                if token.isdigit():
-                    pid = int(token)
-                    break
-            if pid and _pid_alive(pid):
-                _safe_print("  ! another run is active (pid %d, %s) -- refusing to start"
-                            % (pid, LOCK_FILE))
-                return False
-            _safe_print("  ! removing stale lock file from pid %s" % (pid or "?"))
-        with open(str(LOCK_FILE), "w", encoding="utf-8") as fh:
-            fh.write("%d %s" % (os.getpid(), time.strftime("%Y-%m-%d %H:%M:%S")))
-        return True
-    except Exception as exc:
-        log_master("WARN", "could not manage lock file: %s" % exc)
-        return True
-
-
-def release_lock() -> None:
-    try:
-        if LOCK_FILE.exists():
-            LOCK_FILE.unlink()
-    except Exception:
-        pass
-
-
-def _cleanup() -> None:
-    """atexit: drop orphan pscp password files and the lock file."""
-    patterns = [os.path.join(tempfile.gettempdir(), "_pscp_pw_*.tmp")]
-    try:
-        patterns.append(str(BASE_DIR / "_pscp_pw_*.tmp"))
-    except Exception:
-        pass
-    for pattern in patterns:
-        for path in glob.glob(pattern):
-            try:
-                os.remove(path)
-            except Exception:
-                pass
-    release_lock()
-
-
-def _on_signal(signum: int, frame: Any) -> None:
-    global SHUTDOWN_COUNT
-    SHUTDOWN_COUNT += 1
-    if SHUTDOWN_COUNT == 1:
+def _on_signal(signum, frame):
+    _SIG_COUNT[0] += 1
+    if _SIG_COUNT[0] == 1:
         SHUTDOWN_REQ.set()
-        log_master("WARN", "signal %s received; allowing workers 30s to finish" % signum)
-        _safe_print("")
-        _safe_print("  !! interrupt received -- finishing current device work "
-                    "(press again to exit immediately)")
-
-        def _force() -> None:
-            time.sleep(30)
-            if SHUTDOWN_COUNT == 1:
-                log_master("ERROR", "grace period expired; forcing exit")
-                _cleanup()
-                os._exit(1)
-
-        threading.Thread(target=_force, name="forced-exit", daemon=True).start()
+        msg = ("\n  !! Shutdown requested -- finishing safely; temp config "
+               "will be reverted.\n  !! Press Ctrl-C again to force exit.\n")
     else:
-        log_master("ERROR", "second interrupt -- immediate exit")
-        _cleanup()
-        os._exit(1)
+        msg = "\n  !! Forced exit. Run --recover afterwards.\n"
+    try: os.write(2, msg.encode("utf-8", "replace"))
+    except Exception: pass
+    if _SIG_COUNT[0] >= 2: os._exit(130)
 
 
-# ===========================================================================
-#  CLI / MAIN
-# ===========================================================================
-def build_arg_parser() -> argparse.ArgumentParser:
+def parse_args():
     p = argparse.ArgumentParser(
-        prog=SCRIPT_NAME,
-        description="Cisco IOS-XE fleet upgrade orchestrator v%s (target IOS-XE %s)"
-                    % (VERSION, TARGET_VERSION),
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--locations", nargs="+", default=list(DEFAULT_LOCATIONS),
-                   help="locations to process (default: %s)" % " ".join(DEFAULT_LOCATIONS))
-    p.add_argument("--hosts", nargs="+", default=None,
-                   help="ad-hoc devices as name=ip (or bare ip)")
-    p.add_argument("--limit", nargs="+", default=None,
-                   help="process at most N devices (a number) or only these "
-                        "hostnames (a list)")
-    p.add_argument("--exclude", nargs="+", default=[], help="hostnames or ips to skip")
-    p.add_argument("--user", default=None, help="SSH username (or $CISCO_USER)")
-    p.add_argument("--enable-pass", default=None, help="enable/SSH password (or $CISCO_ENABLE)")
-    p.add_argument("--enable-user", default=None,
-                   help="enable username when the AAA server wants a separate "
-                        "enable identity (or $CISCO_ENABLE_USER)")
-    p.add_argument("--base-dir", default=None, help="override the base directory")
-    p.add_argument("--config", default=None, help="explicit config.json path")
-    p.add_argument("--dry-run", action="store_true", help="read-only, no device changes")
-    p.add_argument("--check", action="store_true", help="read-only version sweep and exit")
-    p.add_argument("--validate", action="store_true", help="run internal self-tests and exit")
-    p.add_argument("--recover", action="store_true", help="revert temp config from prior runs")
-    p.add_argument("--revert-only", action="store_true",
-                   help="alias of --recover: revert temp config and exit")
-    p.add_argument("--dry-run-revert", action="store_true",
-                   help="show pending temp changes without applying them")
-    p.add_argument("--yes", action="store_true", help="skip confirmation prompts")
-    p.add_argument("--show-live-transfer", action="store_true",
-                   help="stream pscp output into the dashboard")
-    p.add_argument("--no-reconcile", action="store_true", help="skip the post-run reconcile pass")
-    p.add_argument("--no-hash-verify", action="store_true",
-                   help="skip MD5 verification of the transferred image")
-    p.add_argument("--no-drift-check", action="store_true",
-                   help="skip the post-reboot running-config drift check")
-    p.add_argument("--no-serial-large", action="store_true",
-                   help="interleave C9300/C9500 with the small models instead of "
-                        "running them in their own slower phase")
-    p.add_argument("--no-bundle-mode", action="store_true",
-                   help="fail instead of converting a bundle-boot device to install mode")
-    p.add_argument("--parallel-large", type=int, default=None, metavar="N",
-                   help="max concurrent C9300/C9500 transfers (default: %d)"
-                        % LARGE_MODEL_PARALLEL)
-    p.add_argument("--version", action="store_true", help="print version and exit")
-    return p
+        description="Cisco IOS-XE upgrade orchestrator v%s" % VERSION_STRING)
+    for a in ("--base-dir", "--config", "--user", "--enable-pass",
+              "--enable-user"):
+        p.add_argument(a)
+    p.add_argument("--locations", nargs="+")
+    for a in ("--dry-run", "--skip-issu", "--auto-rollback", "--no-pause",
+              "--yes", "--precache-hostkeys", "--ignore-stale-state",
+              "--force-run-with-stale-state", "--resume", "--recover",
+              "--revert-only", "--dry-run-revert", "--preflight-only",
+              "--inventory", "--check", "--rollback", "--rollback-dry-run",
+              "--no-verify-revert", "--show-live-transfer",
+              "--no-serial-large", "--no-drift-check", "--no-hash-verify",
+              "--no-reconcile", "--resume-checkpoint", "--retry-failed",
+              "--write-manifest", "--verify-mapping", "--validate",
+              "--no-bundle-mode", "--no-pool-locations", "--paramiko-primary",
+              "--allow-lenient-firmware", "--allow-active-pkg-purge"):
+        p.add_argument(a, action="store_true")
+    p.add_argument("--allow-bundle-mode", action="store_true", default=None)
+    p.add_argument("--pool-locations", action="store_true", default=None)
+    p.add_argument("--parallel-large", type=int, default=None, metavar="N")
+    p.add_argument("--bulk-window", type=int, default=None, metavar="N")
+    p.add_argument("--limit", nargs="+")
+    p.add_argument("--exclude", nargs="+")
+    p.add_argument("--hosts", nargs="+")
+    p.add_argument("--version", action="version",
+                   version="cisco_upgrade v%s" % VERSION_STRING)
+    p.add_argument("--only-upgrade-needed", action="store_true")
+    p.add_argument("--preview", action="store_true")
+    p.add_argument("--preview-only", action="store_true")
+    p.add_argument("--quiet-skipped", action="store_true")
+    p.add_argument("--no-html-report", action="store_true")
+    p.add_argument("--no-health-snapshot", action="store_true")
+    p.add_argument("--use-inventory-cache", action="store_true")
+    p.add_argument("--no-colour", "--no-color", action="store_true",
+                   dest="no_colour")
+    p.add_argument("--estimate-only", action="store_true")
+    p.add_argument("--interactive-resume", action="store_true")
+    return p.parse_args()
 
 
-def _apply_config_file() -> None:
-    """Tuning constants may be overridden from <base_dir>/config.json."""
-    global LARGE_SEM
+def get_credentials(args):
+    user = (args.user or os.environ.get("CISCO_USER")
+            or input("  SSH username: ").strip())
+    pw = os.environ.get("CISCO_PASS") or getpass("  SSH password: ")
+    return user, pw
+
+
+def confirm(msg, assume_yes=False):
+    if assume_yes: return True
     try:
-        if not CONFIG_FILE.exists():
-            return
-        with open(str(CONFIG_FILE), "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        if not isinstance(data, dict):
-            return
-        g = globals()
-        for key, value in data.items():
-            if key.isupper() and key in g:
-                g[key] = value
-                log_master("INFO", "config.json override: %s = %r" % (key, value))
-        LARGE_SEM = threading.BoundedSemaphore(max(1, int(LARGE_MODEL_PARALLEL)))
-    except Exception as exc:
-        _safe_print("  ! config.json ignored: %s" % exc)
+        return input("%s [y/N]: " % msg).strip().lower() in ("y", "yes")
+    except EOFError: return False
 
 
-def _ensure_dirs() -> None:
-    for path in (BASE_DIR, FIRMWARE_DIR, LOCATIONS_DIR, LOG_DIR, BACKUP_DIR,
-                 REPORT_DIR, STATE_DIR, CHECKPOINT_DIR, LOG_DIR / "archive"):
-        _ensure_dir(path)
-
-
-def prune_old_artefacts() -> Dict[str, int]:
-    """Keep logs and config backups bounded on a long-lived orchestrator box.
-
-    A 500 device fleet writes a per-device log, an archive copy and a running
-    config snapshot per run; without a retention policy the disk fills and the
-    next upgrade fails for a reason that has nothing to do with the switches.
-    """
-    removed = {"logs": 0, "backups": 0}
-    cutoff = time.time() - (LOG_MAX_AGE_DAYS * 86400)
-
-    def _unlink(path: Path) -> None:
-        try:
-            path.unlink()
-        except Exception:
-            pass
-
-    try:
-        for path in sorted(LOG_DIR.glob("master_*.log")) + sorted(LOG_DIR.glob("ROLLBACK_*.txt")):
-            try:
-                if path.stat().st_mtime < cutoff:
-                    _unlink(path)
-                    removed["logs"] += 1
-            except Exception:
-                continue
-        for path in sorted((LOG_DIR / "archive").glob("*.log")):
-            try:
-                if path.stat().st_mtime < cutoff:
-                    _unlink(path)
-                    removed["logs"] += 1
-            except Exception:
-                continue
-        for pattern, cap_gb in ((LOG_DIR, LOG_MAX_SIZE_GB),):
-            try:
-                files = [p for p in pattern.glob("*.log") if p.is_file()]
-                total = sum(p.stat().st_size for p in files)
-                for path in sorted(files, key=lambda p: p.stat().st_mtime):
-                    if total <= cap_gb * (1024 ** 3):
-                        break
-                    total -= path.stat().st_size
-                    _unlink(path)
-                    removed["logs"] += 1
-            except Exception:
-                pass
-        try:
-            backups = sorted((p for p in BACKUP_DIR.glob("*.cfg") if p.is_file()),
-                             key=lambda p: p.stat().st_mtime)
-            total = sum(p.stat().st_size for p in backups)
-            keep_from = max(0, len(backups) - BACKUP_MAX_FILES)
-            for index, path in enumerate(backups):
-                over_count = index < keep_from
-                over_size = total > BACKUP_MAX_SIZE_GB * (1024 ** 3)
-                if not (over_count or over_size):
-                    break
-                total -= path.stat().st_size
-                _unlink(path)
-                removed["backups"] += 1
-        except Exception:
-            pass
-    except Exception as exc:
-        log_master("WARN", "retention sweep skipped: %s" % exc)
-    if removed["logs"] or removed["backups"]:
-        log_master("INFO", "retention: removed %d log file(s), %d backup(s)"
-                   % (removed["logs"], removed["backups"]))
-    return removed
-
-
-def resolve_credentials(args: argparse.Namespace) -> Tuple[str, str, str]:
-    user = args.user or os.environ.get("CISCO_USER", "")
-    pw = os.environ.get("CISCO_PASS", "") or (args.enable_pass or "")
-    enable = args.enable_pass or os.environ.get("CISCO_ENABLE", "") or pw
-    if not user:
-        try:
-            user = input("SSH username: ").strip()
-        except Exception:
-            user = ""
-    if not pw:
-        try:
-            import getpass
-            pw = getpass.getpass("SSH password: ")
-        except Exception:
-            pw = ""
-    if not enable:
-        enable = pw
-    if args.enable_user and args.enable_user != user:
-        _safe_print("  note: --enable-user differs from --user; netmiko uses a single login "
-                    "and 'enable' reuses the same credentials")
-    return (user, pw, enable)
-
-
-def build_device_list(args: argparse.Namespace) -> List[Device]:
-    devices: List[Device] = []
+def filter_devices(devices, args):
     if args.hosts:
-        devices = load_hosts_devices(args.hosts)
+        wanted = {h.strip() for h in args.hosts}
+        return [d for d in devices if d["hostname"] in wanted]
+    out = devices
+    if args.limit:
+        wanted = {h.strip() for h in args.limit}
+        out = [d for d in out if d["hostname"] in wanted]
+    if args.exclude:
+        skip = {h.strip() for h in args.exclude}
+        out = [d for d in out if d["hostname"] not in skip]
+    return out
+
+
+def mode_dry_run_revert():
+    n = load_state_for_recovery(consume=False)
+    if not n:
+        print("  No recorded temp changes found."); return 0
+    hostmap = build_host_ip_map()
+    print("\n  %d device(s) have un-reverted temp changes:\n" % n)
+    with TEMP_CHANGES_LOCK:
+        snap = {h: list(e["changes"]) for h, e in TEMP_CHANGES.items()}
+    for host in sorted(snap):
+        ip = hostmap.get(host, "??? (not in any location file)")
+        print("  %s  (%s)" % (host, ip))
+        for ch in snap[host]:
+            print("      - %s: %s" % (ch["type"], json.dumps(ch["details"])))
+    print("\n  (nothing changed; use --recover to apply)")
+    return 0
+
+
+def mode_recover(args, locations_filter=None):
+    n = load_state_for_recovery(consume=True)
+    if not n:
+        print("  No recorded temp changes found."); return 0
+    hostmap = build_host_ip_map()
+    if locations_filter:
+        allowed = set()
+        for loc in locations_filter:
+            p = os.path.join(LOCATIONS_DIR, "%s.txt" % loc)
+            if os.path.isfile(p):
+                allowed |= {d["hostname"] for d in load_location(p)}
+            else:
+                print("  Missing location file: %s" % p)
+        hosts = [h for h in list(TEMP_CHANGES) if h in allowed]
     else:
-        for location in args.locations:
-            devices.extend(load_location_devices(location))
-    devices = apply_filters(devices, args.limit, args.exclude)
-    return devices
+        hosts = list(TEMP_CHANGES)
+    devices, unknown = [], []
+    for h in hosts:
+        if h in hostmap:
+            devices.append({"hostname": h, "ip": hostmap[h]})
+        else: unknown.append(h)
+    if unknown: print("  No IP known for: %s" % ", ".join(unknown))
+    if not devices: return 1 if unknown else 0
+    if not confirm("  Revert temp config on %d device(s)?" % len(devices),
+                   args.yes):
+        print("  Aborted (state kept)."); return 1
+    user, pw = get_credentials(args)
+    _, no_conn, failed, expected = revert_devices(devices, user, pw,
+                                                  "RECOVERY")
+    rc = 1 if (no_conn or failed or unknown) else 0
+    if REVERT_VERIFY_AFTER and expected:
+        rv = verify_revert_clean(devices, user, pw, "RECOVERY", expected)
+        if rv and any(not r.get("ok") for r in rv.values()):
+            rc = 1
+    return rc
 
 
-def confirm(prompt: str, assume_yes: bool) -> bool:
-    if assume_yes:
-        return True
-    try:
-        answer = input("%s [y/N] " % prompt).strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return False
-    return answer in ("y", "yes")
-
-
-def _revert_leftovers_outside_inventory(devices: List[Device], ctx: RunCtx) -> None:
-    """Best effort revert for hosts that carry state but were not in this run."""
-    known = {d.hostname for d in devices}
-    for host, changes in sorted(pending_temp_changes().items()):
-        if host in known:
-            continue
-        ip = TEMP_CHANGES.get(host, {}).get("ip", "")
-        if not ip:
-            _safe_print("  ! %s still has temp changes and no recorded ip" % host)
-            continue
-        _safe_print("  reverting leftover temp changes on %s (%s)" % (host, ip))
-        ok_count, fail_count, clean = revert_temp_config_with_retry(
-            host, ip, ctx.user, ctx.pw, ctx.enable_pw)
-        _safe_print("     -> reverted=%d failed=%d" % (ok_count, fail_count))
-
-
-def main(argv: Optional[List[str]] = None) -> int:
-    global RUN_ID, LIVE_TRANSFER, DRY_RUN, CHECK_ONLY, NO_RECONCILE, DASHBOARD_ENABLED, CONSOLE_ECHO
-
-    _init_stdout()
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
-
-    if args.version:
-        _safe_print("%s v%s (target IOS-XE %s)" % (SCRIPT_NAME, VERSION, TARGET_VERSION))
-        return 0
-    if args.validate:
-        return run_validation()
-
-    if args.base_dir:
-        update_paths(args.base_dir)
-    if args.config:
-        globals()["CONFIG_FILE"] = Path(args.config).expanduser()
-    _apply_config_file()
-
-    # Bug B6: Ctrl+Break on Windows raises SIGBREAK, not SIGINT.
-    for sig_name in ("SIGINT", "SIGTERM", "SIGBREAK", "SIGHUP"):
-        sig = getattr(signal, sig_name, None)
-        if sig is None:
-            continue
+def mode_inventory(devices, user, pw):
+    print("\n  INVENTORY")
+    print("  " + "-" * 68)
+    out_devices = []
+    for d in devices:
+        host, ip = d["hostname"], d["ip"]
+        c_ = None
         try:
-            signal.signal(sig, _on_signal)
-        except Exception:
-            pass
-    atexit.register(_cleanup)
-
-    RUN_ID = time.strftime("%Y%m%d_%H%M%S")
-    DRY_RUN = bool(args.dry_run)
-    CHECK_ONLY = bool(args.check)
-    NO_RECONCILE = bool(args.no_reconcile)
-    LIVE_TRANSFER = bool(args.show_live_transfer)
-    CONSOLE_ECHO = True
-    DASHBOARD_ENABLED = not bool(args.check)
-
-    # Optional tuning knobs that map straight onto module constants.
-    globals()["SERIAL_TRANSFER_LARGE_MODELS"] = not bool(args.no_serial_large)
-    globals()["VERIFY_TRANSFER_HASH"] = not bool(args.no_hash_verify)
-    globals()["SKIP_CONFIG_DRIFT_CHECK"] = bool(args.no_drift_check)
-    globals()["ALLOW_BUNDLE_MODE_CONVERSION"] = not bool(args.no_bundle_mode)
-    if args.parallel_large is not None:
-        globals()["LARGE_MODEL_PARALLEL"] = max(1, int(args.parallel_large))
-        globals()["LARGE_SEM"] = threading.BoundedSemaphore(
-            max(1, int(args.parallel_large)))
-
-    _ensure_dirs()
+            c_ = do_connect(ip, user, pw)
+            tacacs_enable(c_, host, ssh_pw=pw)
+            model = get_model(c_) or "?"
+            ver_out = c_.send_command("show version | include Version")
+            ver = parse_running_version(ver_out) or "?"
+            boot = c_.send_command("show boot | include BOOT")
+            mode = "install" if "packages.conf" in boot else "bundle"
+            free = get_flash_free_bytes(c_)
+            flag = "LARGE" if _is_large_model(model) else "small"
+            vt = get_ios_xe_version_tuple(c_)
+            tier = _bulk_mode_tier(vt) or "?"
+            bulk = ("bulk" if _verify_config_line(c_, "ip ssh bulk-mode")
+                    else "no-bulk")
+            print("  %-32s %-15s %-18s ver=%-12s mode=%-7s free=%s %s "
+                  "tier=%s %s"
+                  % (host, ip, model, ver, mode, _fmt_bytes(free), flag,
+                     tier, bulk))
+            out_devices.append({"hostname": host, "ip": ip, "model": model,
+                                "version": ver, "mode": mode,
+                                "free_bytes": free, "tier": tier,
+                                "bulk": bulk})
+        except Exception as e:
+            tag = _classify_connect_error(e)
+            print("  %-32s %-15s ERROR: %s"
+                  % (host, ip, tag or str(e)[:60]))
+        finally:
+            if c_:
+                try: c_.disconnect()
+                except Exception: pass
     try:
-        pruned = prune_old_artefacts()
-        if pruned.get("logs") or pruned.get("backups"):
-            _safe_print("  retention: removed %d log file(s), %d backup(s)"
-                        % (pruned.get("logs", 0), pruned.get("backups", 0)))
-    except Exception:
-        pass
-    if not acquire_lock():
-        return 2
-    try:
-        globals()["ENABLE_PASSWORD"] = (os.environ.get("CISCO_ENABLE")
-                                        or args.enable_pass or None)
-        globals()["ENABLE_USER"] = (args.enable_user
-                                    or os.environ.get("CISCO_ENABLE_USER")
-                                    or None)
-        user, pw, enable_pw = resolve_credentials(args)
-        if not user or not pw:
-            _safe_print("  ! no credentials supplied (--user / --enable-pass or "
-                        "$CISCO_USER / $CISCO_PASS)")
-            return 2
-        ctx = RunCtx(user=user, pw=pw, enable_pw=enable_pw, run_id=RUN_ID)
+        save_inventory_cache(out_devices,
+                             os.path.join(BASE_DIR, "inventory_cache.json"))
+    except Exception: pass
+    return 0
 
-        devices = build_device_list(args) if not (args.recover or args.dry_run_revert) else []
 
-        # Bug B7: recovery state is loaded exactly once, here.
-        loaded = load_state_for_recovery()
-        if loaded:
-            _safe_print("  %d host(s) carry pending temp changes from earlier runs" % loaded)
+def mode_check(devices, user, pw):
+    print("\n  VERSION CHECK")
+    print("  " + "-" * 68)
+    for d in devices:
+        host, ip = d["hostname"], d["ip"]
+        c_ = None
+        try:
+            c_ = do_connect(ip, user, pw)
+            tacacs_enable(c_, host, ssh_pw=pw)
+            model = get_model(c_) or ""
+            fw = pick_firmware(model)
+            if not fw:
+                print("  %-32s unsupported model '%s'" % (host, model))
+                continue
+            _, target_ver = fw
+            ver_out = c_.send_command("show version | include Version")
+            cur = parse_running_version(ver_out) or "?"
+            status = ("OK (target)"
+                      if _norm_ver(cur) == _norm_ver(target_ver)
+                      else "upgrade needed -> %s" % target_ver)
+            print("  %-32s %-15s current=%-14s %s"
+                  % (host, ip, cur, status))
+        except Exception as e:
+            tag = _classify_connect_error(e)
+            print("  %-32s %-15s ERROR: %s"
+                  % (host, ip, tag or str(e)[:60]))
+        finally:
+            if c_:
+                try: c_.disconnect()
+                except Exception: pass
+    return 0
 
-        # --recover / --dry-run-revert work from persisted state alone, so they
-        # deliberately do not need an inventory file to be present.
-        if args.dry_run_revert:
-            return run_recovery(ctx, dry_run_revert=True)
-        if args.recover or args.revert_only:
-            return run_recovery(ctx, dry_run_revert=False)
 
-        if not devices:
-            _safe_print("  ! no devices selected -- check --locations / --hosts / --limit")
-            return 2
-
-        if CHECK_ONLY:
-            return run_check(devices, ctx)
-
-        fw_ok, fw_errors, fw_warnings = preflight_firmware()
-        for warning in fw_warnings:
-            _safe_print("  ! firmware: %s" % warning)
-        if fw_errors and not DRY_RUN:
-            _safe_print("")
-            _safe_print("  !! firmware pre-flight failed:")
-            for error in fw_errors:
-                _safe_print("     - %s" % error)
-            _safe_print("     firmware dir: %s" % FIRMWARE_DIR)
-            return 2
-
-        _safe_print("  %s v%s  run %s" % (SCRIPT_NAME, VERSION, RUN_ID))
-        _safe_print("  base dir : %s" % BASE_DIR)
-        _safe_print("  locations: %s" % ", ".join(args.locations if not args.hosts else ["adhoc"]))
-        _safe_print("  devices  : %d" % len(devices))
-        _safe_print("  firmware : %d image(s) verified in %s"
-                    % (len(FIRMWARE_SIZES), FIRMWARE_DIR))
-        _safe_print("  target   : IOS-XE %s (%d transfer slots, %d install workers, "
-                    "%d large-model slots)"
-                    % (TARGET_VERSION, TRANSFER_SLOTS, INSTALL_WORKERS,
-                       LARGE_MODEL_PARALLEL))
-        applied = ", ".join(PARAMIKO_REPORT.get("applied") or ["defaults"])
-        _safe_print("  paramiko : %s [%s]" % (PARAMIKO_REPORT.get("paramiko"), applied))
-        if not PARAMIKO_REPORT.get("legacy_kex"):
-            _safe_print("  ! this paramiko cannot offer dh-group14-sha1 / "
-                        "ssh-rsa; switches older than IOS-XE 16.12 may refuse "
-                        "the handshake (install paramiko < 5 or upgrade the "
-                        "switch to 16.12+)")
-        if DRY_RUN:
-            _safe_print("  mode     : DRY RUN (no device changes)")
-        if not confirm("begin upgrade?", args.yes):
-            _safe_print("  aborted by operator")
-            return 1
-
-        log_master("INFO", "run %s starting: %d device(s), dry_run=%s"
-                   % (RUN_ID, len(devices), DRY_RUN))
-
-        dash = threading.Thread(target=dashboard_thread, name="dashboard", daemon=True)
-        dash.start()
-
-        _safe_print("  pre-scanning models/versions ...")
-        prescan_models(devices, ctx)
-
-        all_records: List[Dict[str, Any]] = []
-        by_location: Dict[str, List[Device]] = {}
-        for dev in devices:
-            by_location.setdefault(dev.location or "adhoc", []).append(dev)
-
-        for location, devs in by_location.items():
-            if SHUTDOWN_REQ.is_set():
-                _safe_print("  shutdown requested -- skipping %s" % location)
-                break
-            all_records.extend(run_location(location, devs, ctx))
-
-        _revert_leftovers_outside_inventory(devices, ctx)
-
-        if not NO_RECONCILE and not SHUTDOWN_REQ.is_set() and not DRY_RUN:
-            reconcile = run_reconcile(devices, ctx)
+def mode_rollback(devices, user, pw, args, dry=False):
+    verb = "DRY-RUN " if dry else ""
+    if not confirm("  %sIssue `install rollback to committed` on "
+                   "%d device(s)?" % (verb, len(devices)), args.yes):
+        print("  Aborted."); return 1
+    print("\n  ROLLBACK%s" % (" (DRY-RUN)" if dry else ""))
+    print("  " + "-" * 68)
+    rc = 0
+    for d in devices:
+        host, ip = d["hostname"], d["ip"]
+        conn = None
+        try:
+            conn = do_connect(ip, user, pw)
+            tacacs_enable(conn, host, ssh_pw=pw)
+            cur = ""
             try:
-                path = REPORT_DIR / ("reconcile_%s.json" % RUN_ID)
-                with open(str(path), "w", encoding="utf-8") as fh:
-                    json.dump(reconcile, fh, indent=2, default=str)
-            except Exception:
-                pass
+                _o = conn.send_command("show version | include Version",
+                                       read_timeout=30)
+                cur = parse_running_version(_o)
+            except Exception: pass
+            if dry:
+                try:
+                    summ = conn.send_command("show install summary",
+                                             read_timeout=60)
+                    feed_live_log(host,
+                                  "[rollback-dry] show install summary\n%s"
+                                  % summ)
+                    entries = _parse_install_summary(summ)
+                    inactive = [v for v, s in entries.items() if s == "I"]
+                    print("  %-32s current=%-14s inactive_images=%d %s"
+                          % (host, cur, len(inactive),
+                             "(rollback possible)" if inactive
+                             else "(no inactive image)"))
+                except Exception as e:
+                    print("  %-32s DRY-RUN ERROR: %s" % (host, str(e)[:60]))
+                    rc = 1
+            else:
+                if attempt_rollback(conn, host, ip=ip, user=user, pw=pw,
+                                    original_version=cur):
+                    print("  %-32s rollback issued" % host)
+                else:
+                    print("  %-32s rollback FAILED" % host); rc = 1
+        except Exception as e:
+            tag = _classify_connect_error(e)
+            print("  %-32s ERROR: %s" % (host, tag or str(e)[:60])); rc = 1
+        finally:
+            if conn:
+                try: conn.disconnect()
+                except Exception: pass
+    return rc
 
-        done = sum(1 for r in all_records if r.get("status") == "DONE")
-        failed = sum(1 for r in all_records if r.get("status") == "FAILED")
-        drx = sum(1 for r in all_records if r.get("status") == "DRY-RUN")
-        _safe_print("")
-        _safe_print("  ================= final summary (run %s) =================" % RUN_ID)
-        _safe_print("  devices=%d  done=%d  failed=%d  dry-run=%d"
-                    % (len(all_records), done, failed, drx))
-        _safe_print("  logs     : %s" % LOG_DIR)
-        _safe_print("  reports  : %s" % REPORT_DIR)
-        _safe_print("  backups  : %s" % BACKUP_DIR)
-        log_master("INFO", "run %s finished: done=%d failed=%d" % (RUN_ID, done, failed))
-        if all_records and failed == 0:
-            return 0
-        return 1 if failed else 0
-    finally:
-        SHUTDOWN_REQ.set()
-        release_lock()
 
-
-# ===========================================================================
-#  VALIDATION MODE  --  one self-test per regression in the bug history
-# ===========================================================================
-def run_validation(verbose: bool = True) -> int:
-    _init_stdout()
-    tests: List[Tuple[str, Callable[[], bool]]] = []
-
-    def add(name: str, fn: Callable[[], bool]) -> None:
-        tests.append((name, fn))
-
-    def t_version_string() -> bool:
-        return VERSION == "35.9.34"
-
-    def t_classify_176() -> bool:
-        return classify_install_syntax((17, 6, 4))["activate_form"] == "either"
-
-    def t_classify_1718() -> bool:
-        return classify_install_syntax((17, 18, 4))["activate_form"] == "file"
-
-    def t_build_file_activate() -> bool:
-        cmds = build_activate_cmds("x.bin", {"activate_form": "file"})
-        return cmds == ["install activate file flash:x.bin"]
-
-    def t_apply_service_locks() -> bool:
-        src = inspect.getsource(apply_service_locks)
-        return all(key in src for key in ("http_server", "https_server", "tftp_server", "scp_server"))
-
-    def t_revert_services() -> bool:
-        src = inspect.getsource(revert_temp_config)
-        return all(key in src for key in ("http_server", "https_server", "tftp_server", "scp_server"))
-
-    def t_verify_no_temp() -> bool:
-        return "on-target" in inspect.getsource(verify_no_temp_changes)
-
-    def t_locks_before_precheck() -> bool:
-        src = inspect.getsource(transfer_worker)
-        return src.index("apply_service_locks") < src.index("precheck_device")
-
-    def t_no_per_location_state() -> bool:
-        return "load_state_for_recovery" not in inspect.getsource(run_location)
-
-    def t_pscp_reader_thread() -> bool:
-        src = inspect.getsource(_pscp_run_once)
-        return ("threading.Thread" in src and "queue.Queue" in src and "q.get(timeout=" in src)
-
-    def t_keepalive() -> bool:
-        src = inspect.getsource(do_connect)
-        return "get_transport()" in src and "getattr" not in src
-
-    def t_escalation_cap_top() -> bool:
-        src = inspect.getsource(run_state_machine)
-        return src.index("MAX_ESCALATIONS") < src.index("classify_state")
-
-    def t_update_paths_from_main() -> bool:
-        return "update_paths" in inspect.getsource(main)
-
-    def t_session_is_alive_loops() -> bool:
-        return "3.0" in inspect.getsource(_session_is_alive)
-
-    def t_sigbreak() -> bool:
-        return "SIGBREAK" in inspect.getsource(main)
-
-    def t_settle_shutdown_aware() -> bool:
-        return "SHUTDOWN_REQ.wait(POST_REBOOT_SETTLE_SEC)" in inspect.getsource(wait_reboot_and_verify)
-
-    def t_normalise_status() -> bool:
-        return _normalise_status("(C)") == "C" and _normalise_status("[C]") == "C"
-
-    def t_remote_size_retries() -> bool:
-        return "range(2)" in inspect.getsource(_remote_file_size)
-
-    def t_ntp_socket_cleanup() -> bool:
-        src = inspect.getsource(_fetch_reference_utc)
-        return "finally" in src and "s.close()" in src
-
-    def t_summary_parser_rows() -> bool:
-        return _parse_install_summary("  IMG  C  17.18.04") == {"17.18.04": "C"}
-
-    add("VERSION_STRING", t_version_string)
-    add("classify 17.6.4", t_classify_176)
-    add("classify 17.18.4", t_classify_1718)
-    add("build file-arg activate", t_build_file_activate)
-    add("apply_service_locks", t_apply_service_locks)
-    add("revert handles services", t_revert_services)
-    add("verify_no_temp_changes", t_verify_no_temp)
-    add("locks before precheck", t_locks_before_precheck)
-    add("run_location no per-loc", t_no_per_location_state)
-    add("pscp reader thread", t_pscp_reader_thread)
-    add("keepalive get_transport", t_keepalive)
-    add("escalation cap top", t_escalation_cap_top)
-    add("update_paths from main", t_update_paths_from_main)
-    add("session_is_alive loops", t_session_is_alive_loops)
-    add("SIGBREAK registered", t_sigbreak)
-    add("settle shutdown-aware", t_settle_shutdown_aware)
-    add("normalise_status", t_normalise_status)
-    add("remote_size retries", t_remote_size_retries)
-    add("NTP socket cleanup", t_ntp_socket_cleanup)
-    add("summary parser rows", t_summary_parser_rows)
-
-    passed = 0
-    failures: List[str] = []
-    if verbose:
-        _safe_print("  self-test suite for %s v%s" % (SCRIPT_NAME, VERSION))
-    for name, fn in tests:
+def mode_verify_mapping(devices, user, pw):
+    print("\n  FIRMWARE MAPPING VERIFICATION")
+    print("  " + "-" * 68)
+    for d in devices:
+        host, ip = d["hostname"], d["ip"]
+        c_ = None
         try:
-            ok = bool(fn())
-            detail = ""
-        except Exception as exc:
-            ok = False
-            detail = "%s: %s" % (type(exc).__name__, exc)
-        if ok:
-            passed += 1
-            if verbose:
-                _safe_print("  \u2713 %s" % name)
+            c_ = do_connect(ip, user, pw)
+            tacacs_enable(c_, host, ssh_pw=pw)
+            model = get_model(c_) or ""
+            fw = pick_firmware(model)
+            if not fw:
+                print("  %-32s %-18s UNSUPPORTED" % (host, model))
+                continue
+            fwf, tg = fw
+            ok, reason = verify_model_firmware_consistency(model, fwf, tg)
+            print("  %-32s %-18s %-42s %s"
+                  % (host, model, fwf, "OK" if ok else reason))
+        except Exception as e:
+            tag = _classify_connect_error(e)
+            print("  %-32s ERROR: %s" % (host, tag or str(e)[:60]))
+        finally:
+            if c_:
+                try: c_.disconnect()
+                except Exception: pass
+    return 0
+
+
+def _validate():
+    passed, failed = [], []
+    def _t(name, fn):
+        try:
+            fn(); passed.append(name)
+        except AssertionError as e:
+            failed.append((name, "assertion: %s" % e))
+        except Exception as e:
+            failed.append((name, "%s: %s" % (type(e).__name__, e)))
+
+    def t_family():
+        assert _family_for_model("C9200L-24P") == ("lite", "_lite_")
+        assert _family_for_model("C9300-48P") == ("full", None)
+        assert _family_for_model("C9500-24Y4C") == ("full", None)
+        assert _family_for_model("C9200CX-8P") == ("lite", "_lite_")
+        assert _family_for_model("") == (None, None)
+        assert _family_for_model("Unknown") == (None, None)
+    _t("_family_for_model", t_family)
+
+    def t_size():
+        assert _family_size_ok("lite", 500_000_000)[0]
+        assert not _family_size_ok("lite", 1_500_000_000)[0]
+        assert _family_size_ok("full", 1_200_000_000)[0]
+        assert not _family_size_ok("full", 400_000_000)[0]
+        assert _family_size_ok(None, 0)[0]
+    _t("_family_size_ok", t_size)
+
+    def t_norm():
+        raw = "\n".join([
+            "Building configuration...",
+            "Current configuration : 2345 bytes",
+            "!", "! Last configuration change at 12:00",
+            "version 17.18", "hostname SW1", "!",
+            "endpoint-tracking", "end-user-acl 1", "end", "",
+            "3d04h: %SYS-5-CONFIG_I: Configured from console"])
+        out = _normalize_config(raw)
+        assert "version 17.18" in out
+        assert "hostname SW1" in out
+        assert "endpoint-tracking" in out
+        assert "end-user-acl 1" in out
+        assert "end" not in out
+        assert all(not l.startswith("!") for l in out)
+    _t("_normalize_config keeps endpoint-* lines", t_norm)
+
+    def t_drift_noise():
+        assert _is_drift_noise("- exec-timeout 60 0")
+        assert _is_drift_noise("+ exec-timeout 30 0")
+        assert _is_drift_noise("- ip ssh bulk-mode window-size 131072")
+        assert _is_drift_noise("+ ip scp server enable")
+        assert not _is_drift_noise("+ hostname SW1")
+        assert not _is_drift_noise("+++ b/file")
+        assert not _is_drift_noise("--- a/file")
+    _t("config-drift noise filters both sides", t_drift_noise)
+
+    def t_norm_ver():
+        assert _norm_ver("17.18.04") == "17.18.4"
+        assert _norm_ver("17.18.4")  == "17.18.4"
+        assert _norm_ver("") == ""
+        assert _norm_ver(None) == ""
+        assert _norm_ver("garbage") == "garbage"
+    _t("_norm_ver", t_norm_ver)
+
+    def t_member_required():
+        fw = 478_710_000
+        need_act_have = _member_required_bytes(
+            fw, True, bin_already_present=True, is_standby=False)
+        assert 550_000_000 < need_act_have < 650_000_000, need_act_have
+        need_act_no = _member_required_bytes(
+            fw, True, bin_already_present=False, is_standby=False)
+        assert 1_050_000_000 < need_act_no < 1_100_000_000, need_act_no
+        need_stby = _member_required_bytes(
+            fw, True, bin_already_present=True, is_standby=True)
+        assert 1_050_000_000 < need_stby < 1_100_000_000, need_stby
+        assert need_stby == need_act_no
+        assert _member_required_bytes(0, True) == MIN_FREE_BYTES
+    _t("v35.9.34 _member_required_bytes (active vs standby)",
+       t_member_required)
+
+    def t_extraction_factor_realistic():
+        assert 1.0 <= EXTRACTION_OVERHEAD_FACTOR <= 1.15, \
+            "extraction factor must be >=1.0 (bin is compressed)"
+    _t("v35.9.33 extraction factor >= 1.0", t_extraction_factor_realistic)
+
+    def t_space_markers_extended():
+        assert "not enough free disk" in _SPACE_MARKERS
+        assert "free disk available" in _SPACE_MARKERS
+        assert "not enough space" in _SPACE_MARKERS
+        assert "insufficient space" in _SPACE_MARKERS
+    _t("v35.9.30 Cisco space markers", t_space_markers_extended)
+
+    def t_runinstall_uses_space_marker():
+        import inspect as _i
+        src = _i.getsource(run_install)
+        assert "_SPACE_MARKERS" in src
+        assert "insufficient_space: install engine rejected" in src
+    _t("v35.9.30 run_install short-circuits on Cisco space error",
+       t_runinstall_uses_space_marker)
+
+    def t_precheck_uses_new_formula():
+        import inspect as _i
+        src = _i.getsource(precheck_device)
+        assert "_member_required_bytes" in src
+        assert "EXTRACTION_OVERHEAD_FACTOR" in src
+        assert "insufficient_space_stack" in src
+    _t("v35.9.31 precheck uses new formula",
+       t_precheck_uses_new_formula)
+
+    def t_force_wipe_allows_running_bin():
+        import inspect as _i
+        src = _i.getsource(_force_wipe_flash)
+        assert "allow_running_bin_delete" in src
+        assert "_is_install_mode" in src
+        assert "keep_bin" in src
+    _t("v35.9.31 force-wipe can delete running .bin in install mode",
+       t_force_wipe_allows_running_bin)
+
+    def t_do_connect_call():
+        import inspect as _i
+        src = _i.getsource(wait_reboot_and_verify)
+        assert "do_connect(ip, host, user, pw" not in src
+        assert "do_connect(ip, user, pw)" in src
+    _t("v35.9.31 wait_reboot_and_verify uses correct do_connect",
+       t_do_connect_call)
+
+    def t_verify_boot_and_install_ready():
+        import inspect as _i
+        src = _i.getsource(verify_boot_and_install_ready)
+        assert "packages.conf" in src
+        assert "install_busy" in src
+        assert "size_mismatch" in src
+    _t("v35.9.31 verify_boot_and_install_ready",
+       t_verify_boot_and_install_ready)
+
+    def t_purge_unnecessary():
+        import inspect as _i
+        src = _i.getsource(_purge_unnecessary_files)
+        assert "_read_active_packages" in src
+        assert "aggressive" in src
+        assert "active_pkgs" in src
+    _t("v35.9.31 _purge_unnecessary_files", t_purge_unnecessary)
+
+    def t_summary_multi():
+        out = "\n".join([
+            "Install Summary", "===============", "",
+            "IMG: flash:cat9k_iosxe.17.18.04.SPA.bin",
+            "  Version : 17.18.04", "  Status  : C"])
+        assert summary_committed_on_target(out, "17.18.04")
+        assert summary_committed_on_target(out, "17.18.4")
+        assert not summary_committed_on_target(out, "17.15.01")
+    _t("summary_committed_on_target (multi-block)", t_summary_multi)
+
+    def t_summary_with_leftover_I():
+        out = "\n".join([
+            "IMG: flash:cat9k_iosxe.17.18.04.SPA.bin",
+            "  Version : 17.18.04", "  Status  : C",
+            "IMG: flash:cat9k_iosxe.17.15.03.SPA.bin",
+            "  Version : 17.15.03", "  Status  : I"])
+        assert summary_committed_on_target(out, "17.18.04")
+    _t("summary accepts leftover I", t_summary_with_leftover_I)
+
+    def t_summary_two_C_rejected():
+        out = "\n".join([
+            "IMG: flash:cat9k_iosxe.17.18.04.SPA.bin",
+            "  Version : 17.18.04", "  Status  : C",
+            "IMG: flash:cat9k_iosxe.17.15.03.SPA.bin",
+            "  Version : 17.15.03", "  Status  : C"])
+        assert not summary_committed_on_target(out, "17.18.04")
+    _t("summary rejects two-C", t_summary_two_C_rejected)
+
+    def t_summary_uncommitted():
+        out = "\n".join([
+            "IMG: flash:cat9k_iosxe.17.18.04.SPA.bin",
+            "  Version : 17.18.04", "  Status  : U"])
+        assert not summary_committed_on_target(out, "17.18.04")
+    _t("summary rejects Uncommitted", t_summary_uncommitted)
+
+    def t_summary_rows_ok():
+        out = "\n".join(["  IMG  C  17.18.04"])
+        assert summary_committed_on_target(out, "17.18.04")
+    _t("summary rows form accepts single C", t_summary_rows_ok)
+
+    def t_parse_summary_multi():
+        out = ("IMG: flash:cat9k_iosxe.17.18.04.SPA.bin\n"
+               "  Version : 17.18.04\n"
+               "  Status  : C\n"
+               "IMG: flash:cat9k_iosxe.17.15.03.SPA.bin\n"
+               "  Version : 17.15.03\n"
+               "  Status  : I")
+        r = _parse_install_summary(out)
+        assert r.get("17.18.4") == "C"
+        assert r.get("17.15.3") == "I"
+    _t("_parse_install_summary (multi-block)", t_parse_summary_multi)
+
+    def t_parse_summary_rows():
+        out = "  IMG  C  17.18.04\n  IMG  A  17.15.03\n  IMG  U  17.12.04\n  IMG  I  17.11.01"
+        r = _parse_install_summary(out)
+        assert r.get("17.18.4") == "C"
+        assert r.get("17.15.3") == "A"
+        assert r.get("17.12.4") == "U"
+        assert r.get("17.11.1") == "I"
+    _t("_parse_install_summary (rows)", t_parse_summary_rows)
+
+    def t_parse_summary_empty():
+        assert _parse_install_summary("") == {}
+        assert _parse_install_summary(None) == {}
+    _t("_parse_install_summary (empty)", t_parse_summary_empty)
+
+    def t_dead_socket():
+        for txt in ("Socket is closed", "connection reset",
+                    "broken pipe", "EOF", "channel closed",
+                    "no existing session", "EOF occurred",
+                    "EOF when reading a line"):
+            assert _is_dead_socket_error(txt) is True, txt
+        assert _is_dead_socket_error("parser found no EOF marker") is False
+        assert _is_dead_socket_error("random error") is False
+        assert _is_dead_socket_error("no EOF found") is False
+    _t("_is_dead_socket_error (anchored)", t_dead_socket)
+
+    def t_bulk():
+        assert _bulk_mode_tier((17, 10, 1)) == "A"
+        assert _bulk_mode_tier((17, 12, 3)) == "A"
+        assert _bulk_mode_tier((17, 6, 5)) == "B"
+        assert _bulk_mode_tier((17, 2, 1)) == "C"
+        assert _bulk_mode_tier((16, 12, 5)) == "D"
+        assert _bulk_mode_tier(None) is None
+    _t("_bulk_mode_tier", t_bulk)
+
+    def t_bins():
+        out = "\n".join([
+            "Directory of flash:/", "",
+            "    1  -rw-  12345678   Mar 1 2025 12:00:00 +00:00  "
+            "cat9k_iosxe.17.18.04.SPA.bin",
+            "    2  -rw-   9876543   Mar 1 2025 12:00:00 +00:00  "
+            "cat9k_lite_iosxe.17.18.04.SPA.bin",
+            "    3  drwx        4096  Mar 1 2025 12:00:00 +00:00  .installer"])
+        bins = parse_dir_bins(out)
+        assert "cat9k_iosxe.17.18.04.SPA.bin" in bins
+        assert "cat9k_lite_iosxe.17.18.04.SPA.bin" in bins
+    _t("parse_dir_bins", t_bins)
+
+    def t_fsize():
+        out = ("-rw-   123456789   Mar 1 2025 12:00:00 +00:00  "
+               "cat9k_iosxe.17.18.04.SPA.bin")
+        assert _parse_file_size_from_dir(
+            out, "cat9k_iosxe.17.18.04.SPA.bin") == 123456789
+    _t("_parse_file_size_from_dir", t_fsize)
+
+    def t_uptime():
+        assert parse_uptime_minutes("2 weeks, 3 days, 4 hours, 5 minutes") \
+            == 2*10080 + 3*1440 + 4*60 + 5
+        assert parse_uptime_minutes("1 year, 12 weeks") == 525600 + 12*10080
+        assert parse_uptime_minutes("garbage") is None
+    _t("parse_uptime_minutes", t_uptime)
+
+    def t_vty():
+        out = "\n".join([
+            "line vty 0 4", " exec-timeout 60 0", " transport input ssh",
+            "line vty 5 15", " transport input ssh"])
+        b = parse_vty_blocks(out)
+        assert len(b) == 2
+        assert b[0]["vty"] == "0 4"
+        assert b[0]["minutes"] == 60
+        assert b[1]["vty"] == "5 15"
+        assert b[1].get("was_default") is True
+    _t("parse_vty_blocks", t_vty)
+
+    def t_class():
+        e = Exception("No acceptable KEX algorithm")
+        assert _classify_connect_error(e) == "SSH negotiation failed"
+        e = Exception("No acceptable host key")
+        assert _classify_connect_error(e) == "SSH host-key negotiation failed"
+        e = Exception("some random error")
+        assert _classify_connect_error(e) == ""
+    _t("_classify_connect_error", t_class)
+
+    def t_large():
+        assert _is_large_model("C9300-48P")
+        assert _is_large_model("C9500-24Y4C")
+        assert not _is_large_model("C9200L-24P")
+        assert not _is_large_model("")
+    _t("_is_large_model", t_large)
+
+    def t_map_selfcheck():
+        errs, _ = verify_firmware_map()
+        structural = [e for e in errs if "not found at" not in e
+                      and "exceeds the absolute" not in e
+                      and "too small" not in e]
+        assert not structural, "structural errors: %s" % structural
+    _t("verify_firmware_map (structural)", t_map_selfcheck)
+
+    def t_fw_hard_cap():
+        import inspect as _i
+        src = _i.getsource(verify_firmware_map)
+        assert "MAX_FIRMWARE_BYTES" in src
+        assert "exceeds the absolute" in src
+    _t("firmware hard cap", t_fw_hard_cap)
+
+    def t_fw_size_constants():
+        assert MAX_FIRMWARE_BYTES == 2_000_000_000
+        assert MIN_FIRMWARE_BYTES == 100_000_000
+        assert FAMILY_SIZE_BOUNDS_STRICT is True
+    _t("firmware size constants", t_fw_size_constants)
+
+    def t_cmd_tracking():
+        assert "set_cmd" in globals() and "get_cmd" in globals()
+        set_cmd("testhost", "show version")
+        assert get_cmd("testhost") == "show version"
+    _t("Cmd tracking", t_cmd_tracking)
+
+    def t_long_running_phases():
+        assert "INSTALL" in LIVE_LOG_PANEL_PHASES
+        assert "SERVICE-LOCKS" in LIVE_LOG_PANEL_PHASES
+        assert "PRE-CHECK" in LIVE_LOG_PANEL_PHASES
+        assert "PKG-PURGE" in LIVE_LOG_PANEL_PHASES
+    _t("long-running phases", t_long_running_phases)
+
+    def t_activate_forms():
+        assert len(_ACTIVATE_FORMS) >= 3
+        assert any("activate file flash" in f for f in _ACTIVATE_FORMS)
+        assert any(f == "install activate" for f in _ACTIVATE_FORMS)
+        import inspect as _i
+        src = _i.getsource(_try_all_activate_forms)
+        assert "_nudge_install_activate" in src
+    _t("activate forms", t_activate_forms)
+
+    def t_fast_reboot_probe():
+        import inspect as _i
+        src = _i.getsource(wait_reboot_and_verify)
+        assert "fast-reboot probe" in src
+        assert "_verify_after_reboot_impl" in src
+    _t("fast-reboot probe", t_fast_reboot_probe)
+
+    def t_residual_detector():
+        assert "_detect_residual_temp_config" in globals()
+        import inspect as _i
+        src = _i.getsource(_detect_residual_temp_config)
+        assert "exec_timeout" in src
+        assert "ssh_tune" in src
+    _t("residual detector", t_residual_detector)
+
+    def t_precheck_checks_commit():
+        import inspect as _i
+        src = _i.getsource(precheck_device)
+        assert "already_on_target_needs_finalize" in src
+        assert "_detect_residual_temp_config" in src
+        assert "summary_committed_on_target" in src
+    _t("precheck commit + residual audit",
+       t_precheck_checks_commit)
+
+    def t_install_fixup_path():
+        import inspect as _i
+        src = _i.getsource(install_worker)
+        assert "already_on_target_fixup" in src
+    _t("install fixup path (safety net)", t_install_fixup_path)
+
+    def t_fixup_inline():
+        import inspect as _i
+        src = _i.getsource(transfer_worker)
+        assert "fixup_done" in src
+        assert "_finalize_install_commit" in src
+        assert "revert_device_temp_changes" in src
+    _t("v35.9.29 fixup inline in transfer_worker", t_fixup_inline)
+
+    def t_fixup_done_routes_in_collect():
+        import inspect as _i
+        src = _i.getsource(_collect_transfer_result)
+        assert "fixup_done" in src
+    _t("v35.9.29 fixup_done routes", t_fixup_done_routes_in_collect)
+
+    def t_drain_install_futures():
+        import inspect as _i
+        src = _i.getsource(run_pass)
+        assert "_drain_install" in src
+        assert "block=False" in src
+    _t("v35.9.29 run_pass drains installs", t_drain_install_futures)
+
+    def t_pool_rebalance():
+        # v35.9.42 FIX-WORKER-FLEX: no specific counts asserted; just
+        # ensure the config is self-consistent and sane.
+        assert isinstance(TRANSFER_SLOTS, int) and TRANSFER_SLOTS >= 1
+        assert isinstance(INSTALL_WORKERS, int) and INSTALL_WORKERS >= 1
+        assert isinstance(MAX_SAFE_SSH_SESSIONS, int)
+        assert MAX_SAFE_SSH_SESSIONS >= 1
+    _t("v35.9.42 worker counts sane (flexible)", t_pool_rebalance)
+
+    def t_probe_overhead_reduced():
+        assert INSTALL_PROBE_INTERVAL == 300
+        assert PROBE_CONNECT_RETRIES == 2
+        assert COMMIT_VERIFY_TIMEOUT == 300
+        assert COMMIT_VERIFY_RETRY_SEC == 15
+        assert SESSION_SLOT_ACQUIRE_TIMEOUT == 60
+    _t("v35.9.29 probe overhead reduced", t_probe_overhead_reduced)
+
+    def t_clock_cache():
+        assert "_ensure_device_clock_correct_cached" in globals()
+        assert "_CLOCK_TTL_SEC" in globals()
+        import inspect as _i
+        src_pc = _i.getsource(precheck_device)
+        assert "_ensure_device_clock_correct_cached" in src_pc
+    _t("v35.9.29 clock check is cached", t_clock_cache)
+
+    def t_state_hosts():
+        v2 = {"schema": 2, "run_id": "x",
+              "hosts": {"sw1": {"changes": []}}}
+        assert _state_hosts(v2) == {"sw1": {"changes": []}}
+        v1 = {"sw1": {"changes": []}}
+        assert _state_hosts(v1) == v1
+        assert _state_hosts(None) == {}
+    _t("_state_hosts", t_state_hosts)
+
+    def t_row():
+        d = {"hostname": "sw1", "ip": "10.0.0.1"}
+        st = {"verify_pending": True, "target_version": "17.18.04",
+              "clock_corrected": True, "config_diff_lines": 4}
+        r = _row(d, "failed", "install", "test", st=st)
+        assert r["verify_pending"] is True
+        assert r["clock_corrected"] is True
+        assert r["config_diff_lines"] == 4
+        assert r["target_version"] == "17.18.04"
+    _t("_row fields", t_row)
+
+    def t_revert_markers():
+        m = _revert_markers_for_types(["ssh_tune", "cheap_crypto"])
+        names = [x[0] for x in m]
+        assert "ip ssh bulk-mode" in names
+        assert "ip ssh server algorithm encryption" in names
+    _t("_revert_markers_for_types", t_revert_markers)
+
+    def t_rollback_syntax():
+        import inspect as _i
+        src = _i.getsource(_issue_rollback_commands)
+        assert "install rollback to committed" in src
+        assert "install rollback to base" in src
+    _t("rollback tries modern then legacy", t_rollback_syntax)
+
+    def t_safe_reload():
+        import inspect as _i
+        src = _i.getsource(_safe_manual_reload)
+        assert "_RELOAD_MARKERS" in src
+        assert "proceed with reload" in src.lower()
+    _t("_safe_manual_reload marker-driven", t_safe_reload)
+
+    def t_install_stages():
+        import inspect as _i
+        src = _i.getsource(run_install)
+        assert "install_add" in src
+        assert "install_activate" in src
+        assert "install_commit" in src
+    _t("run_install stage detection", t_install_stages)
+
+    def t_runinstall_done():
+        import inspect as _i
+        src = _i.getsource(run_install)
+        assert "_DONE" in src
+        assert "image committed on " in src
+        assert "already on " in src
+        assert "Probe confirms on target" in src
+    _t("run_install exits on done", t_runinstall_done)
+
+    def t_probe_version_first():
+        import inspect as _i
+        src = _i.getsource(_probe_install_status)
+        ver_pos = src.find('show version | include Version')
+        summ_pos = src.find('show install summary')
+        assert ver_pos != -1 and summ_pos != -1
+        assert ver_pos < summ_pos
+    _t("probe checks version first", t_probe_version_first)
+
+    def t_probe_uses_parser():
+        import inspect as _i
+        src = _i.getsource(_probe_install_status)
+        assert "_parse_install_summary" in src
+    _t("probe uses _parse_install_summary", t_probe_uses_parser)
+
+    def t_runinstall_activate_before_cap():
+        import inspect as _i
+        src = _i.getsource(run_install)
+        inactive_pos = src.find('"image inactive" in probe_msg')
+        cap_pos = src.find("if same_total >= 12")
+        assert 0 <= inactive_pos < cap_pos
+    _t("activate nudge before cap", t_runinstall_activate_before_cap)
+
+    def t_nudge_helper():
+        import inspect as _i
+        src = _i.getsource(_nudge_install_activate)
+        assert "install activate file flash:" in src
+        assert "_PROMPT_MARKERS" in src
+        assert "_RELOAD_MARKERS" in src
+        assert "_is_dead_socket_error" in src
+    _t("nudge helper complete", t_nudge_helper)
+
+    def t_escalation_helper():
+        import inspect as _i
+        src = _i.getsource(_run_install_abort_and_reissue)
+        assert "install abort" in src
+        assert "install add file flash:" in src
+        assert "_is_dead_socket_error" in src
+    _t("escalation helper", t_escalation_helper)
+
+    def t_finalize_helper():
+        import inspect as _i
+        src = _i.getsource(_finalize_install_commit)
+        assert "install commit" in src
+        assert "summary_committed_on_target" in src
+        assert "_parse_install_summary" in src
+        assert "_run_install_remove_inactive" in src
+        sig = _i.signature(_finalize_install_commit)
+        assert "fw_file" in sig.parameters
+        assert "_norm_ver" in src
+    _t("finalize commit helper", t_finalize_helper)
+
+    def t_finalize_respects_rollback():
+        import inspect as _i
+        src = _i.getsource(_finalize_install_commit)
+        assert "PRESERVE_ROLLBACK" in src
+    _t("finalize respects PRESERVE_ROLLBACK",
+       t_finalize_respects_rollback)
+
+    def t_finalize_detects_two_committed():
+        import inspect as _i
+        src = _i.getsource(_finalize_install_commit)
+        assert "two committed versions" in src
+    _t("finalize detects two-committed state",
+       t_finalize_detects_two_committed)
+
+    def t_finalize_uses_fw_file_not_running():
+        import inspect as _i
+        src = _i.getsource(_finalize_install_commit)
+        assert "_get_running_image" not in src
+    _t("finalize Path 3a uses fw_file",
+       t_finalize_uses_fw_file_not_running)
+
+    def t_finalize_refuses_empty_fw():
+        import inspect as _i
+        src = _i.getsource(_finalize_install_commit)
+        assert "filename is unknown" in src
+    _t("finalize refuses unknown fw", t_finalize_refuses_empty_fw)
+
+    def t_wait_reboot_calls_finalize():
+        import inspect as _i
+        src = _i.getsource(wait_reboot_and_verify)
+        assert "_finalize_install_commit" in src or \
+            "_verify_after_reboot_impl" in src
+        assert "fw_file" in _i.signature(wait_reboot_and_verify).parameters
+    _t("wait_reboot calls finalize with fw_file",
+       t_wait_reboot_calls_finalize)
+
+    def t_reconcile_calls_finalize():
+        import inspect as _i
+        src = _i.getsource(_reconcile_failed_devices)
+        assert "_finalize_install_commit" in src
+    _t("reconcile calls finalize", t_reconcile_calls_finalize)
+
+    def t_health_no_commit_check():
+        import inspect as _i
+        src = _i.getsource(post_upgrade_health_check)
+        assert "summary_committed_on_target" not in src
+    _t("health check has no commit re-check", t_health_no_commit_check)
+
+    def t_stack_version_multi_syntax():
+        import inspect as _i
+        src = _i.getsource(check_stack_versions)
+        assert "_per_member_version" in src
+    _t("v35.9.36 stack per-member verify", t_stack_version_multi_syntax)
+
+    def t_precheck_members_count_early():
+        import inspect as _i
+        src = _i.getsource(precheck_device)
+        early = src.find("members_count = 1")
+        assert early != -1
+    _t("members_count defined early", t_precheck_members_count_early)
+
+    def t_precheck_skips_gate_on_unreadable():
+        import inspect as _i
+        src = _i.getsource(precheck_device)
+        assert "skip_per_member_gate" in src
+        assert "SKIPPING pre-check space gate" in src
+    _t("precheck skips gate on unreadable members",
+       t_precheck_skips_gate_on_unreadable)
+
+    def t_report_force():
+        import inspect as _i
+        sig = _i.signature(write_location_report)
+        assert "force" in sig.parameters
+        src = _i.getsource(_reconcile_failed_devices)
+        assert "force=True" in src
+    _t("report rewrite force=True", t_report_force)
+
+    def t_atexit():
+        src = open(__file__, "r", encoding="utf-8").read()
+        assert "atexit.register(_cleanup_orphan_pwfiles)" in src
+    _t("atexit pwfile cleanup", t_atexit)
+
+    def t_lock_order():
+        src = open(__file__, "r", encoding="utf-8").read()
+        lock_pos = src.find("lock_handle = _acquire_instance_lock()")
+        rot_pos = src.find("rotate_backups()")
+        assert lock_pos != -1 and rot_pos != -1
+        assert lock_pos < rot_pos
+    _t("instance lock precedes rotation", t_lock_order)
+
+    def t_fmt_dur():
+        assert _fmt_duration(0) == "0s"
+        assert _fmt_duration(45) == "45s"
+        assert _fmt_duration(60) == "1m00s"
+        assert _fmt_duration(200) == "3m20s"
+        assert _fmt_duration(3725) == "1h02m05s"
+        assert _fmt_duration(None) == "0s"
+    _t("_fmt_duration", t_fmt_dur)
+
+    def t_fmt_bytes():
+        assert _fmt_bytes(500) == "500.00B"
+        assert _fmt_bytes(1024 * 1024) == "1.00MB"
+        assert _fmt_bytes(1024 * 1024 * 1024) == "1.00GB"
+        assert _fmt_bytes(None) == "?"
+    _t("_fmt_bytes", t_fmt_bytes)
+
+    def t_device_line():
+        s = _device_line({"hostname": "sw1", "ip": "10.0.0.1",
+                          "status": "success",
+                          "start_version": "17.15.01",
+                          "target_version": "17.18.04",
+                          "duration_sec": 720,
+                          "md5_ok": True, "reboot_detected": True,
+                          "clock_corrected": True})
+        assert s.startswith("OK sw1")
+        assert "17.15.01 -> 17.18.04" in s
+        assert "12m00s" in s
+    _t("_device_line", t_device_line)
+
+    def t_summary_return():
+        fake = {"LocA": {
+            "sw1": {"hostname": "sw1", "ip": "10.0.0.1", "status": "success",
+                    "stage": "install", "start_version": "17.15.01",
+                    "target_version": "17.18.04", "post_version": "17.18.04",
+                    "duration_sec": 720, "md5_ok": True,
+                    "reboot_detected": True, "install_started": True,
+                    "verify_pending": False, "clock_corrected": False,
+                    "config_diff_lines": 0, "attempts": 1, "error": ""},
+            "sw2": {"hostname": "sw2", "ip": "10.0.0.2", "status": "failed",
+                    "stage": "install", "start_version": "17.15.01",
+                    "target_version": "17.18.04", "post_version": "",
+                    "duration_sec": 100, "md5_ok": False,
+                    "reboot_detected": False, "install_started": True,
+                    "verify_pending": True, "clock_corrected": False,
+                    "config_diff_lines": 0, "attempts": 1,
+                    "error": "install probe: not priv-15"},
+        }}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            n = print_summary(fake, {})
+        assert n == 1
+        out = buf.getvalue()
+        assert "FINAL SUMMARY" in out
+        assert "TOTAL" in out
+    _t("print_summary returns failed count", t_summary_return)
+
+    def t_anomaly():
+        prev = {"run_id": "OLD", "results": [
+            {"hostname": "sw1", "status": "success",
+             "post_version": "17.18.04"}]}
+        cur = {"LocA": {"sw1": {"hostname": "sw1", "status": "success",
+                                "post_version": "17.15.01"}}}
+        issues = detect_anomalies(cur, prev)
+        assert any("regressed" in m for _, m in issues)
+    _t("detect_anomalies", t_anomaly)
+
+    def t_cli():
+        real = sys.argv
+        try:
+            for flags in (["--only-upgrade-needed"], ["--preview"],
+                          ["--preview-only"], ["--quiet-skipped"],
+                          ["--no-html-report"], ["--no-health-snapshot"],
+                          ["--use-inventory-cache"], ["--no-colour"],
+                          ["--estimate-only"], ["--interactive-resume"],
+                          ["--no-reconcile"], ["--no-hash-verify"],
+                          ["--allow-lenient-firmware"],
+                          ["--allow-active-pkg-purge"]):
+                sys.argv = ["prog"] + flags
+                parse_args()
+        finally:
+            sys.argv = real
+    _t("CLI flags parse", t_cli)
+
+    def t_pscp_retry_drops_pwfile():
+        import inspect as _i
+        src = _i.getsource(transfer_via_pscp)
+        assert '"-pw", pw' in src
+    _t("pscp retry drops -pwfile", t_pscp_retry_drops_pwfile)
+
+    def t_clock_returns_entry_drift():
+        import inspect as _i
+        src = _i.getsource(_ensure_device_clock_correct)
+        assert "entry_drift" in src
+    _t("clock helper returns entry drift",
+       t_clock_returns_entry_drift)
+
+    def t_transfer_verify_local_size():
+        import inspect as _i
+        src = _i.getsource(_transfer_with_wipe_retry)
+        assert "local_size" in src
+    _t("transfer verifies local size", t_transfer_verify_local_size)
+
+    def t_is_install_mode():
+        assert "_is_install_mode" in globals()
+        import inspect as _i
+        src = _i.getsource(_is_install_mode)
+        assert "packages.conf" in src
+    _t("v35.9.31 _is_install_mode helper", t_is_install_mode)
+
+    def t_read_active_packages_json():
+        import inspect as _i
+        src = _i.getsource(_read_active_packages)
+        assert "file_name" in src
+        assert "return active_conf, None" in src
+        assert "boot\\s+flash:" in src
+    _t("v35.9.32 _read_active_packages handles JSON + text + fail-safe",
+       t_read_active_packages_json)
+
+    def t_read_active_fallback():
+        import inspect as _i
+        src = _i.getsource(_read_active_packages)
+        assert "install summary" in src
+        assert "committed" in src
+    _t("v35.9.36 _read_active_packages falls back to install summary",
+       t_read_active_fallback)
+
+    def t_pre_install_pkg_purge():
+        import inspect as _i
+        src = _i.getsource(_pre_install_pkg_purge)
+        assert "ALLOW_ACTIVE_PKG_PURGE" in src
+        assert "target .bin not on flash" in src
+        assert "cannot determine active .pkg set" in src
+    _t("v35.9.32 _pre_install_pkg_purge gated + verified",
+       t_pre_install_pkg_purge)
+
+    def t_transfer_worker_invokes_pkg_purge():
+        import inspect as _i
+        src = _i.getsource(transfer_worker)
+        assert "_pre_install_pkg_purge" in src
+        assert "ALLOW_ACTIVE_PKG_PURGE" in src
+    _t("v35.9.32 transfer_worker invokes last-resort purge",
+       t_transfer_worker_invokes_pkg_purge)
+
+    def t_purge_refuses_when_unknown():
+        import inspect as _i
+        src = _i.getsource(_purge_unnecessary_files)
+        assert "active_pkgs is None" in src
+        assert "REFUSING to delete any .pkg" in src
+    _t("v35.9.32 aggressive purge refuses when active set unknown",
+       t_purge_refuses_when_unknown)
+
+    def t_config_keys_has_flags():
+        assert "ALLOW_ACTIVE_PKG_PURGE" in _CONFIG_KEYS
+    _t("v35.9.35 _CONFIG_KEYS includes purge flag",
+       t_config_keys_has_flags)
+
+    def t_purge_standby_exists():
+        import inspect as _i
+        src = _i.getsource(_purge_standby_members)
+        assert "stby-flash:" in src
+        assert "flash-%d:" in src
+    _t("v35.9.35 _purge_standby_members", t_purge_standby_exists)
+
+    def t_pkg_set_present_detection():
+        import inspect as _i
+        src = _i.getsource(_is_target_pkg_set_present)
+        assert "status=I" in src
+        assert "status=A" in src
+        assert "status=U" in src
+    _t("v35.9.36 _is_target_pkg_set_present",
+       t_pkg_set_present_detection)
+
+    def t_precheck_early_return():
+        import inspect as _i
+        src = _i.getsource(precheck_device)
+        assert "already_added_needs_activate" in src
+        assert "_is_target_pkg_set_present" in src
+    _t("v35.9.36 precheck skips gate when .pkg already present",
+       t_precheck_early_return)
+
+    def t_transfer_short_circuit():
+        import inspect as _i
+        src = _i.getsource(transfer_worker)
+        assert "already_added_needs_activate" in src
+        assert 'result["already_added"] = True' in src
+    _t("v35.9.36 transfer_worker short-circuits already-added",
+       t_transfer_short_circuit)
+
+    def t_activate_only_helper():
+        assert "_run_install_activate_only" in globals()
+        assert "_run_install_commit_only" in globals()
+        import inspect as _i
+        src = _i.getsource(_run_install_activate_only)
+        assert "install activate" in src
+        assert "install add file" not in src
+    _t("v35.9.37 activate-only helper", t_activate_only_helper)
+
+    def t_commit_only_helper():
+        import inspect as _i
+        src = _i.getsource(_run_install_commit_only)
+        assert "_finalize_install_commit" in src
+    _t("v35.9.37 commit-only helper", t_commit_only_helper)
+
+    def t_install_worker_alreadyadded_cmd():
+        import inspect as _i
+        src = _i.getsource(install_worker)
+        assert "_run_install_activate_only" in src
+        assert "_run_install_commit_only" in src
+    _t("v35.9.37 install_worker uses activate+commit path",
+       t_install_worker_alreadyadded_cmd)
+
+    def t_no_abort_after_add():
+        import inspect as _i
+        src = _i.getsource(install_worker)
+        assert "allow_abort=False" in src
+    _t("v35.9.37 no install abort after add", t_no_abort_after_add)
+
+    def t_runver_match_normalized():
+        import inspect as _i
+        src = _i.getsource(_purge_standby_members)
+        assert "fver_key == running_key" in src
+        assert "_VER3_NORM_RE" in src
+    _t("v35.9.37 standby running-version match normalised",
+       t_runver_match_normalized)
+
+    def t_standby_junk_purge():
+        import inspect as _i
+        src = _i.getsource(_purge_standby_members)
+        assert ".USWAP" in src
+        assert "tech_support" in src
+    _t("v35.9.37 standby junk dir purge", t_standby_junk_purge)
+
+    def t_runinstall_detects_already_added():
+        import inspect as _i
+        src = _i.getsource(run_install)
+        assert "_ALREADY_ADDED_MARKERS" in src
+        assert "already_added_refused" in src
+        assert "super package already added" in _ALREADY_ADDED_MARKERS
+    _t("v35.9.37 run_install detects super-package-already-added",
+       t_runinstall_detects_already_added)
+
+    def t_conf_keep():
+        import inspect as _i
+        src = _i.getsource(_purge_unnecessary_files)
+        assert "FIX-CONF-KEEP" in src or "keep (target .conf)" in src
+        assert "keep (target .conf)" in src
+    _t("v35.9.38 keeps target .conf during purge", t_conf_keep)
+
+    def t_precommit_helper():
+        assert "_state_needs_precommit" in globals()
+        assert "_run_install_commit_for_precommit" in globals()
+    _t("v35.9.38 pre-commit helpers exist", t_precommit_helper)
+
+    def t_activate_handles_cannot_activate():
+        import inspect as _i
+        src = _i.getsource(_run_install_activate_only)
+        assert "cannot activate; please first perform" in src
+        assert "_state_needs_precommit" in src
+    _t("v35.9.38 activate handles cannot-activate",
+       t_activate_handles_cannot_activate)
+
+    def t_activate_detects_partial():
+        import inspect as _i
+        src = _i.getsource(_run_install_activate_only)
+        assert "partial activation" in src
+        assert "per_member_fail" in src
+    _t("v35.9.38 activate detects partial failure",
+       t_activate_detects_partial)
+
+    def t_pwfile_unique():
+        a = _pwfile_for_thread()
+        b = _pwfile_for_thread()
+        assert a != b
+        assert _PWFILE_COUNTER >= 2
+    _t("v35.9.38 pwfile paths are unique", t_pwfile_unique)
+
+    def t_pscp_retry_window_widened():
+        import inspect as _i
+        src = _i.getsource(transfer_via_pscp)
+        assert "elapsed < 60" in src
+        assert "elapsed < 5" not in src
+    _t("v35.9.38 pscp retry window widened",
+       t_pscp_retry_window_widened)
+
+    def t_finalize_no_infinite_activate():
+        import inspect as _i
+        src = _i.getsource(_finalize_install_commit)
+        assert "st_attempts" in src
+        assert "reissued_activate" in src
+    _t("v35.9.38 finalize refuses to loop on target=I",
+       t_finalize_no_infinite_activate)
+
+    def t_stack_verify_platform_safe():
+        import inspect as _i
+        src = _i.getsource(_per_member_version)
+        assert "per_member_syntax_ok" in src
+        assert "show version | include Version" in src
+        src2 = _i.getsource(check_stack_versions)
+        assert "unverified" in src2 or " X" in src2
+    _t("v35.9.38 stack-verify is platform-safe",
+       t_stack_verify_platform_safe)
+
+    def t_precheck_passes_target_ver_to_purge():
+        import inspect as _i
+        src = _i.getsource(precheck_device)
+        assert "target_ver=target_ver" in src
+    _t("v35.9.38 precheck passes target_ver to purge",
+       t_precheck_passes_target_ver_to_purge)
+
+    def t_runinstall_nudge_returns_on_dead_transport():
+        import inspect as _i
+        src = _i.getsource(run_install)
+        assert "tr.is_active()" in src
+        assert "dead = True" in src
+        assert "activate nudged, transport" in src or \
+               "reload in progress" in src
+    _t("v35.9.38 run_install returns on dead transport",
+       t_runinstall_nudge_returns_on_dead_transport)
+
+    def t_runinstall_precommits_on_u_state():
+        import inspect as _i
+        src = _i.getsource(run_install)
+        assert "_state_needs_precommit" in src
+        assert "_run_install_commit_for_precommit" in src
+    _t("v35.9.38 run_install pre-commits U state",
+       t_runinstall_precommits_on_u_state)
+
+    def t_md5_nonfatal():
+        import inspect as _i
+        src = _i.getsource(install_worker)
+        assert "send_command_timing" in src
+        assert "MD5 not confirmed" in src
+        assert "non-fatal" in src
+    _t("v35.9.38 MD5 verify is non-fatal", t_md5_nonfatal)
+
+    def t_retry_install_failures():
+        import inspect as _i
+        src = _i.getsource(is_retryable)
+        assert "recoverable" in src
+    _t("v35.9.38 install failures are retryable when recoverable",
+       t_retry_install_failures)
+
+    def t_revert_verify_default():
+        import inspect as _i
+        src = _i.getsource(verify_revert_clean)
+        assert "hmac-sha1" in src
+        assert "aes128-ctr" in src
+        assert "ip ssh server algorithm mac" in src
+    _t("v35.9.38 revert-verify ignores defaults",
+       t_revert_verify_default)
+
+    def t_low_unbound_fixed():
+        import inspect as _i
+        src = _i.getsource(_run_install_activate_only)
+        assert "FIX-LOW-UNBOUND" in src or 'low = ""' in src
+        assert 'low = ""' in src
+    _t("v35.9.39 _run_install_activate_only binds `low`",
+       t_low_unbound_fixed)
+
+    def t_already_added_ordered():
+        import inspect as _i
+        src = _i.getsource(run_install)
+        p_already = src.find("_ALREADY_ADDED_MARKERS")
+        p_failed  = src.find('re.search(r"failed:\\s*install", low)')
+        assert p_already != -1, "_ALREADY_ADDED_MARKERS not found in run_install"
+        assert p_failed  != -1, 'failed:install check not found in run_install'
+        assert p_already < p_failed, (
+            "_ALREADY_ADDED_MARKERS at offset %d must appear before "
+            "failed:install at offset %d" % (p_already, p_failed))
+    _t("v35.9.39 already-added is checked before failed:install",
+       t_already_added_ordered)
+
+    def t_already_added_markers():
+        assert "_ALREADY_ADDED_MARKERS" in globals()
+        assert "super package already added" in _ALREADY_ADDED_MARKERS
+        assert "add operation not allowed" in _ALREADY_ADDED_MARKERS
+    _t("v35.9.39 _ALREADY_ADDED_MARKERS present",
+       t_already_added_markers)
+
+    def t_already_added_3tuple():
+        import inspect as _i
+        src = _i.getsource(run_install)
+        idx = src.find("_ALREADY_ADDED_MARKERS")
+        assert idx != -1
+        tail = src[idx:idx + 600]
+        assert 'already_added_refused' in tail
+        ret_start = tail.find('"add because .pkg set is already on flash"')
+        assert ret_start != -1
+        ret_end = tail.find("\n", ret_start)
+        ret_line = tail[ret_start:ret_end]
+        assert ", conn" in ret_line, \
+            "already_added_refused return must carry conn: %r" % ret_line
+    _t("v35.9.39 already-added return carries conn",
+       t_already_added_3tuple)
+
+    def t_read_active_pkg_version_match():
+        wanted = {_norm_ver("17.12.04")}
+        assert wanted == {"17.12.4"}
+        for fn in ("cat9k_lite-rpbase.17.12.04.SPA.pkg",
+                   "cat9k_lite-webui.17.12.04.SPA.pkg",
+                   "cat9k_lite-rpboot.17.12.04.SPA.pkg",
+                   "cat9k_lite-srdriver.17.12.04.SPA.pkg"):
+            fm = _VER3_NORM_RE.search(fn)
+            assert fm is not None
+            assert _norm_ver(fm.group(0)) in wanted, fn
+        for fn in ("cat9k_lite-rpbase.17.06.03.SPA.pkg",
+                   "cat9k_lite-webui.17.06.03.SPA.pkg",
+                   "cat9k_lite-rpboot.17.09.04a.SPA.pkg"):
+            fm = _VER3_NORM_RE.search(fn)
+            assert fm is not None
+            assert _norm_ver(fm.group(0)) not in wanted, fn
+    _t("v35.9.41 active-pkg version match (17.12.4 vs 17.12.04)",
+       t_read_active_pkg_version_match)
+
+    def t_read_active_pkg_uses_running():
+        import inspect as _i
+        src = _i.getsource(_read_active_packages)
+        assert "FIX-ACTIVE-PKG-RUNNING" in src
+        assert "_get_running_version_string" in src
+        assert "_VER3_NORM_RE" in src
+    _t("v35.9.41 active-pkg fallback consults running version",
+       t_read_active_pkg_uses_running)
+
+    def t_wait_install_op_idle_exists():
+        assert "_wait_install_op_idle" in globals()
+        import inspect as _i
+        src = _i.getsource(_wait_install_op_idle)
+        assert "FIX-WAIT-OP-IDLE" in src
+        assert "show install summary" in src
+    _t("v35.9.42 _wait_install_op_idle helper present",
+       t_wait_install_op_idle_exists)
+
+    def t_activate_fastpath_check():
+        import inspect as _i
+        src = _i.getsource(_run_install_activate_only)
+        assert "FIX-FASTPATH-ALREADY-ON-TARGET" in src
+        assert "already on target -- skipping activate" in src
+        assert "_wait_install_op_idle" in src
+    _t("v35.9.42 activate has fast-path + busy-wait",
+       t_activate_fastpath_check)
+
+    def t_commit_busy_wait():
+        import inspect as _i
+        src = _i.getsource(_finalize_install_commit)
+        assert "FIX-COMMIT-BUSY-WAIT" in src
+        assert "commit: install engine busy" in src
+    _t("v35.9.42 commit backs off when engine busy",
+       t_commit_busy_wait)
+
+    def t_pscp_stall_detection():
+        import inspect as _i
+        src = _i.getsource(_pscp_run_once)
+        assert "FIX-PSCP-STALL" in src
+        assert "SCP_STALL_TIMEOUT" in src
+        assert "proc.kill()" in src
+        assert "chunks.get(timeout=1.0)" in src or "queue.Empty" in src
+    _t("v35.9.43 pscp kills stalled transfers", t_pscp_stall_detection)
+
+    def t_version_string_v43():
+        assert VERSION_STRING == "35.9.43", \
+            "VERSION_STRING should be 35.9.43, got %s" % VERSION_STRING
+    _t("VERSION_STRING is 35.9.43", t_version_string_v43)
+
+    def t_activate_settle():
+        import inspect as _i
+        src = _i.getsource(_run_install_activate_only)
+        assert "FIX-ACT-SETTLE" in src
+        assert "time.sleep(30)" in src
+    _t("v35.9.43 activate waits for engine to settle",
+       t_activate_settle)
+
+    total = len(passed) + len(failed)
+    print("\n" + "=" * 70)
+    print("  VALIDATION -- %d check(s)" % total)
+    print("=" * 70)
+    for name in passed: print("  OK %s" % name)
+    if failed:
+        print()
+        for name, err in failed: print("  FAIL %s: %s" % (name, err))
+    print("-" * 70)
+    print("  Passed: %d/%d" % (len(passed), total))
+    print("  Failed: %d/%d" % (len(failed), total))
+    print("=" * 70 + "\n")
+    return 0 if not failed else 1
+
+
+def main():
+    global DRY_RUN, SKIP_ISSU, PAUSE_BETWEEN_LOCATIONS, AUTO_ROLLBACK_ON_FAIL
+    global LOCATIONS_TO_RUN, ENABLE_PASSWORD, ENABLE_USER, REVERT_VERIFY_AFTER
+    global LIVE_LOG_FEED_TRANSFER, SERIAL_TRANSFER_LARGE_MODELS
+    global SKIP_CONFIG_DRIFT_CHECK, ALLOW_BUNDLE_MODE_CONVERSION
+    global POOL_LOCATIONS, VERIFY_TRANSFER_HASH, RECONCILE_FAILED_AT_END
+    global LARGE_MODEL_PARALLEL, PARAMIKO_PRIMARY, LARGE_MODEL_SEMAPHORE
+    global BULK_MODE_WINDOW_SIZE, USE_COLOUR, QUIET_SKIPPED
+    global FAMILY_SIZE_BOUNDS_STRICT, ALLOW_ACTIVE_PKG_PURGE
+    args = parse_args()
+
+    if args.validate:
+        return _validate()
+
+    if args.config: apply_config_file(args.config)
+    if args.base_dir: update_paths(args.base_dir)
+    for d in (LOG_DIR, STATE_DIR, REPORT_DIR, BACKUP_DIR, CHECKPOINT_DIR):
+        try: os.makedirs(d, exist_ok=True)
+        except OSError: pass
+    if args.write_manifest:
+        _cleanup_orphan_pwfiles(); _write_manifest(); return 0
+
+    lock_handle = _acquire_instance_lock()
+    if lock_handle is None: return 3
+    _cleanup_orphan_pwfiles()
+    _check_local_disk_space()
+    rotate_backups()
+    rotate_log_archive()
+
+    if args.dry_run:          DRY_RUN = True
+    if args.skip_issu:        SKIP_ISSU = True
+    if args.auto_rollback:    AUTO_ROLLBACK_ON_FAIL = True
+    if args.no_pause:         PAUSE_BETWEEN_LOCATIONS = False
+    if args.locations:        LOCATIONS_TO_RUN = args.locations
+    if args.no_verify_revert: REVERT_VERIFY_AFTER = False
+    if args.show_live_transfer: LIVE_LOG_FEED_TRANSFER = True
+    if args.no_serial_large:  SERIAL_TRANSFER_LARGE_MODELS = False
+    if args.no_drift_check:   SKIP_CONFIG_DRIFT_CHECK = True
+    if args.no_hash_verify:   VERIFY_TRANSFER_HASH = False
+    if args.no_reconcile:     RECONCILE_FAILED_AT_END = False
+    if args.no_bundle_mode:   ALLOW_BUNDLE_MODE_CONVERSION = False
+    if args.allow_bundle_mode: ALLOW_BUNDLE_MODE_CONVERSION = True
+    if args.no_pool_locations: POOL_LOCATIONS = False
+    if args.pool_locations:   POOL_LOCATIONS = True
+    if args.allow_lenient_firmware:
+        FAMILY_SIZE_BOUNDS_STRICT = False
+        print("  ! --allow-lenient-firmware: strict family size check "
+              "disabled (absolute 2 GB cap still applies)")
+    if args.allow_active_pkg_purge:
+        ALLOW_ACTIVE_PKG_PURGE = True
+        print("  ! --allow-active-pkg-purge: active .pkg deletion enabled. "
+              "If install fails after this point, MANUAL CONSOLE RECOVERY "
+              "will be required.")
+    if args.parallel_large is not None:
+        LARGE_MODEL_PARALLEL = max(1, args.parallel_large)
+        LARGE_MODEL_SEMAPHORE = threading.Semaphore(LARGE_MODEL_PARALLEL)
+    if args.paramiko_primary: PARAMIKO_PRIMARY = True
+    if args.bulk_window is not None:
+        if args.bulk_window < 131072:
+            print("  --bulk-window %d < 131072 -- ignored"
+                  % args.bulk_window)
         else:
-            failures.append(name)
-            if verbose:
-                _safe_print("  \u2717 %s%s" % (name, (" -- " + detail) if detail else ""))
-    if verbose:
-        _safe_print("Passed: %d/%d" % (passed, len(tests)))
-        if failures:
-            _safe_print("failed: %s" % ", ".join(failures))
-    return 0 if passed == len(tests) else 1
+            BULK_MODE_WINDOW_SIZE = args.bulk_window
+    if args.quiet_skipped: QUIET_SKIPPED = True
+    if args.no_colour: USE_COLOUR = False
+
+    if os.name == "nt" and not args.no_colour:
+        try:
+            import ctypes
+            _k = ctypes.windll.kernel32
+            _h = _k.GetStdHandle(-11)
+            _m = ctypes.c_ulong()
+            if _k.GetConsoleMode(_h, ctypes.byref(_m)):
+                _k.SetConsoleMode(_h, _m.value | 0x0004)
+        except Exception: pass
+
+    if args.resume:
+        print("  --resume deprecated; use --force-run-with-stale-state.")
+        args.ignore_stale_state = True
+    if args.force_run_with_stale_state:
+        args.ignore_stale_state = True
+    if args.enable_pass:
+        print("  --enable-pass visible in process list; prefer "
+              "$CISCO_ENABLE.")
+    ENABLE_PASSWORD = (args.enable_pass or os.environ.get("CISCO_ENABLE")
+                       or None)
+    ENABLE_USER = (args.enable_user
+                   or os.environ.get("CISCO_ENABLE_USER") or None)
+    if ENABLE_PASSWORD is None and not args.dry_run_revert:
+        print("  (enable password not set -- falling back to SSH password)")
+
+    signal.signal(signal.SIGINT, _on_signal)
+    try: signal.signal(signal.SIGTERM, _on_signal)
+    except (ValueError, OSError, AttributeError): pass
+    if hasattr(signal, "SIGBREAK"):
+        try: signal.signal(signal.SIGBREAK, _on_signal)
+        except (ValueError, OSError): pass
+
+    if args.dry_run_revert: return mode_dry_run_revert()
+    if args.recover:        return mode_recover(args)
+    if args.revert_only:    return mode_recover(
+        args, locations_filter=LOCATIONS_TO_RUN)
+
+    rotate_logs()
+    print_ssh_banner()
+
+    stale = list_state_files()
+    if stale and not (args.ignore_stale_state
+                      or args.force_run_with_stale_state or args.resume):
+        if args.interactive_resume:
+            choice = prompt_resume_or_abort(stale)
+            if choice == "abort":
+                print("  Aborted (state kept)."); return 2
+            args.ignore_stale_state = True
+            if choice == "resume": args.resume_checkpoint = True
+            if choice == "skip":   args.retry_failed = True
+        else:
+            print("\n  Un-reverted temp-config state from earlier run:")
+            for s in stale: print("     - %s" % s)
+            print("  Use --dry-run-revert to inspect, --recover to fix, "
+                  "--interactive-resume to prompt, or "
+                  "--force-run-with-stale-state to proceed.\n")
+            return 2
+
+    for _, fw, _ in MODEL_FIRMWARE_MAP:
+        p = os.path.join(FIRMWARE_DIR, fw)
+        if os.path.isfile(p):
+            FIRMWARE_SIZES[fw] = os.path.getsize(p)
+
+    print("\n  -- Firmware inventory --")
+    for fw_name in sorted(set(fw for _, fw, _ in MODEL_FIRMWARE_MAP)):
+        p = os.path.join(FIRMWARE_DIR, fw_name)
+        if os.path.isfile(p):
+            print("    %-45s %s" % (fw_name, _fmt_bytes(os.path.getsize(p))))
+        else:
+            print("    %-45s MISSING" % fw_name)
+    map_errors, map_warnings = verify_firmware_map()
+    if map_errors:
+        print("\n  FIRMWARE pre-flight FAILED (hard stop):")
+        for e in map_errors: print("     - %s" % e)
+        print("\n  Fix the firmware files and re-run.  If you are certain")
+        print("  the sizes are correct for your platform, override with")
+        print("  --allow-lenient-firmware (NOT recommended).\n")
+        return 1
+    if map_warnings:
+        print("\n  MODEL_FIRMWARE_MAP warnings:")
+        for w in map_warnings: print("     - %s" % w)
+    print("  Firmware pre-flight passed")
+
+    loc_devices = {}
+    if args.hosts:
+        hostmap = build_host_ip_map()
+        all_known = sorted(hostmap.keys())
+        wanted = {h.strip() for h in args.hosts}
+        devices = [{"hostname": h, "ip": hostmap[h]}
+                   for h in wanted if h in hostmap]
+        for h in [x for x in wanted if x not in hostmap]:
+            print("  Host not found: %s" % h)
+            suggestions = suggest_similar_hosts(h, all_known)
+            if suggestions:
+                print("     Did you mean: %s" % ", ".join(suggestions[:3]))
+        if devices: loc_devices["ad-hoc"] = devices
+    else:
+        seen = set()
+        for loc in LOCATIONS_TO_RUN:
+            p = os.path.join(LOCATIONS_DIR, "%s.txt" % loc)
+            if not os.path.isfile(p):
+                print("  Missing: %s -- skipping" % p); continue
+            loc_devices[loc] = load_location(p, reference_hosts=seen)
+            seen.update(d["hostname"] for d in loc_devices[loc])
+
+    dups = detect_duplicate_hostnames(loc_devices)
+    if dups:
+        print("\n  Duplicate hostnames/IPs:")
+        for h, a, b in dups: print("     - %s: %s and %s" % (h, a, b))
+    for loc in list(loc_devices):
+        loc_devices[loc] = filter_devices(loc_devices[loc], args)
+
+    all_devices = [d for ds in loc_devices.values() for d in ds]
+    if not all_devices:
+        print("  No devices to process."); return 1
+
+    user, pw = get_credentials(args)
+
+    if args.inventory:
+        return mode_inventory(all_devices, user, pw)
+    if args.check:
+        return mode_check(all_devices, user, pw)
+    if args.verify_mapping:
+        return mode_verify_mapping(all_devices, user, pw)
+    if args.rollback_dry_run:
+        return mode_rollback(all_devices, user, pw, args, dry=True)
+    if args.rollback:
+        return mode_rollback(all_devices, user, pw, args)
+    if args.estimate_only:
+        return estimate_runtime(all_devices, user, pw)
+
+    if args.only_upgrade_needed:
+        print("\n  -- Filtering to devices that need upgrade --")
+        need, tgt, unr = filter_only_upgrade_needed(all_devices, user, pw)
+        print("    %d need upgrade, %d already on target, %d unreachable"
+              % (len(need), len(tgt), len(unr)))
+        if not need:
+            print("  Nothing to do -- every reachable device is on target.")
+            return 0
+        all_devices = [d for d, _ in need]
+        keep = {d["hostname"] for d in all_devices}
+        loc_devices = {loc: [d for d in devs if d["hostname"] in keep]
+                       for loc, devs in loc_devices.items()}
+        loc_devices = {loc: ds for loc, ds in loc_devices.items() if ds}
+        if not loc_devices:
+            print("  No locations left after filtering."); return 0
+
+    if args.preview or args.preview_only or not args.yes:
+        print_change_preview(all_devices, user, pw)
+        if args.preview_only:
+            print("  Preview-only mode -- exiting."); return 0
+
+    if args.precache_hostkeys:
+        precache_host_keys(all_devices, user, pw)
+    errors, _ = preflight_validation(all_devices, user, pw)
+    if errors:
+        print("  Pre-flight failed -- aborting."); return 1
+    if args.preflight_only:
+        print("  Pre-flight-only mode -- exiting."); return 0
+
+    if not confirm("  Proceed with %supgrade of %d device(s)?"
+                   % ("DRY-RUN of " if DRY_RUN else "",
+                      len(all_devices)), args.yes):
+        print("  Cancelled."); return 1
+
+    all_results, all_revert = {}, {}
+    start_monitor_thread()
+    try:
+        if POOL_LOCATIONS and len(loc_devices) > 1:
+            print("\n  -- POOLED MODE (per-location abort gates) --")
+            master_log("POOLED START: %d locations" % len(loc_devices))
+            all_results, all_revert = _run_pooled(
+                loc_devices, user, pw,
+                resume_checkpoint=args.resume_checkpoint,
+                retry_failed=args.retry_failed)
+        else:
+            locs = list(loc_devices)
+            for i, loc in enumerate(locs):
+                if SHUTDOWN_REQ.is_set(): break
+                p = os.path.join(LOCATIONS_DIR, "%s.txt" % loc)
+                if os.path.isfile(p):
+                    fresh = load_location(p)
+                    if fresh:
+                        loc_devices[loc] = filter_devices(fresh, args)
+                results, aborted, rv = run_location(
+                    loc, loc_devices[loc], user, pw,
+                    resume_checkpoint=args.resume_checkpoint,
+                    retry_failed=args.retry_failed)
+                all_results[loc] = results
+                all_revert[loc] = rv
+                if aborted: break
+                if (PAUSE_BETWEEN_LOCATIONS and i < len(locs) - 1
+                        and not SHUTDOWN_REQ.is_set()):
+                    if not confirm("\n  %s finished. Continue to %s?"
+                                   % (loc, locs[i+1])):
+                        print("  Stopping at operator request."); break
+    finally:
+        stop_monitor_thread()
+        try:
+            all_results, all_revert = _reconcile_failed_devices(
+                all_results, all_revert, user, pw)
+        except Exception as e:
+            master_log("Reconcile pass raised: %s" % e)
+            print("\n  Reconcile pass raised: %s\n" % e)
+        try:
+            write_run_summary(
+                all_results, all_revert, RUN_ID,
+                os.path.join(REPORT_DIR, "run_summary_%s.json" % RUN_ID))
+        except Exception as e:
+            master_log("run_summary raised: %s" % e)
+        if not args.no_html_report:
+            try:
+                write_html_report(
+                    all_results,
+                    os.path.join(REPORT_DIR, "run_%s.html" % RUN_ID))
+            except Exception as e:
+                master_log("HTML raised: %s" % e)
+        if not args.no_health_snapshot and not DRY_RUN:
+            try:
+                post_run_health_snapshot(
+                    all_results, user, pw,
+                    os.path.join(REPORT_DIR, "health_%s.json" % RUN_ID))
+            except Exception as e:
+                master_log("Health raised: %s" % e)
+        failed = print_summary(all_results, all_revert)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
+    sys.exit(main())
+
+def _run_install_commit_only(conn, host, st, ip, user, pw, target_ver):
+    wlog(host, "COMMIT (already-added path)", "STEP")
+    set_state(host, "INSTALL", "commit")
+    if st.get("reboot_detected") or conn is None:
+        wlog(host, "Waiting for reboot to settle before commit", "INFO")
+        if not wait_for_ping_down(ip, host,
+                                  timeout_sec=PING_DOWN_TIMEOUT_SEC):
+            wlog(host, "Device did not go down -- checking anyway", "WARN")
+        if not wait_for_ping_up(ip, host,
+                                timeout_sec=PING_UP_TIMEOUT_SEC):
+            return False, "device did not return after activate", None
+        if not wait_for_ping_stable(ip, host):
+            return False, "boot loop detected", None
+        if not wait_for_ssh_ready(ip, host):
+            return False, "SSH did not return after activate", None
+        time.sleep(POST_REBOOT_SETTLE_SEC)
+        conn = robust_reconnect(ip, user, pw, host,
+                                max_attempts=POST_REBOOT_MAX_ATTEMPTS,
+                                delay=POST_REBOOT_DELAY_SEC,
+                                purpose="post-activate commit")
+        if not conn:
+            return False, "could not reconnect for commit", None
+    if _finalize_install_commit(conn, host, target_ver, fw_file=""):
+        return True, "", conn
+    return False, "commit could not be verified", conn
+
+
+def precheck_device(conn, host, fw_file, target_ver):
+    wlog(host, "--- PRE-CHECK ---", "STEP")
+    members_count = 1
     try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        SHUTDOWN_REQ.set()
-        _cleanup()
-        sys.exit(130)
+        sw = conn.send_command("show switch", read_timeout=60)
+        rows = _SWITCH_ROW_RE.findall(sw)
+        members_count = len(rows) if rows else 1
     except Exception:
-        _safe_print("FATAL: %s" % traceback.format_exc())
-        _cleanup()
-        sys.exit(3)
+        members_count = 1
+
+    set_state(host, "PRE-CHECK", "clock")
+    _ok, _drift, _tz = _ensure_device_clock_correct_cached(
+        conn, host, max_drift_sec=CLOCK_DRIFT_FIX_SEC)
+    clock_fixed = bool(_ok and _drift is not None
+                       and _drift > CLOCK_DRIFT_FIX_SEC)
+
+    set_state(host, "PRE-CHECK", "model")
+    model = get_model(conn)
+    if model: wlog(host, "  Model: %s" % model, "INFO")
+
+    ok_fam, reason = verify_model_firmware_consistency(
+        model, fw_file, target_ver)
+    if not ok_fam:
+        wlog(host, "  Firmware/model mismatch: %s" % reason, "ERROR")
+        if STRICT_FAMILY_CHECK:
+            return (False, "firmware mismatch: %s" % reason, "unknown",
+                    clock_fixed)
+        else:
+            wlog(host, "  Continuing in lenient mode", "WARN")
+
+    set_state(host, "PRE-CHECK", "readiness")
+    ready_ok, ready_reason = verify_boot_and_install_ready(
+        conn, host, fw_file, self_heal=True)
+    if not ready_ok:
+        wlog(host, "  readiness gate: %s" % ready_reason, "ERROR")
+        return (False, ready_reason, "unknown", clock_fixed)
+
+    set_state(host, "PRE-CHECK", "version")
+    ver_out = conn.send_command("show version | include Version")
+    m = re.search(r"Version ([\w.()]+)", ver_out)
+    current_ver = m.group(1) if m else "unknown"
+    wlog(host, "  Version: %s  ->  target %s" % (current_ver, target_ver),
+         "INFO", silent=QUIET_SKIPPED)
+
+    if _norm_ver(current_ver) == _norm_ver(target_ver):
+        needs_finalize = False
+        try:
+            summ = conn.send_command("show install summary",
+                                     read_timeout=60)
+            feed_live_log(host,
+                          "[precheck] show install summary\n%s" % summ)
+            if summary_committed_on_target(summ, target_ver):
+                wlog(host, "  on target and committed", "OK",
+                     silent=QUIET_SKIPPED)
+            else:
+                entries = _parse_install_summary(summ)
+                status = entries.get(_norm_ver(target_ver))
+                other_c = [v for v, s in entries.items()
+                           if s == "C" and v != _norm_ver(target_ver)]
+                if other_c:
+                    wlog(host, "  on target but TWO committed versions "
+                               "present (%s) -- manual remediation required"
+                         % ", ".join(other_c), "ERROR")
+                    return (False,
+                            "two committed versions present: %s + %s"
+                            % (target_ver, ", ".join(other_c)),
+                            current_ver, clock_fixed)
+                wlog(host, "  on target but install summary status=%s "
+                           "-- will run install commit" % (status or "?"),
+                     "WARN")
+                needs_finalize = True
+        except Exception as e:
+            wlog(host, "  summary read failed: %s -- assuming commit "
+                       "needed" % str(e)[:80], "WARN")
+            needs_finalize = True
+
+        residuals = {}
+        try:
+            residuals = _detect_residual_temp_config(conn, host)
+        except Exception as e:
+            wlog(host, "  residual scan failed: %s" % str(e)[:80], "WARN")
+
+        existing_types = {ch["type"] for ch in get_temp_changes(host)}
+        newly_discovered = []
+        for t, d in residuals.items():
+            if t not in existing_types:
+                newly_discovered.append(t)
+            track_temp_change(host, t, d)
+
+        all_residual_types = set(existing_types) | set(residuals.keys())
+        needs_cleanup = bool(all_residual_types)
+
+        if newly_discovered:
+            wlog(host, "  newly discovered residual temp config: %s"
+                 % ", ".join(sorted(newly_discovered)), "WARN")
+        if needs_cleanup:
+            wlog(host, "  temp config to revert: %s"
+                 % ", ".join(sorted(all_residual_types)), "INFO")
+
+        if not needs_finalize and not needs_cleanup:
+            wlog(host, "  on target, committed, and clean", "OK")
+            return (True, "already_on_target", current_ver, clock_fixed)
+        if needs_finalize and not needs_cleanup:
+            wlog(host, "  fixup: finalize only", "INFO")
+            return (True, "already_on_target_needs_finalize", current_ver,
+                    clock_fixed)
+        if not needs_finalize and needs_cleanup:
+            wlog(host, "  fixup: cleanup only", "INFO")
+            return (True, "already_on_target_needs_cleanup", current_ver,
+                    clock_fixed)
+        wlog(host, "  fixup: finalize + cleanup", "INFO")
+        return (True, "already_on_target_needs_finalize_and_cleanup",
+                current_ver, clock_fixed)
+
+    already_added, added_reason = _is_target_pkg_set_present(
+        conn, host, target_ver)
+    if already_added:
+        wlog(host, "  %s" % added_reason, "OK")
+        wlog(host, "  skipping space gate and transfer; proceeding to "
+                   "activate/commit", "OK")
+        return (True, "already_added_needs_activate",
+                current_ver, clock_fixed)
+
+    boot = conn.send_command("show boot | include BOOT", read_timeout=60)
+    feed_live_log(host, "[precheck] show boot\n%s" % boot)
+    if "packages.conf" not in boot:
+        if ALLOW_BUNDLE_MODE_CONVERSION:
+            wlog(host, "  Bundle mode -- install will convert", "WARN")
+            master_log("%s: BUNDLE MODE -- will convert via install add" % host)
+        else:
+            wlog(host, "  Not INSTALL mode", "ERROR")
+            return (False, "not_install_mode", current_ver, clock_fixed)
+
+    fw_size = get_firmware_size(fw_file)
+    if not fw_size:
+        fw_size = MIN_FREE_BYTES
+
+    bin_present = False
+    try:
+        out = conn.send_command(
+            "dir flash: | include %s" % re.escape(fw_file),
+            read_timeout=TRANSFER_VERIFY_TIMEOUT)
+        if fw_file in out:
+            remote_size = _parse_file_size_from_dir(out, fw_file)
+            if remote_size and remote_size == fw_size:
+                bin_present = True
+                wlog(host, "  target .bin already on flash (correct "
+                           "size)", "OK")
+            elif remote_size:
+                wlog(host, "  target .bin on flash but wrong size "
+                           "(%d vs %d) -- will be re-transferred"
+                     % (remote_size, fw_size), "WARN")
+    except Exception:
+        pass
+
+    extraction = int(fw_size * EXTRACTION_OVERHEAD_FACTOR)
+    required_active = (extraction + EXTRA_HEADROOM_BYTES) if bin_present \
+                      else (fw_size + extraction + EXTRA_HEADROOM_BYTES)
+    wlog(host, "  Space plan: fw_size=%s extraction=%s headroom=%s "
+               "bin_on_flash=%s"
+         % (_fmt_bytes(fw_size), _fmt_bytes(extraction),
+            _fmt_bytes(STACK_MEMBER_HEADROOM),
+            "yes" if bin_present else "no"), "INFO")
+
+    if not DRY_RUN:
+        try:
+            in_install = _is_install_mode(conn)
+            if in_install:
+                wlog(host, "  Purging stale .bin / .conf / junk "
+                           "(running .bin is deletable in install mode)",
+                     "INFO")
+                _purge_unnecessary_files(conn, host, fw_file, aggressive=False,
+                                         target_ver=target_ver)
+                if members_count > 1:
+                    _purge_standby_members(conn, host, fw_file, members_count)
+                time.sleep(2)
+                try:
+                    out2 = conn.send_command(
+                        "dir flash: | include %s" % re.escape(fw_file),
+                        read_timeout=60)
+                    if fw_file in out2:
+                        bin_present = True
+                except Exception:
+                    pass
+        except Exception as e:
+            wlog(host, "  purge failed (non-fatal): %s" % str(e)[:80],
+                 "WARN")
+
+    try:
+        per_member_bytes = _get_all_member_free_bytes(conn, host)
+        skip_per_member_gate = False
+        if per_member_bytes is None:
+            wlog(host, "  Could not verify all stack member storage -- "
+                       "SKIPPING pre-check space gate "
+                       "(install will validate)", "WARN")
+            skip_per_member_gate = True
+
+        if (not skip_per_member_gate) and per_member_bytes and fw_size:
+            shortfalls = []
+            for idx, mfree in enumerate(per_member_bytes):
+                need_this = _member_required_bytes(
+                    fw_size,
+                    preserve_rollback=PRESERVE_ROLLBACK,
+                    bin_already_present=(bin_present and idx == 0),
+                    is_standby=(idx > 0))
+                role = "active" if idx == 0 else "standby"
+                marker = "OK" if mfree >= need_this else "SHORT"
+                wlog(host, "  member %d (%s): free=%s need=%s %s"
+                     % (idx + 1, role, _fmt_bytes(mfree),
+                        _fmt_bytes(need_this), marker),
+                     "OK" if mfree >= need_this else "WARN")
+                if mfree < need_this:
+                    shortfalls.append((idx + 1, role, mfree, need_this))
+
+            if shortfalls:
+                wlog(host, "  Space short on %d member(s) -- attempting "
+                           "aggressive purge" % len(shortfalls), "WARN")
+                try:
+                    _purge_unnecessary_files(conn, host, fw_file,
+                                             aggressive=True,
+                                             target_ver=target_ver)
+                    if members_count > 1:
+                        _purge_standby_members(conn, host, fw_file,
+                                               members_count)
+                except Exception as e:
+                    wlog(host, "  aggressive purge failed: %s"
+                         % str(e)[:80], "WARN")
+                time.sleep(3)
+                per_member_bytes = _get_all_member_free_bytes(conn, host)
+                if per_member_bytes is None:
+                    skip_per_member_gate = True
+                else:
+                    shortfalls = []
+                    for idx, mfree in enumerate(per_member_bytes):
+                        need_this = _member_required_bytes(
+                            fw_size,
+                            preserve_rollback=PRESERVE_ROLLBACK,
+                            bin_already_present=(bin_present and idx == 0),
+                            is_standby=(idx > 0))
+                        role = "active" if idx == 0 else "standby"
+                        marker = "OK" if mfree >= need_this else "SHORT"
+                        wlog(host,
+                             "  after purge -- member %d (%s): free=%s "
+                             "need=%s %s"
+                             % (idx + 1, role, _fmt_bytes(mfree),
+                                _fmt_bytes(need_this), marker),
+                             "OK" if mfree >= need_this else "WARN")
+                        if mfree < need_this:
+                            shortfalls.append((idx + 1, role, mfree,
+                                               need_this))
+
+            if shortfalls and not skip_per_member_gate:
+                detail = "; ".join(
+                    "m%d(%s) free=%s need=%s"
+                    % (m, role, _fmt_bytes(f), _fmt_bytes(n))
+                    for m, role, f, n in shortfalls)
+                reason = ("insufficient_space_stack: %s "
+                          "fw_size=%s extraction=%s headroom=%s"
+                          % (detail,
+                             _fmt_bytes(fw_size),
+                             _fmt_bytes(extraction),
+                             _fmt_bytes(STACK_MEMBER_HEADROOM)))
+                wlog(host, "  STILL insufficient: %s -- REFUSING"
+                     % reason, "ERROR")
+                return (False, reason, current_ver, clock_fixed)
+            if not shortfalls and not skip_per_member_gate:
+                wlog(host, "  All %d member(s) have sufficient space"
+                     % len(per_member_bytes), "OK")
+        elif not skip_per_member_gate and fw_size:
+            wlog(host, "  Could not determine per-member free", "WARN")
+    except Exception as e:
+        wlog(host, "  Stack free-space check skipped: %s" % str(e)[:80],
+             "WARN")
+
+    if WIPE_BEFORE_TRANSFER and not DRY_RUN:
+        set_state(host, "PRE-CHECK", "wiping")
+        wipe_firmware_flash(conn, host)
+    free_bytes = get_flash_free_bytes(conn)
+    if free_bytes < required_active:
+        reason = ("insufficient_space: free=%s need=%s"
+                  % (_fmt_bytes(free_bytes),
+                     _fmt_bytes(required_active)))
+        wlog(host, "  STILL insufficient on active member: %s -- REFUSING"
+             % reason, "ERROR")
+        return (False, reason, current_ver, clock_fixed)
+    wlog(host, "  Space OK: %.1f MB (active need ~%.0f MB)"
+         % (free_bytes/1e6, required_active/1e6), "OK")
+    return (True, "ready", current_ver, clock_fixed)
+
+
+def _pwfile_for_thread():
+    global _PWFILE_COUNTER
+    with _PWFILE_COUNTER_LK:
+        _PWFILE_COUNTER += 1
+        n = _PWFILE_COUNTER
+    return "%s_%d_%d.tmp" % (_PWFILE_BASE, os.getpid(), n)
+
+
+def _write_pwfile(pw):
+    path = _pwfile_for_thread()
+    with _PWFILE_LOCK:
+        try:
+            with open(path, "w", newline="") as f:
+                f.write(pw + "\n")
+            return path
+        except Exception as e:
+            master_log("Could not write pwfile: %s" % e)
+            return None
+
+
+def _delete_pwfile(path):
+    if not path: return
+    with _PWFILE_LOCK:
+        try:
+            if os.path.exists(path): os.remove(path)
+        except OSError: pass
+
+
+def _verify_firmware_hash(fw_file, host):
+    if not FIRMWARE_RECHECK_BEFORE_TRANSFER: return True
+    expected = FIRMWARE_SHA256.get(fw_file)
+    if not expected: return True
+    p = os.path.join(FIRMWARE_DIR, fw_file)
+    try:
+        actual = _sha256_of_file(p)
+        if actual != expected:
+            wlog(host, "Firmware hash changed! expected %s... got %s..."
+                 % (expected[:16], actual[:16]), "ERROR")
+            return False
+        return True
+    except Exception as e:
+        wlog(host, "Firmware hash re-check failed: %s" % str(e)[:80], "WARN")
+        return True
+
+
+def _pscp_run_once(cmd, host, start, tag_prefix=""):
+    """
+    v35.9.43 FIX-PSCP-STALL: adds a stall detector.  Previously the
+    blocking `proc.stdout.read(4096)` never returned when pscp stopped
+    producing output (hung socket, stalled transfer), freezing the
+    entire transfer pool.  Now a background reader thread pushes raw
+    bytes onto a queue, and the main loop kills the process after
+    SCP_STALL_TIMEOUT seconds without any output, letting the caller's
+    retry path take over.
+    """
+    import queue as _queue
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            bufsize=-1,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    except Exception as e:
+        wlog(host, "pscp spawn failed: %s" % str(e)[:120], "ERROR")
+        return -1, 0.0, False
+
+    pct_re = re.compile(rb"(\d{1,3})%")
+    last_pct = -1
+    last_report = 0.0
+    killed = False
+
+    chunks = _queue.Queue()
+    _SENTINEL = object()
+
+    def _reader():
+        try:
+            while True:
+                buf = proc.stdout.read(4096)
+                if not buf:
+                    break
+                chunks.put(buf)
+        except Exception:
+            pass
+        finally:
+            try: proc.stdout.close()
+            except Exception: pass
+            chunks.put(_SENTINEL)
+
+    rt = threading.Thread(target=_reader, daemon=True, name="pscp-rd")
+    rt.start()
+
+    pending = b""
+    last_data = time.time()
+    try:
+        while True:
+            if SHUTDOWN_REQ.is_set():
+                try: proc.terminate()
+                except Exception: pass
+                killed = True
+                wlog(host, "pscp aborted (shutdown)", "WARN")
+                break
+            try:
+                item = chunks.get(timeout=1.0)
+            except _queue.Empty:
+                if time.time() - last_data > SCP_STALL_TIMEOUT:
+                    wlog(host, "pscp stalled %ds with no output -- killing "
+                               "(will retry)" % SCP_STALL_TIMEOUT, "WARN")
+                    try: proc.kill()
+                    except Exception: pass
+                    killed = True
+                    break
+                continue
+            if item is _SENTINEL:
+                break
+            last_data = time.time()
+            pending += item
+            # pscp writes progress with `\r`, stats with `\n`.
+            while True:
+                i_r = pending.find(b"\r")
+                i_n = pending.find(b"\n")
+                idxs = [i for i in (i_r, i_n) if i >= 0]
+                if not idxs:
+                    break
+                i = min(idxs)
+                line, pending = pending[:i], pending[i+1:]
+                if LIVE_LOG_FEED_TRANSFER:
+                    try: line_str = line.decode("utf-8", "replace")
+                    except Exception: line_str = str(line)
+                    if line_str.strip():
+                        feed_live_log(host, "[%spscp] %s"
+                                      % (tag_prefix, line_str.strip()))
+                m = pct_re.search(line)
+                if m:
+                    try: pct = int(m.group(1))
+                    except Exception: continue
+                    if pct != last_pct and time.time() - last_report > 3:
+                        last_pct = pct
+                        last_report = time.time()
+                        with STATE_LOCK:
+                            if host in PEER_STATES:
+                                PEER_STATES[host]["progress"] = float(pct)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            try: proc.kill()
+            except Exception: pass
+            wlog(host, "pscp hung on exit", "WARN")
+            return -2, time.time() - start, False
+    except Exception as e:
+        wlog(host, "pscp read error: %s" % str(e)[:120], "WARN")
+        try: proc.kill()
+        except Exception: pass
+        return -3, time.time() - start, False
+
+    rc_final = proc.returncode if proc.returncode is not None else -4
+    if rc_final != 0:
+        try:
+            tail = (pending or b"").decode("utf-8", "replace").strip()
+            if tail:
+                wlog(host, "  pscp(%s) output tail: %s"
+                     % (tag_prefix or "main", tail[-500:]), "INFO")
+        except Exception: pass
+    return rc_final, time.time() - start, killed
+
+
+def transfer_via_pscp(ip, user, pw, fw_file, host):
+    if not os.path.isfile(PSCP_EXE):
+        wlog(host, "pscp.exe not found at %s" % PSCP_EXE, "ERROR"); return False
+    local_file = os.path.join(FIRMWARE_DIR, fw_file)
+    if not os.path.isfile(local_file):
+        wlog(host, "pscp: local missing %s" % local_file, "ERROR")
+        return False
+    if not _verify_firmware_hash(fw_file, host): return False
+    pwfile = _write_pwfile(pw)
+    if not pwfile: return False
+    wlog(host, "PSCP push -> %s:%s" % (ip, fw_file), "STEP")
+    set_state(host, "TRANSFER", "PSCP", progress=0)
+    set_cmd(host, "pscp -> flash:%s" % fw_file)
+    dest = "%s@%s:flash:%s" % (user, ip, fw_file)
+    cmd = [PSCP_EXE, "-scp", "-batch", "-pwfile", pwfile,
+           local_file, dest]
+    start = time.time()
+    rc, elapsed, killed = _pscp_run_once(cmd, host, start)
+    try: _delete_pwfile(pwfile)
+    except Exception: pass
+    if killed: return False
+    if rc == 0:
+        fw_size = get_firmware_size(fw_file)
+        mbps = fw_size / max(elapsed, 1) / 1e6 if fw_size else 0
+        wlog(host, "PSCP success -- %.0fs (%.2f MB/s)" % (elapsed, mbps),
+             "OK")
+        return True
+    if rc == 1 and elapsed < 60:
+        wlog(host, "  pscp failed fast -- fetching host key", "WARN")
+        hk = _get_host_key_fingerprint(ip, user, pw)
+        if hk: wlog(host, "  host key: %s  %s..." % (hk[0], hk[1][:32]), "INFO")
+        else: wlog(host, "  no host key fingerprint", "WARN")
+        cmd2 = [PSCP_EXE, "-scp", "-batch", "-pw", pw]
+        if hk: cmd2.extend(["-hostkey", hk[1]])
+        cmd2.extend([local_file, dest])
+        start2 = time.time()
+        rc2, elapsed2, killed2 = _pscp_run_once(cmd2, host, start2,
+                                                tag_prefix="retry-")
+        if killed2: return False
+        if rc2 == 0:
+            fw_size = get_firmware_size(fw_file)
+            mbps = fw_size / max(elapsed2, 1) / 1e6 if fw_size else 0
+            wlog(host, "PSCP (via -pw) -- %.0fs (%.2f MB/s)"
+                 % (elapsed2, mbps), "OK")
+            return True
+        wlog(host, "PSCP retry failed rc=%d" % rc2, "ERROR")
+        return False
+    wlog(host, "PSCP failed rc=%d after %.0fs" % (rc, elapsed), "ERROR")
+    return False
+
+
+def transfer_via_scp(ip, user, pw, fw_file, host):
+    wlog(host, "Paramiko SCP (legacy) -> %s:%s" % (ip, fw_file), "STEP")
+    set_state(host, "TRANSFER", "SCP", progress=0)
+    fw_size = get_firmware_size(fw_file)
+    if DRY_RUN:
+        wlog(host, "DRY-RUN: skipping SCP", "INFO"); return True
+    local_file = os.path.join(FIRMWARE_DIR, fw_file)
+    if not os.path.isfile(local_file):
+        wlog(host, "local firmware missing: %s" % local_file, "ERROR")
+        return False
+    if not _verify_firmware_hash(fw_file, host): return False
+    for attempt in range(1, SCP_MAX_ATTEMPTS + 1):
+        if SHUTDOWN_REQ.is_set(): return False
+        conn = None
+        start_time = time.time()
+        try:
+            conn = do_connect(ip, user, pw)
+            tacacs_enable(conn, host, ssh_pw=pw)
+            if not ensure_scp_server_enabled(conn, host):
+                raise RuntimeError("could not enable SCP server")
+            result = file_transfer(
+                conn, source_file=local_file, dest_file=fw_file,
+                file_system="flash:", direction="put",
+                overwrite_file=True, socket_timeout=SCP_TIMEOUT_SEC)
+            if result.get("file_transferred") or result.get("file_exists"):
+                elapsed = time.time() - start_time
+                mbps = fw_size / max(elapsed, 1) / 1e6 if fw_size else 0
+                wlog(host, "  SCP success -- %.0fs (%.2f MB/s)"
+                     % (elapsed, mbps), "OK")
+                return True
+        except Exception as e:
+            tag = _classify_connect_error(e)
+            if tag:
+                wlog(host, "  SCP %s" % tag, "WARN"); return False
+            wlog(host, "  SCP attempt %d: %s" % (attempt, str(e)[:120]),
+                 "WARN")
+        finally:
+            if conn:
+                try: conn.disconnect()
+                except Exception: pass
+        if attempt < SCP_MAX_ATTEMPTS and not SHUTDOWN_REQ.is_set():
+            wlog(host, "  Retrying in %ds..." % SCP_RETRY_DELAY, "INFO")
+            time.sleep(SCP_RETRY_DELAY)
+    return False
+
+
+def _build_optimized_paramiko_client(ip, user, pw):
+    import paramiko as _p
+    client = _p.SSHClient()
+    client.set_missing_host_key_policy(_p.AutoAddPolicy())
+    client.connect(
+        hostname=ip, username=user, password=pw,
+        look_for_keys=False, allow_agent=False,
+        timeout=PARAMIKO_CONNECT_TIMEOUT,
+        banner_timeout=PARAMIKO_CONNECT_TIMEOUT,
+        auth_timeout=PARAMIKO_CONNECT_TIMEOUT,
+        compress=False)
+    transport = client.get_transport()
+    try:
+        transport.default_window_size = PARAMIKO_WINDOW_BYTES
+        transport.default_max_packet_size = 32768
+    except Exception: pass
+    if PARAMIKO_DISABLE_REKEY:
+        try:
+            pk = transport.packetizer
+            if hasattr(pk, "REKEY_BYTES"): pk.REKEY_BYTES = 1 << 40
+            if hasattr(pk, "REKEY_PACKETS"): pk.REKEY_PACKETS = 1 << 40
+        except Exception: pass
+    return client
+
+
+def transfer_via_paramiko_tuned(ip, user, pw, fw_file, host):
+    if not USE_PARAMIKO_TUNED:
+        return transfer_via_scp(ip, user, pw, fw_file, host)
+    local_file = os.path.join(FIRMWARE_DIR, fw_file)
+    if not os.path.isfile(local_file):
+        wlog(host, "local firmware missing: %s" % local_file, "ERROR")
+        return False
+    if not _verify_firmware_hash(fw_file, host): return False
+    fw_size = get_firmware_size(fw_file) or os.path.getsize(local_file)
+    wlog(host, "Paramiko tuned SCP -> %s:%s (chunk=%dKB, window=%dMB)"
+         % (ip, fw_file, PARAMIKO_CHANNEL_CHUNK//1024,
+            PARAMIKO_WINDOW_BYTES//(1024*1024)), "STEP")
+    set_state(host, "TRANSFER", "SCP-tuned", progress=0)
+    client = None
+    try:
+        client = _build_optimized_paramiko_client(ip, user, pw)
+        transport = client.get_transport()
+        try:
+            probe_chan = transport.open_session()
+            probe_chan.settimeout(PARAMIKO_READ_TIMEOUT)
+            probe_chan.exec_command(
+                "show running-config | include ip scp server")
+            probe_chan.recv(4096); probe_chan.close()
+        except Exception: pass
+        channel = transport.open_session()
+        channel.settimeout(PARAMIKO_READ_TIMEOUT)
+        channel.exec_command("scp -t flash:%s" % fw_file)
+        try: ack = channel.recv(1)
+        except Exception as e:
+            wlog(host, "SCP target ack failed: %s: %s"
+                 % (type(e).__name__, str(e)[:80] or "(no message)"), "ERROR")
+            return False
+        if not ack or ack[0] != 0:
+            try: err = channel.recv(256) or b""
+            except Exception: err = b""
+            wlog(host, "SCP target-mode rejected: %s"
+                 % err.decode('utf-8', 'replace')[:120], "ERROR")
+            return False
+        import stat as _stat
+        mode = _stat.S_IRUSR | _stat.S_IWUSR | _stat.S_IRGRP | _stat.S_IROTH
+        header = "C%04o %d %s\n" % (mode, fw_size,
+                                    os.path.basename(fw_file))
+        channel.sendall(header.encode())
+        try: ack = channel.recv(1)
+        except Exception: ack = b""
+        if not ack or ack[0] != 0:
+            wlog(host, "SCP header rejected", "ERROR"); return False
+        start = time.time(); sent = 0
+        last_report = start; last_pct = -1
+        chunk_size = PARAMIKO_CHANNEL_CHUNK
+        with open(local_file, "rb") as f:
+            while True:
+                if SHUTDOWN_REQ.is_set():
+                    wlog(host, "SCP-tuned aborted (shutdown)", "WARN")
+                    try: channel.close()
+                    except Exception: pass
+                    return False
+                buf = f.read(chunk_size)
+                if not buf: break
+                try: channel.sendall(buf)
+                except Exception as e:
+                    wlog(host, "SCP send error at %d bytes: %s: %s"
+                         % (sent, type(e).__name__,
+                            str(e)[:100] or "(no message)"), "ERROR")
+                    return False
+                sent += len(buf)
+                now = time.time()
+                if now - last_report > 3 and fw_size:
+                    pct = int(100.0 * sent / fw_size)
+                    if pct != last_pct:
+                        last_pct = pct
+                        with STATE_LOCK:
+                            if host in PEER_STATES:
+                                PEER_STATES[host]["progress"] = float(pct)
+                        last_report = now
+        channel.sendall(b"\x00")
+        try: ack = channel.recv(1)
+        except Exception: ack = b""
+        if not ack or ack[0] != 0:
+            wlog(host, "SCP EOF not acked by switch", "ERROR")
+            return False
+        try: channel.close()
+        except Exception: pass
+        try: client.close()
+        except Exception: pass
+        client = None
+        elapsed = time.time() - start
+        mbps = fw_size / max(elapsed, 1) / 1e6 if fw_size else 0
+        wlog(host, "Paramiko tuned SCP -- %.0fs (%.2f MB/s)"
+             % (elapsed, mbps), "OK")
+        return True
+    except Exception as e:
+        detail = str(e)[:140] or "(no message)"
+        wlog(host, "Paramiko tuned SCP failed: %s: %s"
+             % (type(e).__name__, detail), "ERROR")
+        return False
+    finally:
+        if client:
+            try: client.close()
+            except Exception: pass
+
+
+def transfer_firmware(ip, user, pw, fw_file, host, model=""):
+    if DRY_RUN:
+        wlog(host, "DRY-RUN: skipping firmware transfer", "INFO")
+        return True
+    if PARAMIKO_PRIMARY and USE_PARAMIKO_TUNED:
+        if transfer_via_paramiko_tuned(ip, user, pw, fw_file, host):
+            return True
+        wlog(host, "Paramiko tuned failed -- falling back to pscp", "WARN")
+    if USE_PSCP:
+        if transfer_via_pscp(ip, user, pw, fw_file, host):
+            return True
+        if PSCP_TRANSFER_FALLBACK:
+            if USE_PARAMIKO_TUNED:
+                wlog(host, "pscp failed -- falling back to tuned", "WARN")
+                if transfer_via_paramiko_tuned(ip, user, pw, fw_file, host):
+                    return True
+            wlog(host, "pscp failed -- falling back to legacy", "WARN")
+    if transfer_via_scp(ip, user, pw, fw_file, host):
+        return True
+    return False
+
+
+def validate_transfer_size(conn, host, fw_file):
+    fw_size = get_firmware_size(fw_file)
+    if not fw_size:
+        wlog(host, "  No local size reference", "WARN"); return True
+    try:
+        out = conn.send_command(
+            "dir flash: | include %s" % re.escape(fw_file),
+            read_timeout=60)
+        feed_live_log(host, "[verify] dir flash:\n%s" % out)
+        remote_size = _parse_file_size_from_dir(out, fw_file)
+        if remote_size is None:
+            wlog(host, "  Could not parse remote size", "ERROR")
+            return False
+        if remote_size == fw_size:
+            wlog(host, "  Size validated: %d bytes" % remote_size, "OK")
+            return True
+        wlog(host, "  SIZE MISMATCH: %d != %d" % (remote_size, fw_size),
+             "ERROR")
+        return False
+    except Exception as e:
+        wlog(host, "  Size validation error: %s" % e, "ERROR")
+        return False
+
+
+def validate_transfer_hash(conn, host, fw_file):
+    if not VERIFY_TRANSFER_HASH: return True
+    expected = FIRMWARE_SHA256.get(fw_file)
+    if not expected:
+        wlog(host, "  No local SHA256 reference -- skipping", "WARN")
+        return True
+    try:
+        wlog(host, "  verify /sha256 (5-15 min)", "STEP")
+        set_state(host, "MD5", "verify sha256")
+        set_cmd(host, "verify /sha256 flash:%s" % fw_file)
+        out = conn.send_command("verify /sha256 flash:%s" % fw_file,
+                                read_timeout=1800)
+        feed_live_log(host, "[verify-sha256] %s" % out)
+        m = re.search(r"SHA256 hash of [^:]+:\s*([0-9a-fA-F]{64})", out)
+        if not m: m = re.search(r"\b([0-9a-fA-F]{64})\b", out)
+        if not m:
+            wlog(host, "  Could not parse SHA256 -- allowing", "WARN")
+            return True
+        remote = m.group(1).lower()
+        if remote == expected.lower():
+            wlog(host, "  SHA256 verified (%s...)" % remote[:16], "OK")
+            return True
+        wlog(host, "  SHA256 MISMATCH: remote=%s... local=%s..."
+             % (remote[:16], expected[:16]), "ERROR")
+        return False
+    except Exception as e:
+        wlog(host, "  SHA256 verify failed: %s -- allowing" % str(e)[:80],
+             "WARN")
+        return True
+
+
+def _best_effort_wipe(ip, user, pw, fw_file, host, reason="wipe"):
+    conn = None
+    try:
+        conn = do_connect(ip, user, pw)
+        tacacs_enable(conn, host, ssh_pw=pw)
+        if is_privileged(conn):
+            _delete_firmware_from_flash(conn, host, fw_file)
+        else:
+            wlog(host, "  %s: not priv-15, skipping wipe" % reason, "WARN")
+    except Exception as e:
+        wlog(host, "  %s failed: %s" % (reason, str(e)[:80]), "WARN")
+    finally:
+        if conn:
+            try: conn.disconnect()
+            except Exception: pass
+
+
+def _transfer_with_wipe_retry(ip, user, pw, fw_file, host, model=""):
+    local_path = os.path.join(FIRMWARE_DIR, fw_file)
+    local_size = (os.path.getsize(local_path)
+                  if os.path.isfile(local_path) else 0)
+    for attempt in range(1, TRANSFER_RETRY_ATTEMPTS + 1):
+        if SHUTDOWN_REQ.is_set():
+            wlog(host, "Shutdown -- aborting transfer retries", "WARN")
+            return False
+        wlog(host, "--- Transfer attempt %d/%d ---"
+             % (attempt, TRANSFER_RETRY_ATTEMPTS), "STEP")
+        conn = None
+        try:
+            conn = robust_reconnect(
+                ip, user, pw, host,
+                purpose="pre-transfer wipe (attempt %d)" % attempt)
+            if conn:
+                _delete_firmware_from_flash(conn, host, fw_file)
+        except Exception as e:
+            wlog(host, "Pre-transfer wipe failed: %s" % str(e)[:80], "WARN")
+        finally:
+            if conn:
+                try: conn.disconnect()
+                except Exception: pass
+        transfer_ok = transfer_firmware(ip, user, pw, fw_file, host,
+                                        model=model)
+        if not transfer_ok:
+            wlog(host, "  Transfer failed (attempt %d)" % attempt, "WARN")
+            _best_effort_wipe(ip, user, pw, fw_file, host,
+                              reason="post-fail wipe")
+            if attempt < TRANSFER_RETRY_ATTEMPTS:
+                time.sleep(TRANSFER_RETRY_DELAY_SEC)
+            continue
+        conn = robust_reconnect(ip, user, pw, host,
+                                purpose="post-transfer verify (attempt %d)"
+                                        % attempt)
+        if not conn:
+            wlog(host, "  Reconnect after transfer failed", "WARN")
+            _best_effort_wipe(ip, user, pw, fw_file, host,
+                              reason="verify-reconnect wipe")
+            if attempt < TRANSFER_RETRY_ATTEMPTS:
+                time.sleep(TRANSFER_RETRY_DELAY_SEC)
+            continue
+        try:
+            if not file_in_flash(conn, fw_file):
+                wlog(host, "  File not in flash after transfer", "WARN")
+                if attempt < TRANSFER_RETRY_ATTEMPTS:
+                    time.sleep(TRANSFER_RETRY_DELAY_SEC)
+                continue
+            if not validate_transfer_size(conn, host, fw_file):
+                wlog(host, "  Size mismatch -- wiping", "WARN")
+                _delete_firmware_from_flash(conn, host, fw_file)
+                if attempt < TRANSFER_RETRY_ATTEMPTS:
+                    time.sleep(TRANSFER_RETRY_DELAY_SEC)
+                continue
+            if not validate_transfer_hash(conn, host, fw_file):
+                wlog(host, "  Hash mismatch -- wiping", "WARN")
+                _delete_firmware_from_flash(conn, host, fw_file)
+                if attempt < TRANSFER_RETRY_ATTEMPTS:
+                    time.sleep(TRANSFER_RETRY_DELAY_SEC)
+                continue
+            wlog(host, "Transfer OK on attempt %d" % attempt, "OK")
+            return True
+        finally:
+            try: conn.disconnect()
+            except Exception: pass
+    wlog(host, "Transfer FAILED after %d attempts"
+         % TRANSFER_RETRY_ATTEMPTS, "ERROR")
+    return False
+
+
+def _probe_install_status(ip, user, pw, host, target_ver,
+                          prev_indeterminate=0):
+    c = None
+    try:
+        last_err = None
+        for attempt in range(PROBE_CONNECT_RETRIES):
+            try:
+                c = do_connect(ip, user, pw)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < PROBE_CONNECT_RETRIES - 1:
+                    time.sleep(PROBE_CONNECT_DELAY_SEC)
+        if c is None:
+            err_name = type(last_err).__name__ if last_err else "?"
+            wlog(host, "Probe: connect failed after %d attempts (%s) -- "
+                       "indeterminate" % (PROBE_CONNECT_RETRIES, err_name),
+                 "WARN")
+            return (True, "connect failed (%s)" % err_name,
+                    prev_indeterminate + 1)
+        try:
+            tacacs_enable(c, host, ssh_pw=pw)
+        except Exception:
+            pass
+        if not is_privileged(c):
+            wlog(host, "Probe: not priv-15 -- indeterminate (may be transient)",
+                 "WARN")
+            return (True, "not priv-15 (transient?)",
+                    prev_indeterminate + 1)
+        try:
+            ver = c.send_command("show version | include Version",
+                                 read_timeout=60)
+            feed_live_log(host, "[probe] show version\n%s" % ver)
+            if _norm_ver(parse_running_version(ver)) == _norm_ver(target_ver):
+                try:
+                    up = c.send_command("show version | include uptime is",
+                                        read_timeout=30)
+                    feed_live_log(host, "[probe] uptime\n%s" % up)
+                    m = re.search(r"uptime is (.+)", up)
+                    uptime_min = (parse_uptime_minutes(m.group(1))
+                                  if m else None)
+                    if uptime_min is not None and uptime_min < 30:
+                        return (True,
+                                "already on %s (rebooted %d min ago)"
+                                % (target_ver, uptime_min), 0)
+                except Exception:
+                    pass
+                return True, "already on %s" % target_ver, 0
+        except Exception as e:
+            return (True, "version check error (%s)" % type(e).__name__,
+                    prev_indeterminate + 1)
+        try:
+            summ = c.send_command("show install summary", read_timeout=60)
+            feed_live_log(host, "[probe] show install summary\n%s" % summ)
+        except Exception as e:
+            return (True, "install summary error (%s)" % type(e).__name__,
+                    prev_indeterminate + 1)
+
+        if re.search(r"install operation in progress|operation in progress",
+                     summ, re.IGNORECASE):
+            return True, "install still running", 0
+
+        entries = _parse_install_summary(summ)
+        if entries:
+            tkey = _norm_ver(target_ver)
+            target_status = entries.get(tkey)
+            blocking = [v for v, s in entries.items()
+                        if v != tkey and s in ("C", "A", "U")]
+            if target_status == "C" and not blocking:
+                return True, "image committed on %s" % target_ver, 0
+            if target_status == "I":
+                return True, "image inactive (added, awaiting activate)", 0
+            if target_status == "U":
+                return True, "image uncommitted (in progress)", 0
+            if target_status == "A":
+                return True, "image activated, commit pending", 0
+            if any(s == "I" for s in entries.values()):
+                return True, "image inactive (added, awaiting activate)", 0
+            if any(s == "U" for s in entries.values()):
+                return True, "image uncommitted (in progress)", 0
+            if any(s == "A" for s in entries.values()):
+                return True, "image activated, commit pending", 0
+
+        try:
+            log = c.send_command("show install log", read_timeout=60)
+            feed_live_log(host, "[probe] show install log\n%s" % log)
+            if not re.search(r"% Invalid input|% Incomplete", log,
+                             re.IGNORECASE):
+                lines = log.splitlines()
+                start_idx = -1
+                for i in range(len(lines) - 1, -1, -1):
+                    if re.search(
+                            r"install_(?:add|activate|commit|remove|"
+                            r"abort|rollback).*?:\s*START",
+                            lines[i], re.IGNORECASE):
+                        start_idx = i
+                        break
+                current = ("\n".join(lines[start_idx:])
+                           if start_idx >= 0 else "\n".join(lines[-40:]))
+                low_cur = current.lower()
+                if re.search(r"install_\w+\]\s*:\s*end\s+failed",
+                             low_cur, re.IGNORECASE):
+                    return False, "install log shows FAILED (current op)", 0
+                if re.search(r"install_\w+\]\s*:\s*end\s+success",
+                             low_cur, re.IGNORECASE):
+                    return True, "install op ended SUCCESS", 0
+                if start_idx >= 0:
+                    return True, "current install op in progress", 0
+        except Exception:
+            pass
+        return True, "indeterminate", prev_indeterminate + 1
+    except Exception as e:
+        err_name = type(e).__name__
+        wlog(host, "Probe: %s: %s -- indeterminate"
+             % (err_name, str(e)[:80]), "WARN")
+        return True, "probe error (%s)" % err_name, prev_indeterminate + 1
+    finally:
+        if c:
+            try: c.disconnect()
+            except Exception: pass
+
+
+def _safe_manual_reload(conn, host):
+    wlog(host, "Issuing manual reload (fallback)", "STEP")
+    try:
+        drain_channel(conn, 2, host=host)
+        set_cmd(host, "reload")
+        conn.write_channel("reload\n")
+        buffer = ""
+        deadline = time.time() + 90
+        sent_save_no = sent_confirm = False
+        while time.time() < deadline:
+            try: chunk = conn.read_channel()
+            except Exception: break
+            if not chunk:
+                time.sleep(0.5); continue
+            feed_live_log(host, chunk)
+            buffer = (buffer + chunk)[-2000:]
+            low = buffer.lower()
+            if any(k in low for k in _RELOAD_MARKERS):
+                wlog(host, "Reload accepted by switch", "OK")
+                return True
+            if (not sent_save_no
+                    and ("system configuration has been modified" in low
+                         or "save?" in low)):
+                conn.write_channel("no\n"); sent_save_no = True
+                time.sleep(1); buffer = ""; continue
+            if (not sent_confirm
+                    and ("proceed with reload" in low
+                         or "[confirm]" in low)):
+                conn.write_channel("\n"); sent_confirm = True
+                time.sleep(1); buffer = ""; continue
+        wlog(host, "Manual reload did not confirm", "WARN")
+        return False
+    except Exception as e:
+        wlog(host, "Manual reload error: %s" % str(e)[:80], "WARN")
+        return False
+
+
+def run_install(conn, cmd, host, state, ip, user, pw, target_ver,
+                is_issu=False, fw_file=None):
+    set_state(host, "INSTALL", "starting")
+    set_cmd(host, cmd)
+    state["install_started"] = True
+    state["last_probe"] = 0.0
+    state["indeterminate_streak"] = 0
+    state["last_probe_msg"] = ""
+    state["probe_msg_counts"] = {}
+    state["activate_nudged"] = False
+    state["activate_attempts"] = 0
+    state.setdefault("add_seen", False)
+    state.setdefault("activate_seen", False)
+    state.setdefault("commit_seen", False)
+    state.setdefault("op_success_probes", 0)
+    state.setdefault("commit_nudge_count", 0)
+    if fw_file is None:
+        m = re.search(r"flash:(\S+\.bin)", cmd)
+        if m: fw_file = m.group(1)
+    drain_channel(conn, 5, host=host)
+    wlog(host, "INSTALL: %s" % cmd, "CMD")
+    try:
+        conn.write_channel(cmd + "\n")
+    except Exception as e:
+        return False, "write failed: %s" % e, conn
+    start = time.time()
+    last_output = time.time()
+    buffer, last_y = "", 0.0
+    success = reload_seen = False
+    success_at = None
+    _DONE = ("already on ", "image committed on ")
+
+    def _close_and_return(ok, msg, rebooted=True):
+        if rebooted:
+            state["reboot_detected"] = True
+        try: conn.disconnect()
+        except Exception: pass
+        return ok, msg, None
+
+    while time.time() - start < INSTALL_TOTAL_TIMEOUT:
+        if SHUTDOWN_REQ.is_set():
+            return False, "shutdown requested", conn
+        try:
+            chunk = conn.read_channel()
+            if chunk: feed_live_log(host, chunk)
+        except Exception as e:
+            emsg = str(e).lower()
+            if success or reload_seen:
+                wlog(host, "Session closed after install -- reboot in progress",
+                     "OK")
+                return _close_and_return(True, "", rebooted=True)
+            if ("tacacs" in emsg or "authorization failed" in emsg
+                    or "command authorization" in emsg):
+                wlog(host, "TACACS+ dropped session: %s" % str(e)[:80],
+                     "ERROR")
+                try: conn.disconnect()
+                except Exception: pass
+                return False, "TACACS+ dropped session", None
+            wlog(host, "Install session lost: %s" % str(e)[:80], "WARN")
+            try: conn.disconnect()
+            except Exception: pass
+            new_conn = robust_reconnect(ip, user, pw, host,
+                                        purpose="mid-install")
+            if not new_conn:
+                return _close_and_return(True, "", rebooted=True)
+            try:
+                if committed_on_target(new_conn, target_ver):
+                    wlog(host, "Target committed after reconnect", "OK")
+                    return True, "", new_conn
+            except Exception:
+                pass
+            return False, "install session lost; state unknown", new_conn
+        if chunk:
+            last_output = time.time()
+            buffer = (buffer + chunk)[-4000:]
+            low = buffer.lower()
+            for k in _AUTHZ_MARKERS:
+                if k in low: return False, "TACACS+ denied command", conn
+            for k in _REJECT_MARKERS:
+                if k in low:
+                    return False, "command rejected (%s)" % k, conn
+            for k in _SPACE_MARKERS:
+                if k in low:
+                    msg = ("insufficient_space: install engine rejected "
+                           "install add: %s" % k)
+                    wlog(host, "  %s" % msg, "ERROR")
+                    return False, msg, conn
+            if any(k in low for k in _ALREADY_ADDED_MARKERS):
+                return False, ("already_added_refused: engine refused "
+                               "add because .pkg set is already on flash"), conn
+            if re.search(r"failed:\s*install", low):
+                return False, "install reported FAILED", conn
+            tail = low[-400:]
+            hit = next((p for p in _PROMPT_MARKERS if p in tail), None)
+            if hit and time.time() - last_y > 10:
+                conn.write_channel("y\n"); last_y = time.time()
+                buffer = ""
+                wlog(host, "Prompt ('%s') -> y" % hit, "OK")
+                continue
+            if any(k in low for k in _RELOAD_MARKERS):
+                reload_seen = True
+                state["reboot_detected"] = True
+            if re.search(r"success:\s*install_add", low) \
+                    and not state["add_seen"]:
+                state["add_seen"] = True
+                wlog(host, "Install add SUCCESS", "OK")
+            if re.search(r"success:\s*install_activate", low) \
+                    and not state["activate_seen"]:
+                state["activate_seen"] = True
+                wlog(host, "Install activate SUCCESS", "OK")
+                if is_issu and not success:
+                    success = True; success_at = time.time()
+            if re.search(r"success:\s*install_commit", low) \
+                    and not state["commit_seen"]:
+                state["commit_seen"] = True
+                success = True; success_at = time.time()
+                wlog(host, "Install commit SUCCESS", "OK")
+
+        if success and is_issu:
+            set_state(host, "INSTALL", "ISSU verify")
+            deadline = time.time() + ISSU_VERIFY_TIMEOUT
+            consecutive_errs = 0
+            while time.time() < deadline:
+                if SHUTDOWN_REQ.is_set():
+                    return False, "shutdown requested", conn
+                time.sleep(20)
+                try:
+                    if committed_on_target(conn, target_ver):
+                        wlog(host, "ISSU complete -- no reload", "OK")
+                        return True, "", conn
+                    consecutive_errs = 0
+                except Exception as e:
+                    consecutive_errs += 1
+                    wlog(host, "ISSU verify error (%d/%d): %s"
+                         % (consecutive_errs, ISSU_VERIFY_MAX_ERRORS,
+                            str(e)[:80]), "WARN")
+                    if consecutive_errs >= ISSU_VERIFY_MAX_ERRORS:
+                        return (False,
+                                "ISSU verify failed %dx consecutively: %s"
+                                % (ISSU_VERIFY_MAX_ERRORS, str(e)[:80]),
+                                conn)
+            return False, "ISSU never committed within timeout", conn
+
+        if reload_seen and not is_issu:
+            time.sleep(3)
+            return _close_and_return(True, "", rebooted=True)
+
+        if success and not is_issu and time.time() - success_at > 180:
+            already_on_target = False
+            try:
+                vo = conn.send_command("show version | include Version",
+                                       read_timeout=30)
+                if _norm_ver(parse_running_version(vo)) \
+                        == _norm_ver(target_ver):
+                    already_on_target = True
+                    wlog(host, "Already on target after commit -- no reload "
+                               "needed", "OK")
+            except Exception:
+                pass
+            if already_on_target:
+                return _close_and_return(True, "", rebooted=False)
+            wlog(host, "Commit seen but device not yet on target after 180s "
+                       "-- issuing manual reload", "WARN")
+            _safe_manual_reload(conn, host)
+            return _close_and_return(True, "", rebooted=True)
+
+        if not chunk:
+            silence = time.time() - last_output
+            if (not success and silence > INSTALL_PROBE_INTERVAL
+                    and time.time() - state.get("last_probe", 0)
+                        > INSTALL_PROBE_INTERVAL):
+                state["last_probe"] = time.time()
+                set_state(host, "INSTALL",
+                          "probe (silent %ds)" % int(silence))
+                wlog(host, "Install silent %ds -- probing status"
+                     % int(silence), "INFO")
+                streak = state.get("indeterminate_streak", 0)
+                probe_ok, probe_msg, new_streak = _probe_install_status(
+                    ip, user, pw, host, target_ver, streak)
+                state["indeterminate_streak"] = new_streak
+                cnts = state["probe_msg_counts"]
+                cnts[probe_msg] = cnts.get(probe_msg, 0) + 1
+                same_total = cnts[probe_msg]
+                if probe_ok and any(m in probe_msg for m in _DONE):
+                    wlog(host, "Probe confirms on target -- exiting "
+                               "install loop", "OK")
+                    return _close_and_return(True, "", rebooted=False)
+                if probe_ok and new_streak == 0:
+                    prev_msg = state.get("last_probe_msg")
+                    state["last_probe_msg"] = probe_msg
+                    if probe_msg != prev_msg:
+                        last_output = time.time()
+                    if "image inactive" in probe_msg:
+                        try:
+                            if _state_needs_precommit(conn, host):
+                                wlog(host, "  probe found U state -- "
+                                           "pre-committing first", "WARN")
+                                ok_pc, err_pc = \
+                                    _run_install_commit_for_precommit(
+                                        conn, host)
+                                if not ok_pc:
+                                    wlog(host, "  pre-commit failed: %s"
+                                         % err_pc, "WARN")
+                        except Exception:
+                            pass
+                        state["activate_attempts"] += 1
+                        if state["activate_attempts"] == 1:
+                            accepted = _nudge_install_activate(
+                                conn, host, fw_file)
+                        else:
+                            accepted = _try_all_activate_forms(
+                                conn, host, fw_file)
+                        if accepted:
+                            state["activate_nudged"] = True
+                            last_output = time.time()
+                            dead = False
+                            try:
+                                tr = getattr(conn, "remote_conn", None)
+                                tr = getattr(tr, "transport", None)
+                                if tr is None or not tr.is_active():
+                                    dead = True
+                            except Exception:
+                                dead = True
+                            if dead:
+                                wlog(host, "  activate nudged, transport "
+                                           "inactive -- reload in progress",
+                                     "OK")
+                                return _close_and_return(
+                                    True, "", rebooted=True)
+                            try:
+                                conn.read_channel()
+                            except Exception:
+                                wlog(host, "  activate nudged, session "
+                                           "closed -- reload in progress",
+                                     "OK")
+                                return _close_and_return(
+                                    True, "", rebooted=True)
+                        elif state["activate_attempts"] >= 3:
+                            _run_install_abort_and_reissue(
+                                conn, host, fw_file)
+                            state["activate_attempts"] = 0
+                            last_output = time.time()
+                    elif ("image uncommitted" in probe_msg
+                          or "commit pending" in probe_msg):
+                        try:
+                            if _state_needs_precommit(conn, host):
+                                wlog(host, "  probe found U state -- "
+                                           "pre-committing", "WARN")
+                                _run_install_commit_for_precommit(
+                                    conn, host)
+                        except Exception:
+                            pass
+                        state["commit_nudge_count"] += 1
+                        if state["commit_nudge_count"] >= 3:
+                            wlog(host, "  Uncommitted -- nudging "
+                                       "install commit", "WARN")
+                            try:
+                                conn.write_channel("install commit\n")
+                                time.sleep(3)
+                                try: conn.read_channel()
+                                except Exception: pass
+                            except Exception as e:
+                                wlog(host, "  commit nudge failed: %s"
+                                     % str(e)[:80], "WARN")
+                            state["commit_nudge_count"] = 0
+                    elif "install op ended SUCCESS" in probe_msg:
+                        state["op_success_probes"] += 1
+                        if state["op_success_probes"] >= 5:
+                            try:
+                                vo = conn.send_command(
+                                    "show version | include Version",
+                                    read_timeout=30)
+                                if _norm_ver(parse_running_version(vo)) \
+                                        == _norm_ver(target_ver):
+                                    wlog(host, "Version on target after "
+                                               "add-success -- exiting", "OK")
+                                    return _close_and_return(True, "",
+                                                             rebooted=False)
+                            except Exception:
+                                pass
+                            state["op_success_probes"] = 0
+                if same_total >= 12:
+                    wlog(host, "Probe returned '%s' %d times -- forcing "
+                               "version check" % (probe_msg, same_total),
+                         "WARN")
+                    try:
+                        vo = conn.send_command(
+                            "show version | include Version",
+                            read_timeout=30)
+                        if _norm_ver(parse_running_version(vo)) \
+                                == _norm_ver(target_ver):
+                            wlog(host, "Version on target -- exiting "
+                                       "install loop", "OK")
+                            return _close_and_return(True, "",
+                                                     rebooted=False)
+                    except Exception:
+                        pass
+                    return (False,
+                            "install stuck on '%s' for %d probes"
+                            % (probe_msg, same_total), conn)
+                if probe_ok and new_streak != 0:
+                    wlog(host, "Probe: %s (streak %d)"
+                         % (probe_msg, new_streak), "WARN")
+                    if new_streak >= 10:
+                        return (False,
+                                "install never started (indeterminate "
+                                "for %ds)"
+                                % (new_streak * INSTALL_PROBE_INTERVAL),
+                                conn)
+                elif not probe_ok:
+                    wlog(host, "Probe failed: %s" % probe_msg, "WARN")
+                    return False, "install probe: %s" % probe_msg, conn
+            if not success and silence > INSTALL_SILENT_TIMEOUT:
+                return (False,
+                        "no install output for %ds" % INSTALL_SILENT_TIMEOUT,
+                        conn)
+            time.sleep(0.5)
+    return False, "install timeout", conn
+
+
+def _issue_rollback_commands(conn, host):
+    for cmd in ("install rollback to committed", "install rollback to base"):
+        try:
+            drain_channel(conn, 2, host=host)
+            set_cmd(host, cmd)
+            conn.write_channel(cmd + "\n")
+            time.sleep(3)
+            got = ""
+            try: got = conn.read_channel() or ""
+            except Exception: pass
+            feed_live_log(host, got)
+            low = got.lower()
+            if ("% invalid input" in low or "unrecognized" in low
+                    or "% incomplete" in low):
+                wlog(host, "  %s not accepted -- trying alternate" % cmd,
+                     "WARN")
+                continue
+            return True, cmd
+        except Exception as e:
+            wlog(host, "  %s error: %s" % (cmd, str(e)[:80]), "WARN")
+    return False, ""
+
+
+def attempt_rollback(conn, host, ip=None, user=None, pw=None,
+                     original_version=None):
+    if not PRESERVE_ROLLBACK:
+        wlog(host, "Rollback impossible: old packages not preserved", "ERROR")
+        return False
+    wlog(host, "AUTO-ROLLBACK", "STEP")
+    set_state(host, "ROLLBACK", "issuing")
+    issued = False
+    ok, cmd = _issue_rollback_commands(conn, host)
+    if not ok:
+        wlog(host, "Neither rollback syntax accepted", "ERROR")
+        return False
+    wlog(host, "Rollback accepted: %s" % cmd, "OK")
+    try:
+        buffer, last_y = "", 0.0
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            try: chunk = conn.read_channel()
+            except Exception:
+                wlog(host, "Session closed during rollback -- reloading", "OK")
+                issued = True; break
+            if chunk:
+                feed_live_log(host, chunk)
+                buffer = (buffer + chunk)[-3000:]
+                low = buffer.lower()
+                if re.search(r"failed:\s*install", low):
+                    wlog(host, "Rollback FAILED", "ERROR"); return False
+                if any(k in low for k in ("initiating reload",
+                                          "reload requested",
+                                          "restarting system", "will reload")):
+                    issued = True; break
+                if (re.search(r"\[y/n\]|\(y/n\)|do you want to proceed",
+                              low[-300:]) and time.time() - last_y > 10):
+                    conn.write_channel("y\n"); last_y = time.time()
+                    buffer = ""; continue
+            time.sleep(0.5)
+    except Exception as e:
+        wlog(host, "Rollback error: %s" % str(e)[:100], "ERROR")
+    if not issued: return False
+    if not (ip and user and pw and original_version): return True
+    wlog(host, "Waiting for rollback reboot (target %s)" % original_version,
+         "INFO")
+    try:
+        try: conn.disconnect()
+        except Exception: pass
+        if not wait_for_ping_down(ip, host, timeout_sec=PING_DOWN_TIMEOUT_SEC):
+            wlog(host, "Switch never went down after rollback", "WARN")
+        if not wait_for_ping_up(ip, host, timeout_sec=PING_UP_TIMEOUT_SEC):
+            wlog(host, "Switch did not come back", "ERROR")
+            return False
+        if not wait_for_ssh_ready(ip, host):
+            wlog(host, "SSH not ready after rollback", "ERROR")
+            return False
+        c2 = robust_reconnect(ip, user, pw, host,
+                              purpose="post-rollback verify")
+        if not c2:
+            wlog(host, "Reconnect failed after rollback", "ERROR")
+            return False
+        try:
+            out = c2.send_command("show version | include Version",
+                                  read_timeout=60)
+            feed_live_log(host, "[rollback-verify] show version\n%s" % out)
+            if _norm_ver(parse_running_version(out)) \
+                    == _norm_ver(original_version):
+                wlog(host, "Rollback verified -- back on %s"
+                     % original_version, "OK")
+                return True
+            wlog(host, "Rollback did NOT restore %s" % original_version,
+                 "ERROR")
+            return False
+        finally:
+            try: c2.disconnect()
+            except Exception: pass
+    except Exception as e:
+        wlog(host, "Rollback verify error: %s" % str(e)[:100], "ERROR")
+        return False
+
+
+def _verify_after_reboot_impl(conn, ip, target_ver, host, user, pw, st,
+                              pre_config, fw_file):
+    try:
+        out = conn.send_command("show version | include Version")
+        feed_live_log(host, "[verify] show version\n%s" % out)
+        st["post_version"] = parse_running_version(out)
+        if _norm_ver(st["post_version"]) != _norm_ver(target_ver):
+            st["error"] = ("version mismatch: %s != %s"
+                           % (st.get("post_version") or '?', target_ver))
+            wlog(host, st["error"], "ERROR")
+            if AUTO_ROLLBACK_ON_FAIL and st.get("reboot_detected"):
+                if attempt_rollback(conn, host, ip=ip, user=user, pw=pw,
+                                    original_version=st.get("start_version",
+                                                            "")):
+                    st["error"] += " (auto-rollback issued and verified)"
+                else:
+                    st["error"] += " (auto-rollback FAILED)"
+            return False
+        drain_syslog_after_reboot(conn, host)
+
+        if not _finalize_install_commit(conn, host, target_ver,
+                                        fw_file=fw_file or ""):
+            st["error"] = "commit could not be verified"
+            st["verify_pending"] = True
+            wlog(host, "  upgrade NOT durable -- commit missing. "
+                       "Device will revert on next reload.", "ERROR")
+            return False
+        wlog(host, "  commit finalized -- upgrade is durable", "OK")
+
+        issues = []
+        for i in range(1, HEALTH_RETRIES + 1):
+            ok, issues = post_upgrade_health_check(conn, host, target_ver)
+            if ok: break
+            wlog(host, "Health %d/%d: %s"
+                 % (i, HEALTH_RETRIES, "; ".join(issues)), "WARN")
+            if i < HEALTH_RETRIES: time.sleep(HEALTH_RETRY_DELAY_SEC)
+        else:
+            st["error"] = "health check failed: " + "; ".join(issues)
+            wlog(host, st["error"], "ERROR")
+            st["verify_pending"] = True
+            return False
+        if pre_config and not SKIP_CONFIG_DRIFT_CHECK:
+            try:
+                post_cfg = conn.send_command("show running-config",
+                                             read_timeout=120)
+                drift = config_drift_check(pre_config, post_cfg, host)
+                if drift:
+                    st["drift"] = drift[:20]
+                    st["config_diff_lines"] = len(drift)
+            except Exception as e:
+                wlog(host, "Config drift check skipped: %s" % str(e)[:80],
+                     "WARN")
+        wlog(host, "Upgrade verified on %s" % target_ver, "OK")
+        try: post_upgrade_cleanup(conn, host)
+        except Exception as e:
+            wlog(host, "Cleanup non-fatal: %s" % str(e)[:80], "WARN")
+        return True
+    except Exception as e:
+        st["error"] = "post-reboot verify error: %s" % str(e)[:150]
+        st["verify_pending"] = True
+        return False
+
+
+def wait_reboot_and_verify(ip, target_ver, host, user, pw, st, is_issu=False,
+                           pre_config="", fw_file=""):
+    if not is_issu and ssh_port_open(ip, 3):
+        peek = None
+        try:
+            peek = do_connect(ip, user, pw)
+            vo = peek.send_command("show version | include Version",
+                                   read_timeout=30)
+            if _norm_ver(parse_running_version(vo)) \
+                    == _norm_ver(target_ver):
+                wlog(host, "Device already on target (fast reboot) -- "
+                           "skipping ping-down wait", "OK")
+                st["reboot_detected"] = True
+                set_state(host, "VERIFY", "post-upgrade")
+                return _verify_after_reboot_impl(
+                    peek, ip, target_ver, host, user, pw, st,
+                    pre_config, fw_file)
+        except Exception as e:
+            wlog(host, "  fast-reboot probe skipped: %s" % str(e)[:80],
+                 "WARN")
+        finally:
+            if peek is not None:
+                try: peek.disconnect()
+                except Exception: pass
+
+    if is_issu:
+        wlog(host, "ISSU path -- skipping reboot wait", "INFO")
+        set_state(host, "VERIFY", "post-ISSU")
+    else:
+        set_state(host, "REBOOT", "wait down")
+        set_cmd(host, "ping (wait down)")
+        went_down = wait_for_ping_down(ip, host)
+        if not went_down:
+            wlog(host, "Device did not go down -- checking anyway", "WARN")
+        set_state(host, "REBOOT", "wait up")
+        came_back = wait_for_ping_up(ip, host)
+        if not came_back:
+            st["error"] = "device did not return after reboot"
+            st["verify_pending"] = True
+            return False
+        if not wait_for_ping_stable(ip, host):
+            st["error"] = "boot loop detected (ping flapping)"
+            st["verify_pending"] = True
+            return False
+        set_state(host, "REBOOT", "wait ssh")
+        set_cmd(host, "ssh reconnect")
+        if not wait_for_ssh_ready(ip, host):
+            st["error"] = "SSH did not return"
+            st["verify_pending"] = True
+            return False
+        wlog(host, "Settling %ds before verification"
+             % POST_REBOOT_SETTLE_SEC, "INFO")
+        set_state(host, "REBOOT", "settling")
+        time.sleep(POST_REBOOT_SETTLE_SEC)
+    set_state(host, "VERIFY", "post-upgrade")
+    conn = robust_reconnect(ip, user, pw, host,
+                            max_attempts=POST_REBOOT_MAX_ATTEMPTS,
+                            delay=POST_REBOOT_DELAY_SEC, purpose="post-reboot")
+    if not conn:
+        st["error"] = "could not reconnect after reboot"
+        st["verify_pending"] = True
+        return False
+    try:
+        return _verify_after_reboot_impl(
+            conn, ip, target_ver, host, user, pw, st,
+            pre_config, fw_file)
+    finally:
+        try: conn.disconnect()
+        except Exception: pass
+
+
+def transfer_worker(dev, user, pw, location_name=""):
+    loc = location_name or dev.get("_location", "")
+    host, ip = dev["hostname"], dev["ip"]
+    set_state(host, "QUEUE", "waiting slot")
+    result = {"dev": dev, "success": False, "error": "", "fw_file": "",
+              "target_ver": "", "start_ver": "", "skipped": False,
+              "pre_config": "", "clock_corrected": False}
+    conn = None
+    model = ""
+    if SHUTDOWN_REQ.is_set():
+        result["error"] = "shutdown requested"; return result
+    if DO_RESET_DEVICE_LOGS and not DRY_RUN: reset_device_logs(host)
+    if loc: _update_checkpoint(loc, host, "transfer_start")
+    try:
+        try:
+            conn = do_connect(ip, user, pw)
+        except Exception as e:
+            tag = _classify_connect_error(e)
+            if tag:
+                wlog(host, "%s: %s" % (tag, str(e)[:160]), "ERROR")
+                result["error"] = tag
+                if loc: _update_checkpoint(loc, host, "failed", tag)
+                return result
+            raise
+        tacacs_enable(conn, host, ssh_pw=pw)
+        try: conn.set_base_prompt()
+        except Exception: pass
+        if not is_privileged(conn):
+            result["error"] = "not priv 15"
+            if loc: _update_checkpoint(loc, host, "failed", "not priv 15")
+            return result
+        model = get_model(conn)
+        fw = pick_firmware(model)
+        if not fw:
+            result["error"] = "unsupported model '%s'" % model
+            wlog(host, "Unsupported model '%s' -- refusing" % model, "ERROR")
+            if loc: _update_checkpoint(loc, host, "failed", result["error"])
+            return result
+        fw_file, target_ver = fw
+        result["fw_file"], result["target_ver"] = fw_file, target_ver
+        if _is_large_model(model) and SERIAL_TRANSFER_LARGE_MODELS:
+            wlog(host, "Large model %s -- pool sized by LARGE_MODEL_PARALLEL=%d"
+                 % (model, LARGE_MODEL_PARALLEL), "INFO")
+        try:
+            cnt, states = _stack_member_count(conn, host)
+            if cnt > 1:
+                wlog(host, "  Stack: %d members -- %s" % (cnt, states),
+                     "INFO")
+        except Exception: pass
+        ok, reason, current_ver, clock_fixed = precheck_device(
+            conn, host, fw_file, target_ver)
+        result["start_ver"] = current_ver
+        result["clock_corrected"] = clock_fixed
+        if not ok:
+            result["error"] = reason
+            if loc: _update_checkpoint(loc, host, "failed", reason)
+            return result
+        if reason == "already_on_target":
+            result["success"] = True; result["skipped"] = True
+            if loc: _update_checkpoint(loc, host, "verified",
+                                       "already_on_target")
+            return result
+
+        if reason == "already_added_needs_activate":
+            result["success"] = True
+            result["already_added"] = True
+            if loc: _update_checkpoint(loc, host, "transferred")
+            wlog(host, "TARGET .PKG SET PRESENT -- SKIPPING TRANSFER "
+                       "AND PURGE", "OK")
+            set_state(host, "READY", "activate pending")
+            return result
+
+        if reason.startswith("already_on_target_needs_"):
+            needs_finalize = "needs_finalize" in reason
+            needs_cleanup = "needs_cleanup" in reason
+            wlog(host, "POST-UPGRADE FIXUP (%s)" % reason, "OK")
+            set_state(host, "VERIFY", "fixup")
+            fix_ok = True
+            if needs_finalize:
+                if not _finalize_install_commit(conn, host, target_ver,
+                                                fw_file=fw_file):
+                    result["error"] = ("fixup: commit could not be "
+                                       "verified")
+                    result["success"] = False
+                    fix_ok = False
+            if fix_ok and needs_cleanup:
+                set_state(host, "VERIFY", "revert temp config")
+                ok_count, fail_count, _unknown = revert_device_temp_changes(
+                    conn, host)
+                if fail_count:
+                    wlog(host, "  revert partial: ok=%d fail=%d"
+                         % (ok_count, fail_count), "WARN")
+                else:
+                    wlog(host, "  residual temp config reverted", "OK")
+                try:
+                    conn.send_command("write memory", read_timeout=60)
+                except Exception:
+                    pass
+            if fix_ok:
+                result["success"] = True
+                result["fixup_done"] = True
+                set_state(host, "DONE", "fixup complete")
+                if loc: _update_checkpoint(loc, host, "verified", "fixup")
+                wlog(host, "fixup complete -- device secured and durable",
+                     "OK")
+            return result
+
+        if DO_BACKUP and not DRY_RUN:
+            try:
+                cfg = conn.send_command("show running-config",
+                                        read_timeout=120)
+                result["pre_config"] = cfg
+                fn = ("%s_%s_%s.cfg"
+                      % (host, current_ver,
+                         datetime.now().strftime("%Y%m%d_%H%M%S")))
+                with open(os.path.join(BACKUP_DIR, fn), "w",
+                          encoding="utf-8") as f:
+                    f.write(cfg)
+                wlog(host, "Backup saved: %s" % fn, "OK")
+            except Exception as e:
+                wlog(host, "Backup skipped: %s" % e, "WARN")
+        if PRE_SAVE_CONFIG and not DRY_RUN:
+            try:
+                wr = conn.send_command("write memory", read_timeout=60)
+                if "error" in wr.lower() or "fail" in wr.lower():
+                    wlog(host, "Pre-temp write memory: %s"
+                         % wr.strip()[:80], "WARN")
+            except Exception as e:
+                wlog(host, "Pre-temp write memory error: %s" % str(e)[:80],
+                     "WARN")
+        fw_already_present = False
+        if not DRY_RUN:
+            tune_ssh_for_bulk_transfer(conn, host, model)
+            apply_cheap_crypto_tuning(conn, host, model)
+            if not ensure_scp_server_enabled(conn, host):
+                result["error"] = "scp server enable failed"
+                if loc:
+                    _update_checkpoint(loc, host, "failed", result["error"])
+                return result
+            if not any(ch.get("type") == "exec_timeout"
+                       for ch in get_temp_changes(host)):
+                orig = get_vty_exec_timeout(conn, host)
+                if orig:
+                    all_already = all(
+                        b.get("minutes") == 60 and b.get("seconds") == 0
+                        for b in orig["blocks"]
+                        if not b.get("was_default"))
+                    if all_already and orig["blocks"]:
+                        wlog(host, "  exec-timeout already 60 0 -- skipping",
+                             "INFO")
+                    else:
+                        try:
+                            track_temp_change(host, "exec_timeout", orig)
+                            cmds = []
+                            for b in orig["blocks"]:
+                                cmds += ["line vty %s" % b["vty"],
+                                         "exec-timeout 60 0", "exit"]
+                            conn.send_config_set(cmds)
+                            wlog(host, "Temp exec-timeout 60 0 set", "INFO")
+                        except Exception as e:
+                            wlog(host, "Failed temp exec-timeout: %s" % e,
+                                 "WARN")
+                else:
+                    wlog(host, "Could not read VTY config -- skipping", "WARN")
+            try:
+                wlog(host, "Saving config (install precondition)...", "INFO")
+                wr = conn.send_command("write memory", read_timeout=120)
+                if "error" in wr.lower() or "fail" in wr.lower():
+                    wlog(host, "write memory: %s" % wr.strip()[:80], "WARN")
+                else:
+                    wlog(host, "Config saved", "OK")
+            except Exception as e:
+                wlog(host, "write memory failed: %s" % str(e)[:80], "WARN")
+            if file_in_flash(conn, fw_file):
+                if validate_transfer_size(conn, host, fw_file):
+                    wlog(host, "%s already in flash -- skipping transfer"
+                         % fw_file, "OK")
+                    fw_already_present = True
+                else:
+                    wlog(host, "%s present but wrong size -- wiping"
+                         % fw_file, "WARN")
+                    _delete_firmware_from_flash(conn, host, fw_file)
+            else:
+                wlog(host, "  %s not in flash -- will transfer" % fw_file,
+                     "INFO")
+        try: conn.disconnect()
+        except Exception: pass
+        conn = None
+        if fw_already_present:
+            result["success"] = True
+            if not QUIET_SKIPPED:
+                wlog(host, "DEVICE READY FOR INSTALL", "OK")
+            set_state(host, "READY", "handing to install pool")
+            if loc: _update_checkpoint(loc, host, "transferred")
+            return result
+        if DRY_RUN:
+            wlog(host, "DRY-RUN: skipping transfer retry logic", "INFO")
+            result["success"] = True; return result
+        if not _transfer_with_wipe_retry(ip, user, pw, fw_file, host,
+                                         model=model):
+            result["error"] = ("transfer failed after %d attempts"
+                               % TRANSFER_RETRY_ATTEMPTS)
+            if loc: _update_checkpoint(loc, host, "failed", result["error"])
+            return result
+
+        if ALLOW_ACTIVE_PKG_PURGE and not DRY_RUN:
+            conn2 = None
+            try:
+                conn2 = robust_reconnect(ip, user, pw, host,
+                                         purpose="post-transfer pkg purge")
+                if conn2:
+                    fw_size = get_firmware_size(fw_file)
+                    extraction = int(fw_size * EXTRACTION_OVERHEAD_FACTOR)
+                    need = extraction + STACK_MEMBER_HEADROOM
+                    free = get_flash_free_bytes(conn2)
+                    if free < need:
+                        wlog(host, "  Space still tight (%.0f MB < %.0f MB) "
+                                   "-- invoking active-pkg purge"
+                             % (free/1e6, need/1e6), "WARN")
+                        set_state(host, "PKG-PURGE", "active .pkg purge")
+                        _ok, _msg = _pre_install_pkg_purge(
+                            conn2, host, fw_file, target_ver)
+                        wlog(host, "  active-pkg purge: %s" % _msg,
+                             "OK" if _ok else "WARN")
+                    else:
+                        wlog(host, "  Space OK (%.0f MB >= %.0f MB) -- "
+                                   "skipping active-pkg purge"
+                             % (free/1e6, need/1e6), "INFO")
+            except Exception as e:
+                wlog(host, "  post-transfer pkg purge error: %s"
+                     % str(e)[:120], "WARN")
+            finally:
+                if conn2:
+                    try: conn2.disconnect()
+                    except Exception: pass
+
+        result["success"] = True
+        if not QUIET_SKIPPED:
+            wlog(host, "DEVICE READY FOR INSTALL", "OK")
+        set_state(host, "READY", "handing to install pool")
+        if loc: _update_checkpoint(loc, host, "transferred")
+        return result
+    except Exception as e:
+        result["error"] = str(e)[:200]
+        if loc: _update_checkpoint(loc, host, "failed", result["error"])
+        return result
+    finally:
+        if conn:
+            try: conn.disconnect()
+            except Exception: pass
+
+
+def install_worker(dev, user, pw, transfer_result, location_name=""):
+    loc = location_name or dev.get("_location", "")
+    host, ip = dev["hostname"], dev["ip"]
+    fw_file = transfer_result["fw_file"]
+    target_ver = transfer_result["target_ver"]
+    start_ver = transfer_result.get("start_ver", "")
+    pre_config = transfer_result.get("pre_config", "")
+    st = {"hostname": host, "ip": ip, "start_version": start_ver,
+          "target_version": target_ver, "fw_file": fw_file,
+          "status": "failed", "duration_sec": 0,
+          "md5_ok": False, "install_started": False, "reboot_detected": False,
+          "post_version": "", "error": "", "verify_pending": False,
+          "stage": "install",
+          "clock_corrected": transfer_result.get("clock_corrected", False)}
+    start = time.time()
+    def _fail(msg):
+        st["error"] = msg
+        if loc: _update_checkpoint(loc, host, "failed", msg)
+        return (dev, "failed", time.time() - start, st, msg)
+    if SHUTDOWN_REQ.is_set(): return _fail("shutdown requested")
+    if DRY_RUN:
+        wlog(host, "DRY-RUN: skipping install", "INFO")
+        st["status"] = "success"
+        if loc: _update_checkpoint(loc, host, "verified")
+        return (dev, "success", time.time() - start, st, "")
+
+    if transfer_result.get("already_on_target_fixup"):
+        conn = None
+        try:
+            conn = robust_reconnect(ip, user, pw, host, purpose="fixup")
+            if not conn:
+                return _fail("reconnect failed before fixup")
+            if transfer_result.get("needs_finalize"):
+                set_state(host, "VERIFY", "commit finalize")
+                wlog(host, "FIXUP: install commit", "STEP")
+                if not _finalize_install_commit(conn, host, target_ver,
+                                                fw_file=fw_file):
+                    return _fail("commit could not be verified (fixup)")
+                st["post_version"] = target_ver
+                wlog(host, "commit finalized", "OK")
+            if transfer_result.get("needs_cleanup"):
+                set_state(host, "VERIFY", "revert temp config")
+                wlog(host, "FIXUP: revert residual temp config", "STEP")
+                ok_count, fail_count, _u = revert_device_temp_changes(
+                    conn, host)
+                if fail_count:
+                    wlog(host, "  revert partial: ok=%d fail=%d"
+                         % (ok_count, fail_count), "WARN")
+                else:
+                    wlog(host, "residual temp config reverted", "OK")
+                try:
+                    conn.send_command("write memory", read_timeout=60)
+                except Exception:
+                    pass
+            st["status"] = "success"
+            st["stage"] = "install"
+            if not st.get("post_version"):
+                st["post_version"] = target_ver
+            if loc: _update_checkpoint(loc, host, "verified")
+            return (dev, "success", time.time() - start, st, "")
+        except Exception as e:
+            return _fail(str(e)[:200])
+        finally:
+            if conn:
+                try: conn.disconnect()
+                except Exception: pass
+
+    conn = None
+    try:
+        conn = robust_reconnect(ip, user, pw, host, purpose="install phase")
+        if not conn: return _fail("reconnect failed before install")
+
+        if transfer_result.get("already_added"):
+            wlog(host, "Target .pkg already on flash -- issuing `install "
+                       "activate` then `install commit` (no re-add)", "OK")
+            ok1, err1, conn = _run_install_activate_only(
+                conn, host, st, ip, user, pw, target_ver, fw_file=fw_file)
+            if not ok1:
+                return _fail("activate failed: %s" % err1)
+            ok2, err2, conn = _run_install_commit_only(
+                conn, host, st, ip, user, pw, target_ver)
+            if not ok2:
+                return _fail("commit failed: %s" % err2)
+            if conn:
+                try: conn.disconnect()
+                except Exception: pass
+                conn = None
+            if not wait_reboot_and_verify(ip, target_ver, host, user, pw,
+                                          st, is_issu=False,
+                                          pre_config=pre_config,
+                                          fw_file=fw_file):
+                return (dev, "failed", time.time() - start, st,
+                        st.get("error", ""))
+            st["status"] = "success"
+            if loc: _update_checkpoint(loc, host, "verified")
+            return (dev, "success", time.time() - start, st, "")
+
+        if DO_VERIFY_MD5:
+            set_state(host, "MD5", "verify")
+            set_cmd(host, "verify /md5 flash:%s" % fw_file)
+            local_path = os.path.join(FIRMWARE_DIR, fw_file)
+            if not os.path.isfile(local_path):
+                wlog(host, "  MD5 skipped -- local firmware missing", "WARN")
+            else:
+                expected = cached_md5(local_path)
+                out = ""
+                try:
+                    out = conn.send_command(
+                        "verify /md5 flash:%s" % fw_file,
+                        read_timeout=1800)
+                    feed_live_log(host, "[verify] verify /md5\n%s" % out)
+                except Exception as e:
+                    msg = str(e)
+                    if "Pattern not detected" in msg:
+                        wlog(host, "  MD5 prompt pattern failed -- "
+                                   "retrying with send_command_timing",
+                             "WARN")
+                        try:
+                            out = conn.send_command_timing(
+                                "verify /md5 flash:%s" % fw_file,
+                                read_timeout=1800,
+                                strip_prompt=False,
+                                strip_command=False)
+                            feed_live_log(host,
+                                          "[verify] verify /md5 (timing)\n%s"
+                                          % out)
+                        except Exception as e2:
+                            wlog(host, "  MD5 timing retry failed: %s -- "
+                                       "skipping (non-fatal)"
+                                 % str(e2)[:80], "WARN")
+                            out = ""
+                    else:
+                        wlog(host, "  MD5 verify error: %s -- skipping "
+                                   "(non-fatal)" % msg[:80], "WARN")
+                        out = ""
+                if not out:
+                    wlog(host, "  MD5 not confirmed -- continuing "
+                               "(transfer SHA256 already validated)", "WARN")
+                elif expected.lower() in out.lower():
+                    st["md5_ok"] = True
+                    wlog(host, "MD5 verified", "OK")
+                else:
+                    m = re.search(
+                        r"verify /md5 \([^)]+\)\s*=\s*([0-9a-fA-F]{32})",
+                        out)
+                    if m and m.group(1).lower() != expected.lower():
+                        return _fail("MD5 mismatch: got %s expected %s"
+                                     % (m.group(1).lower(), expected.lower()))
+                    wlog(host, "  MD5 not parseable -- continuing", "WARN")
+
+        issu_ok, issu_reasons = False, ["--skip-issu"]
+        if not SKIP_ISSU:
+            issu_ok, issu_reasons = check_issu_eligibility(conn, host)
+
+        if issu_ok:
+            wlog(host, "ISSU eligible -- zero-downtime path", "OK")
+            install_cmd = ("install add file flash:%s activate issu commit"
+                           % fw_file)
+        else:
+            wlog(host, "ISSU not eligible (%s) -- reload path"
+                 % "; ".join(issu_reasons), "INFO")
+            install_cmd = "install add file flash:%s activate commit" % fw_file
+
+        success, err, conn = run_install(conn, install_cmd, host, st,
+                                         ip, user, pw, target_ver,
+                                         is_issu=issu_ok, fw_file=fw_file)
+        if not success:
+            if err and "already_added_refused" in err:
+                wlog(host, "Engine refused re-add -- switching to "
+                           "activate-only path", "WARN")
+                if conn is None:
+                    conn = robust_reconnect(ip, user, pw, host,
+                                            purpose="activate-only retry")
+                if conn:
+                    ok1, err1, conn = _run_install_activate_only(
+                        conn, host, st, ip, user, pw, target_ver,
+                        fw_file=fw_file)
+                    if ok1:
+                        ok2, err2, conn = _run_install_commit_only(
+                            conn, host, st, ip, user, pw, target_ver)
+                        if ok2:
+                            if conn:
+                                try: conn.disconnect()
+                                except Exception: pass
+                                conn = None
+                            if wait_reboot_and_verify(
+                                    ip, target_ver, host, user, pw, st,
+                                    is_issu=False, pre_config=pre_config,
+                                    fw_file=fw_file):
+                                st["status"] = "success"
+                                if loc:
+                                    _update_checkpoint(loc, host, "verified")
+                                return (dev, "success",
+                                        time.time() - start, st, "")
+                            return (dev, "failed", time.time() - start, st,
+                                    st.get("error", ""))
+                        return _fail("activate-only commit failed: %s" % err2)
+                    return _fail("activate-only failed: %s" % err1)
+                return _fail(err)
+            try:
+                if conn and not st.get("reboot_detected"):
+                    still_running = False
+                    try:
+                        probe_ok, probe_msg, _ = _probe_install_status(
+                            ip, user, pw, host, target_ver)
+                        if probe_ok and "install still running" in probe_msg:
+                            still_running = True
+                            wlog(host, "  Install still running -- skipping "
+                                       "remove-inactive", "WARN")
+                    except Exception: pass
+                    if not still_running:
+                        wlog(host, "  Clearing stale super-package", "INFO")
+                        _run_install_remove_inactive(
+                            conn, host, allow_abort=False)
+            except Exception as e:
+                wlog(host, "  Post-fail cleanup skipped: %s" % str(e)[:80],
+                     "WARN")
+            return _fail(err)
+        if conn:
+            try: conn.disconnect()
+            except Exception: pass
+            conn = None
+        if not wait_reboot_and_verify(ip, target_ver, host, user, pw, st,
+                                      is_issu=issu_ok, pre_config=pre_config,
+                                      fw_file=fw_file):
+            return (dev, "failed", time.time() - start, st,
+                    st.get("error", ""))
+        st["status"] = "success"
+        if loc: _update_checkpoint(loc, host, "verified")
+        return (dev, "success", time.time() - start, st, "")
+    except Exception as e:
+        return _fail(str(e)[:200])
+    finally:
+        if conn:
+            try: conn.disconnect()
+            except Exception: pass
+
+
+def pre_scan_devices(devices, user=None, pw=None):
+    reachable, unreachable = [], []
+    if not devices: return reachable, unreachable
+    def _chk(d):
+        if SHUTDOWN_REQ.is_set(): return d, None, ""
+        ok = ssh_port_open(d["ip"], timeout=5)
+        model = ""
+        if ok and user and pw:
+            c_ = None
+            try:
+                c_ = do_connect(d["ip"], user, pw)
+                tacacs_enable(c_, d["hostname"], ssh_pw=pw)
+                model = get_model(c_) or ""
+            except Exception: model = ""
+            finally:
+                if c_:
+                    try: c_.disconnect()
+                    except Exception: pass
+        return d, ok, model
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        for d, ok, model in ex.map(_chk, devices):
+            if ok is None: continue
+            if model: d["_model"] = model
+            (reachable if ok else unreachable).append(d)
+    small = [d for d in reachable if not _is_large_model(d.get("_model", ""))]
+    large = [d for d in reachable if _is_large_model(d.get("_model", ""))]
+    return small + large, unreachable
+
+
+def _row(dev, status, stage="", error="", st=None, duration=0,
+         attempts=1, transfer=None):
+    st = st or {}; transfer = transfer or {}
+    return {
+        "hostname": dev["hostname"], "ip": dev["ip"], "status": status,
+        "stage": stage,
+        "start_version": st.get("start_version")
+                         or transfer.get("start_ver", ""),
+        "target_version": st.get("target_version")
+                          or transfer.get("target_ver", ""),
+        "post_version": st.get("post_version", ""),
+        "fw_file": st.get("fw_file") or transfer.get("fw_file", ""),
+        "md5_ok": st.get("md5_ok", False),
+        "install_started": st.get("install_started", False),
+        "reboot_detected": st.get("reboot_detected", False),
+        "verify_pending": st.get("verify_pending", False),
+        "clock_corrected": bool(st.get("clock_corrected")
+                                or transfer.get("clock_corrected", False)),
+        "config_diff_lines": st.get("config_diff_lines", 0),
+        "duration_sec": int(duration), "attempts": attempts, "error": error,
+    }
+
+
+def is_retryable(row):
+    if row["status"] != "failed":
+        return False
+    err = (row.get("error") or "").lower()
+    if any(row["error"].startswith(p)
+           for p in NON_RETRYABLE_PREFIXES):
+        return False
+    if row["stage"] == "transfer" and not row["install_started"]:
+        return True
+    if row["stage"] == "install":
+        recoverable = (
+            "image inactive" in err
+            or "install stuck" in err
+            or "cannot activate" in err
+            or "commit could not be verified" in err
+            or "version mismatch" in err
+        )
+        non_recoverable = (
+            "md5 mismatch" in err
+            or "tacacs+ denied" in err
+            or "partial activation" in err
+            or "two committed versions" in err
+            or "insufficient_space" in err
+        )
+        return recoverable and not non_recoverable
+    return False
+
+
+def _collect_transfer_result(fut, dev, results, ifut, install_pool,
+                             user, pw, attempt_no, location_name=""):
+    host = dev["hostname"]
+    try: tr = fut.result()
+    except Exception as e:
+        tr = {"success": False, "error": str(e)[:200], "skipped": False}
+    if not tr.get("success"):
+        results[host] = _row(dev, "failed", "transfer",
+                             tr.get("error", "?"),
+                             attempts=attempt_no, transfer=tr)
+        set_state(host, "FAILED", tr.get("error", "")[:30])
+        return
+    if tr.get("skipped"):
+        results[host] = _row(dev, "skipped", "precheck",
+                             "already on target",
+                             attempts=attempt_no, transfer=tr)
+        clear_state(host)
+        return
+    if tr.get("fixup_done"):
+        results[host] = _row(dev, "success", "verify", "",
+                             attempts=attempt_no, transfer=tr)
+        set_state(host, "DONE", "fixup complete")
+        return
+    ifut[install_pool.submit(install_worker, dev, user, pw, tr,
+                             location_name)] = (dev, tr)
+
+
+def run_pass(devices, user, pw, results, attempt_no, location_name=""):
+    small, large = [], []
+    for d in devices:
+        (large if _is_large_model(d.get("_model", "")) else small).append(d)
+    if not SERIAL_TRANSFER_LARGE_MODELS:
+        small, large = devices, []
+
+    def _model_counts(lst):
+        cnt = {}
+        for d in lst:
+            m = d.get("_model", "unknown")
+            cnt[m] = cnt.get(m, 0) + 1
+        return ", ".join("%s x%d" % (k, v) for k, v in sorted(cnt.items()))
+
+    print("\n  === Transfer plan (pass %d) ===" % attempt_no)
+    if small:
+        print("    Phase 1 -- %d small model(s), parallel=%d [%s]"
+              % (len(small), TRANSFER_SLOTS, _model_counts(small)))
+    if large:
+        print("    Phase 2 -- %d large model(s), parallel=%d [%s]"
+              % (len(large), LARGE_MODEL_PARALLEL, _model_counts(large)))
+    print()
+    master_log("PASS %d plan: small=%d large=%d"
+               % (attempt_no, len(small), len(large)))
+
+    with ThreadPoolExecutor(max_workers=INSTALL_WORKERS,
+                            thread_name_prefix="inst") as ip_:
+        ifut = {}
+
+        def _consume_one(f):
+            pair = ifut.pop(f, None)
+            if pair is None:
+                return
+            d, tr = pair
+            host = d["hostname"]
+            try:
+                _, status, dur, st, err = f.result()
+            except Exception as e:
+                status, dur, st, err = "failed", 0, {}, str(e)[:200]
+            results[host] = _row(
+                d, "success" if status == "success" else "failed",
+                "install", err, st=st, duration=dur,
+                attempts=attempt_no, transfer=tr)
+            set_state(host, "DONE" if status == "success" else "FAILED",
+                      "upgraded" if status == "success" else err[:30])
+
+        def _drain_install(block):
+            keys = list(ifut.keys())
+            if not keys:
+                return
+            if block:
+                for f in as_completed(keys):
+                    _consume_one(f)
+            else:
+                for f in keys:
+                    if f.done():
+                        _consume_one(f)
+
+        def _run_phase(dev_list, workers, prefix):
+            if not dev_list:
+                return
+            with ThreadPoolExecutor(max_workers=max(1, workers),
+                                    thread_name_prefix=prefix) as tp:
+                tfut = {tp.submit(transfer_worker, d, user, pw,
+                                  location_name): d for d in dev_list}
+                pending = set(tfut.keys())
+                while pending:
+                    done, pending = wait(pending, timeout=10,
+                                         return_when=FIRST_COMPLETED)
+                    for f in done:
+                        dev = tfut.pop(f, None)
+                        if dev is None:
+                            continue
+                        _collect_transfer_result(
+                            f, dev, results, ifut, ip_,
+                            user, pw, attempt_no, location_name)
+                    _drain_install(block=False)
+
+        if small:
+            _run_phase(small, TRANSFER_SLOTS, "xfer")
+        if large:
+            workers = max(1, LARGE_MODEL_PARALLEL)
+            master_log("TRANSFER PHASE 2 start: %d large, parallel=%d"
+                       % (len(large), workers))
+            _run_phase(large, workers, "xfer-large")
+            master_log("TRANSFER PHASE 2 end: %d large" % len(large))
+
+        _drain_install(block=True)
+
+
+def _print_location_progress(by_loc, results):
+    print("\n  -- Location progress --")
+    for loc in sorted(by_loc.keys()):
+        total = len(by_loc[loc])
+        done = sum(1 for d in by_loc[loc]
+                   if results.get(d["hostname"], {}).get("status")
+                   in ("success", "skipped", "failed"))
+        succ = sum(1 for d in by_loc[loc]
+                   if results.get(d["hostname"], {}).get("status")
+                   in ("success", "skipped"))
+        fail = sum(1 for d in by_loc[loc]
+                   if results.get(d["hostname"], {}).get("status") == "failed")
+        marker = ("OK" if done == total and fail == 0
+                  else "!!" if fail else "..")
+        print("    %s %-20s %d/%d done (success=%d failed=%d)"
+              % (marker, loc, done, total, succ, fail))
+    print()
+
+
+def _report_fields():
+    return ["hostname", "ip", "status", "stage", "start_version",
+            "target_version", "post_version", "fw_file", "md5_ok",
+            "install_started", "reboot_detected", "verify_pending",
+            "clock_corrected", "config_diff_lines",
+            "duration_sec", "attempts", "error", "revert_verified"]
+
+
+def write_location_report(location_name, results, revert_verify=None,
+                          force=False):
+    key = "%s" % location_name
+    with CSV_WRITTEN_LOCK:
+        if key in CSV_WRITTEN and not force: return None
+        CSV_WRITTEN.add(key)
+    try:
+        os.makedirs(REPORT_DIR, exist_ok=True)
+        csv_path = os.path.join(REPORT_DIR,
+                                "%s_%s.csv" % (location_name, RUN_ID))
+        json_path = os.path.join(REPORT_DIR,
+                                 "%s_%s.json" % (location_name, RUN_ID))
+        fields = _report_fields()
+        for r in results.values():
+            if revert_verify and r["hostname"] in revert_verify:
+                r["revert_verified"] = ("OK"
+                                        if revert_verify[r["hostname"]]["ok"]
+                                        else "FAILED")
+            else: r["revert_verified"] = "N/A"
+        with CSV_LOCK:
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+                w.writeheader()
+                for r in sorted(results.values(),
+                                key=lambda x: x["hostname"]):
+                    w.writerow(r)
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump({"location": location_name, "run_id": RUN_ID,
+                           "revert_verify": revert_verify or {},
+                           "results": sorted(results.values(),
+                                             key=lambda x: x["hostname"])},
+                          f, indent=2)
+        print("  Report: %s" % csv_path)
+        return csv_path
+    except Exception as e:
+        master_log("Report write failed for %s: %s" % (location_name, e))
+        return None
+
+
+def run_location(location_name, devices, user, pw,
+                 resume_checkpoint=False, retry_failed=False):
+    print("\n" + "=" * 70)
+    print("  LOCATION: %s (%d devices)%s%s%s"
+          % (location_name, len(devices),
+             "  [DRY-RUN]" if DRY_RUN else "",
+             "  [RESUME]" if resume_checkpoint else "",
+             "  [RETRY-FAILED]" if retry_failed else ""))
+    print("=" * 70)
+    master_log("LOCATION START: %s devices=%d" % (location_name, len(devices)))
+    if retry_failed:
+        failed_set = _failed_hosts_from_last_report(location_name)
+        if failed_set:
+            print("  Filter: %d host(s) failed last run" % len(failed_set))
+            devices = [d for d in devices if d["hostname"] in failed_set]
+            print("  -> %d device(s) to retry" % len(devices))
+        else: print("  No failed devices from last run -- running full set")
+    if resume_checkpoint:
+        ckpt = _load_checkpoint(location_name)
+        verified = {h for h, v in ckpt.items()
+                    if v.get("stage") == "verified"}
+        if verified:
+            print("  Checkpoint: %d host(s) already verified" % len(verified))
+            devices = [d for d in devices if d["hostname"] not in verified]
+            print("  -> %d device(s) remaining" % len(devices))
+    if not devices:
+        print("  Nothing to do for this location.")
+        return {}, False, {}
+    results, aborted = {}, False
+    revert_verify = {}
+    try:
+        prepare_rollback_doc(devices, location_name)
+        reachable, unreachable = pre_scan_devices(devices, user, pw)
+        for d in unreachable:
+            results[d["hostname"]] = _row(d, "failed", "prescan",
+                                          "unreachable on tcp/22")
+            wlog(d["hostname"], "Unreachable on port 22", "ERROR")
+            _update_checkpoint(location_name, d["hostname"], "failed",
+                               "unreachable")
+        pending, attempt = reachable, 0
+        while pending and not SHUTDOWN_REQ.is_set():
+            attempt += 1
+            run_pass(pending, user, pw, results, attempt, location_name)
+            failed = [d for d in pending
+                      if results[d["hostname"]]["status"] == "failed"]
+            if (attempt == 1 and len(pending) >= ABORT_GATE_MIN_DEVICES
+                    and len(failed) / len(pending) > ABORT_GATE_THRESHOLD):
+                aborted = True
+                print("\n  ABORT GATE: %d/%d failed"
+                      % (len(failed), len(pending)))
+                master_log("ABORT GATE at %s" % location_name)
+                break
+            retry = [d for d in failed
+                     if is_retryable(results[d["hostname"]])]
+            if (not RETRY_FAILED_DEVICES or not retry
+                    or attempt > MAX_RETRIES or SHUTDOWN_REQ.is_set()):
+                break
+            print("\n  Retrying %d device(s) in %ds (retry %d/%d)"
+                  % (len(retry), RETRY_DELAY_SEC, attempt, MAX_RETRIES))
+            SHUTDOWN_REQ.wait(RETRY_DELAY_SEC)
+            pending = retry
+    except Exception as e:
+        master_log("Location %s raised: %s" % (location_name, e))
+        print("\n  Location %s raised: %s" % (location_name, e))
+    finally:
+        for d in devices:
+            results.setdefault(d["hostname"],
+                               _row(d, "failed", "not_run",
+                                    "not processed (shutdown/crash?)"))
+        try:
+            revert_verify = revert_location_temp_changes(devices, user, pw,
+                                                         location_name) or {}
+        except Exception as e:
+            master_log("Revert/verify raised: %s" % e)
+        write_location_report(location_name, results, revert_verify)
+        master_log("LOCATION END: %s" % location_name)
+    return results, aborted, revert_verify
+
+
+def _run_pooled(loc_devices, user, pw,
+                resume_checkpoint=False, retry_failed=False):
+    flat, by_loc = [], {}
+    for loc, devs in loc_devices.items():
+        by_loc[loc] = []
+        for d in devs:
+            td = {"hostname": d["hostname"], "ip": d["ip"], "_location": loc}
+            flat.append(td); by_loc[loc].append(td)
+    if retry_failed:
+        for loc in list(by_loc):
+            fs = _failed_hosts_from_last_report(loc)
+            if fs:
+                by_loc[loc] = [d for d in by_loc[loc]
+                               if d["hostname"] in fs]
+        flat = [d for loc in by_loc for d in by_loc[loc]]
+    if resume_checkpoint:
+        for loc in list(by_loc):
+            ckpt = _load_checkpoint(loc)
+            verified = {h for h, v in ckpt.items()
+                        if v.get("stage") == "verified"}
+            if verified:
+                by_loc[loc] = [d for d in by_loc[loc]
+                               if d["hostname"] not in verified]
+        flat = [d for loc in by_loc for d in by_loc[loc]]
+    if not flat:
+        print("  Nothing to do (all devices filtered).")
+        return {}, {}
+    for loc, devs in by_loc.items():
+        if devs: prepare_rollback_doc(devs, loc)
+    results = {}
+    reachable, unreachable = pre_scan_devices(flat, user, pw)
+    for d in unreachable:
+        results[d["hostname"]] = _row(d, "failed", "prescan",
+                                      "unreachable on tcp/22")
+        wlog(d["hostname"], "Unreachable on port 22", "ERROR")
+        _update_checkpoint(d["_location"], d["hostname"], "failed",
+                           "unreachable")
+    aborted_locs = set()
+    pending = reachable
+    attempt = 0
+    while pending and not SHUTDOWN_REQ.is_set():
+        attempt += 1
+        run_pass(pending, user, pw, results, attempt, location_name="")
+        _print_location_progress(by_loc, results)
+        for loc, devs in by_loc.items():
+            if loc in aborted_locs: continue
+            hosts_in = {d["hostname"] for d in devs}
+            pend_in = [d for d in pending if d["hostname"] in hosts_in]
+            if not pend_in: continue
+            fail_in = [d for d in pend_in
+                       if results.get(d["hostname"], {})
+                                 .get("status") == "failed"]
+            if (attempt == 1
+                    and len(pend_in) >= ABORT_GATE_MIN_DEVICES
+                    and len(fail_in) / max(len(pend_in), 1)
+                        > ABORT_GATE_THRESHOLD):
+                print("\n  ABORT GATE (%s): %d/%d failed -- skipping "
+                      "retries for this location"
+                      % (loc, len(fail_in), len(pend_in)))
+                master_log("ABORT GATE %s: %d/%d"
+                           % (loc, len(fail_in), len(pend_in)))
+                aborted_locs.add(loc)
+        failed = [d for d in pending
+                  if results.get(d["hostname"], {}).get("status") == "failed"
+                  and d.get("_location") not in aborted_locs]
+        retry = [d for d in failed
+                 if is_retryable(results.get(d["hostname"], {}))]
+        if (not RETRY_FAILED_DEVICES or not retry
+                or attempt > MAX_RETRIES or SHUTDOWN_REQ.is_set()):
+            break
+        print("\n  Retrying %d device(s) in %ds (retry %d/%d)"
+              % (len(retry), RETRY_DELAY_SEC, attempt, MAX_RETRIES))
+        SHUTDOWN_REQ.wait(RETRY_DELAY_SEC)
+        pending = retry
+    print("\n" + "=" * 70)
+    print("  POOLED RUN COMPLETE -- writing per-location reports")
+    print("=" * 70)
+    all_results, all_revert = {}, {}
+    for loc, devs in by_loc.items():
+        loc_res = {}
+        for d in devs:
+            r = results.get(d["hostname"])
+            if r is None:
+                r = _row(d, "failed", "not_run",
+                         "not processed (pooled run)")
+            loc_res[d["hostname"]] = r
+        all_results[loc] = loc_res
+        try:
+            rv = revert_location_temp_changes(devs, user, pw, loc) or {}
+        except Exception as e:
+            master_log("Revert for %s raised: %s" % (loc, e))
+            rv = {}
+        all_revert[loc] = rv
+        write_location_report(loc, loc_res, rv)
+    return all_results, all_revert
+
+
+def _fmt_duration(seconds):
+    seconds = int(seconds or 0)
+    if seconds < 60:
+        return "%ds" % seconds
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return "%dm%02ds" % (m, s)
+    h, m = divmod(m, 60)
+    return "%dh%02dm%02ds" % (h, m, s)
+
+
+def _device_line(r):
+    host = (r.get("hostname") or "?")[:30]
+    ip = (r.get("ip") or "?")[:15]
+    st = r.get("status", "?")
+    sv = r.get("start_version") or "?"
+    tv = r.get("target_version") or "?"
+    dur = _fmt_duration(r.get("duration_sec", 0))
+    if st == "success":
+        arrow = "%s -> %s" % (sv, tv) if sv != tv else tv
+        flags = []
+        if r.get("reboot_detected"): flags.append("reboot")
+        if r.get("md5_ok"):          flags.append("md5-ok")
+        if r.get("clock_corrected"): flags.append("clock-fix")
+        fs = ("  [" + ", ".join(flags) + "]") if flags else ""
+        mark = c("OK", "green")
+        return "%s %-30s %-15s %-28s %9s%s" % (mark, host, ip, arrow, dur, fs)
+    if st == "skipped":
+        mark = c("--", "yellow")
+        return "%s %-30s %-15s already on %-16s %9s" % (mark, host, ip, tv,
+                                                        dur)
+    stage = r.get("stage", "")
+    err = (r.get("error") or "?")[:60]
+    tag = "[%s] " % stage if stage else ""
+    mark = c("!!", "red")
+    return "%s %-30s %-15s %s%s" % (mark, host, ip, tag, err)
+
+
+def _load_previous_run_summary():
+    if not os.path.isdir(REPORT_DIR): return None
+    try:
+        names = sorted((f for f in os.listdir(REPORT_DIR)
+                        if f.startswith("run_summary_")
+                        and f.endswith(".json")
+                        and RUN_ID not in f), reverse=True)
+    except OSError:
+        return None
+    for name in names:
+        try:
+            with open(os.path.join(REPORT_DIR, name), "r",
+                      encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            continue
+    return None
+
+
+def detect_anomalies(all_results, prev_summary):
+    if not prev_summary: return []
+    prev_by = {r["hostname"]: r for r in prev_summary.get("results", [])}
+    issues = []
+    for loc, res in all_results.items():
+        for host, r in res.items():
+            prev = prev_by.get(host)
+            if not prev: continue
+            if (r["status"] == "success" and prev.get("post_version")
+                    and r.get("post_version")
+                    and r["post_version"] < prev["post_version"]):
+                issues.append((host, "version regressed: %s -> %s"
+                               % (prev["post_version"], r["post_version"])))
+            if (prev.get("status") == "success" and r["status"] == "failed"
+                    and r.get("install_started")
+                    and not prev.get("install_started")):
+                issues.append((host, "failed this run (was success last): %s"
+                               % (r.get("error") or "?")[:60]))
+    return issues
+
+
+def trend_report(all_results, lookback=5):
+    if not os.path.isdir(REPORT_DIR): return
+    try:
+        files = sorted((f for f in os.listdir(REPORT_DIR)
+                        if f.startswith("run_summary_")
+                        and f.endswith(".json")
+                        and RUN_ID not in f), reverse=True)[:lookback]
+    except OSError:
+        return
+    if len(files) < 2: return
+    history = {}
+    for fn in files:
+        try:
+            with open(os.path.join(REPORT_DIR, fn), "r",
+                      encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        for r in data.get("results", []):
+            history.setdefault(r["hostname"], []).append(r["status"])
+    chronic = [(h, s) for h, s in history.items() if s.count("failed") >= 2]
+    if chronic:
+        print("\n  CHRONIC FAILURES (last %d runs):" % len(files))
+        for h, seq in sorted(chronic):
+            print("      ! %s: %s" % (h, "/".join(seq)))
+
+
+def print_summary(all_results, all_revert=None):
+    all_revert = all_revert or {}
+    ok = skipped = failed = 0
+    print("\n" + "=" * 78)
+    print("  FINAL SUMMARY -- DEVICE DETAIL  (v%s)" % VERSION_STRING)
+    print("=" * 78)
+    for loc in sorted(all_results.keys()):
+        res = all_results[loc]
+        cnt = {"success": 0, "skipped": 0, "failed": 0}
+        for r in res.values():
+            cnt[r["status"]] = cnt.get(r["status"], 0) + 1
+        ok += cnt["success"]; skipped += cnt["skipped"]; failed += cnt["failed"]
+        rv = all_revert.get(loc, {})
+        rc = sum(1 for x in rv.values() if x.get("ok"))
+        rf = sum(1 for x in rv.values() if not x.get("ok"))
+        hdr = ("-- %s  (%d device(s) -- success=%d skipped=%d failed=%d"
+               % (loc, len(res), cnt["success"], cnt["skipped"],
+                  cnt["failed"]))
+        if rv: hdr += "  revert_ok=%d revert_fail=%d" % (rc, rf)
+        hdr += ") --"
+        print("\n  %s" % hdr)
+        print("  " + "-" * 76)
+        print("  %2s%-30s %-15s Detail" % ("", "Hostname", "IP"))
+        print("  " + "-" * 76)
+        for want in ("success", "skipped", "failed"):
+            for r in sorted((x for x in res.values() if x["status"] == want),
+                            key=lambda x: x["hostname"]):
+                print("  " + _device_line(r))
+        for h, rvr in sorted(rv.items()):
+            if not rvr.get("ok"):
+                print("      revert failed: %s -- %s"
+                      % (h, rvr.get("message", "")[:60]))
+    total = ok + skipped + failed
+    print("\n" + "=" * 78)
+    print("  TOTAL  success=%d  skipped=%d  failed=%d  (of %d)"
+          % (ok, skipped, failed, total))
+    print("=" * 78)
+    cf = sum(1 for loc in all_results.values()
+             for r in loc.values() if r.get("clock_corrected"))
+    if cf:
+        print("\n  %d device(s) had clock drift corrected during pre-check"
+              % cf)
+    manual = []
+    for loc in sorted(all_results.keys()):
+        for r in sorted(all_results[loc].values(),
+                        key=lambda x: x["hostname"]):
+            if r["status"] == "failed":
+                manual.append((loc, r))
+    if manual:
+        print("\n  %d device(s) NEED MANUAL ATTENTION:" % len(manual))
+        for loc, r in manual:
+            ip = r.get("ip", "?")
+            stage = r.get("stage", "?")
+            err = (r.get("error") or "?")[:80]
+            print("      !! %-30s (%s) [%s]" % (r["hostname"], ip, loc))
+            print("          stage=%s  error=%s" % (stage, err))
+            if r.get("install_started"):
+                print("          install was started -- check `show install log`")
+            if r.get("verify_pending"):
+                print("          verify_pending=True -- reconcilable next run")
+    try:
+        prev = _load_previous_run_summary()
+        if prev:
+            anom = detect_anomalies(all_results, prev)
+            if anom:
+                print("\n  ANOMALIES vs previous run (%s):"
+                      % prev.get("run_id", "?"))
+                for h, m in anom:
+                    print("      ! %s: %s" % (h, m))
+    except Exception: pass
+    try: trend_report(all_results, lookback=5)
+    except Exception: pass
+    with TEMP_CHANGES_LOCK:
+        pending = sorted(h for h, e in TEMP_CHANGES.items()
+                         if e.get("changes"))
+    if pending:
+        print("\n  %d device(s) still have un-reverted temp config "
+              "changes -- run with --recover" % len(pending))
+        for h in pending:
+            print("      - %s" % h)
+    print("=" * 78 + "\n")
+    return failed
+
+
+def _reconcile_failed_devices(all_results, all_revert, user, pw):
+    if not RECONCILE_FAILED_AT_END:
+        return all_results, all_revert
+    candidates = []
+    for loc, res in all_results.items():
+        for host, r in res.items():
+            if r.get("status") != "failed": continue
+            eligible = (r.get("verify_pending")
+                        or r.get("stage") in ("install", "verify", "reboot"))
+            if not eligible: continue
+            ip = r.get("ip", "")
+            target_ver = r.get("target_version", "")
+            if not ip or not target_ver: continue
+            candidates.append((loc, host, ip, target_ver, r))
+    if not candidates:
+        print("\n  Reconcile: no verify-pending failures to recheck")
+        return all_results, all_revert
+    print("\n" + "=" * 70)
+    print("  RECONCILE -- rechecking %d failed device(s)" % len(candidates))
+    print("=" * 70)
+    reconciled = 0; still_failed = 0
+    reconciled_locs = set()
+    for loc, host, ip, target_ver, r in candidates:
+        print("\n  [%s] %s -- checking for %s..." % (host, ip, target_ver),
+              flush=True)
+        c_ = None
+        ok_now = False
+        try:
+            c_ = do_connect(ip, user, pw)
+            tacacs_enable(c_, host, ssh_pw=pw)
+            if not is_privileged(c_):
+                print("    not priv-15 -- cannot verify"); continue
+            out = c_.send_command("show version | include Version",
+                                  read_timeout=60)
+            post_ver = parse_running_version(out)
+            print("    running version: %s" % post_ver)
+            if _norm_ver(post_ver) == _norm_ver(target_ver):
+                try:
+                    b = c_.send_command("show boot | include BOOT",
+                                        read_timeout=30)
+                    if "packages.conf" not in b:
+                        print("    boot var not packages.conf"); continue
+                except Exception: pass
+                fw_file = ""
+                try:
+                    fwm = pick_firmware(get_model(c_) or "")
+                    if fwm: fw_file = fwm[0]
+                except Exception: pass
+                if not _finalize_install_commit(c_, host, target_ver,
+                                                fw_file=fw_file):
+                    print("    device is on target but NOT committed -- "
+                          "will revert on next reload")
+                    r["error"] = ("on target but commit not verified -- "
+                                  "will revert on next reload")
+                    r["verify_pending"] = True
+                    continue
+                ok_now = True
+            else:
+                print("    still not on %s" % target_ver)
+        except Exception as e:
+            print("    connection failed: %s: %s"
+                  % (type(e).__name__, str(e)[:80]))
+        finally:
+            if c_:
+                try: c_.disconnect()
+                except Exception: pass
+        if ok_now:
+            print("    RECONCILED -- device is on %s" % target_ver)
+            r["status"] = "success"
+            r["stage"] = "install"
+            r["error"] = ""
+            r["post_version"] = target_ver
+            r["verify_pending"] = False
+            reconciled += 1
+            reconciled_locs.add(loc)
+        else:
+            still_failed += 1
+    print("\n" + "-" * 70)
+    print("  Reconciled (now success) : %d" % reconciled)
+    print("  Still failed             : %d" % still_failed)
+    print("-" * 70 + "\n")
+    for loc in reconciled_locs:
+        loc_res = all_results.get(loc, {})
+        rv = all_revert.get(loc, {})
+        write_location_report(loc, loc_res, rv, force=True)
+    return all_results, all_revert
+
+
+def write_run_summary(all_results, all_revert, run_id, path):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        flat = []
+        for loc in sorted(all_results.keys()):
+            for r in sorted(all_results[loc].values(),
+                            key=lambda x: x["hostname"]):
+                row = dict(r); row["location"] = loc
+                flat.append(row)
+        summary = {
+            "run_id": run_id,
+            "timestamp": datetime.now().isoformat(),
+            "version_string": VERSION_STRING,
+            "totals": {
+                "success": sum(1 for r in flat if r["status"] == "success"),
+                "skipped": sum(1 for r in flat if r["status"] == "skipped"),
+                "failed":  sum(1 for r in flat if r["status"] == "failed"),
+                "total":   len(flat)},
+            "by_location": {
+                loc: {"success": sum(1 for r in all_results[loc].values()
+                                     if r["status"] == "success"),
+                      "skipped": sum(1 for r in all_results[loc].values()
+                                     if r["status"] == "skipped"),
+                      "failed": sum(1 for r in all_results[loc].values()
+                                    if r["status"] == "failed"),
+                      "revert_failed": sum(
+                          1 for x in all_revert.get(loc, {}).values()
+                          if not x.get("ok"))}
+                for loc in sorted(all_results.keys())},
+            "results": flat}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+        print("  Summary: %s" % path)
+        return path
+    except Exception as e:
+        master_log("run_summary err: %s" % e)
+        return None
+
+
+_HTML_TPL = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Cisco Upgrade Run {rid}</title>
+<style>
+ body {{ font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+         margin: 24px; color: #222; }}
+ h1 {{ font-size: 20px; margin-bottom: 4px; }}
+ .meta {{ color: #666; font-size: 13px; margin-bottom: 20px; }}
+ table {{ border-collapse: collapse; width: 100%; margin-bottom: 24px; }}
+ th, td {{ padding: 6px 10px; border-bottom: 1px solid #e5e5e5;
+           text-align: left; font-size: 13px; }}
+ th {{ background: #f5f5f5; font-weight: 600; }}
+ tr.s-success td:first-child {{ color: #1a7f37; }}
+ tr.s-failed  td:first-child {{ color: #b62324; }}
+ tr.s-skipped td:first-child {{ color: #8a6d00; }}
+ .totals {{ display: flex; gap: 20px; margin-bottom: 24px; font-size: 14px; }}
+ .totals span {{ padding: 4px 10px; border-radius: 4px; background: #f5f5f5; }}
+ .badge {{ display: inline-block; padding: 1px 6px; border-radius: 3px;
+           background: #eef; font-size: 11px; color: #335; }}
+</style></head><body>
+<h1>Cisco IOS-XE Upgrade -- Run {rid}</h1>
+<div class="meta">Version {ver} &middot; {ts}</div>
+<div class="totals">
+ <span>success={s}</span><span>skipped={k}</span>
+ <span>failed={f}</span><span>total={t}</span>
+</div>
+{blocks}
+</body></html>"""
+
+_HTML_LOC = """<h2>{loc} -- {n} device(s)</h2>
+<table><tr><th>Status</th><th>Hostname</th><th>IP</th>
+<th>Start</th><th>Target</th><th>Post</th><th>Duration</th><th>Error</th></tr>
+{rows}</table>"""
+
+
+def _html_escape(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def write_html_report(all_results, path, run_id=None):
+    run_id = run_id or RUN_ID
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tot = {"success": 0, "skipped": 0, "failed": 0}
+        blocks = []
+        for loc in sorted(all_results.keys()):
+            rows = []
+            for r in sorted(all_results[loc].values(),
+                            key=lambda x: x["hostname"]):
+                tot[r["status"]] = tot.get(r["status"], 0) + 1
+                dur = _fmt_duration(r.get("duration_sec", 0))
+                err = _html_escape(r.get("error", "")[:100])
+                flags = []
+                if r.get("reboot_detected"): flags.append("reboot")
+                if r.get("md5_ok"):          flags.append("md5")
+                if r.get("clock_corrected"): flags.append("clock")
+                fh = (" " + " ".join('<span class="badge">%s</span>' % f
+                                     for f in flags)) if flags else ""
+                rows.append(
+                    '<tr class="s-%s"><td>%s</td><td>%s%s</td><td>%s</td>'
+                    '<td>%s</td><td>%s</td><td>%s</td><td>%s</td>'
+                    '<td>%s</td></tr>'
+                    % (r["status"], r["status"],
+                       _html_escape(r["hostname"]), fh,
+                       _html_escape(r["ip"]),
+                       _html_escape(r.get("start_version", "")),
+                       _html_escape(r.get("target_version", "")),
+                       _html_escape(r.get("post_version", "")),
+                       dur, err))
+            blocks.append(_HTML_LOC.format(
+                loc=_html_escape(loc), n=len(all_results[loc]),
+                rows="\n".join(rows)))
+        html = _HTML_TPL.format(
+            rid=run_id, ver=VERSION_STRING,
+            ts=datetime.now().isoformat(timespec="seconds"),
+            s=tot["success"], k=tot["skipped"], f=tot["failed"],
+            t=sum(tot.values()), blocks="\n".join(blocks))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+        print("  HTML: %s" % path)
+        return path
+    except Exception as e:
+        master_log("HTML err: %s" % e)
+        return None
+
+
+def post_run_health_snapshot(all_results, user, pw, path):
+    devices = []
+    for loc, res in all_results.items():
+        for r in res.values():
+            if r["status"] in ("success", "skipped"):
+                devices.append((r["hostname"], r["ip"]))
+    if not devices: return
+    print("\n  -- Post-run health snapshot (%d device(s)) --" % len(devices))
+    def _chk(host, ip):
+        cc = None
+        try:
+            cc = do_connect(ip, user, pw)
+            tacacs_enable(cc, host, ssh_pw=pw)
+            ver = cc.send_command("show version | include Version",
+                                  read_timeout=60)
+            m = re.search(r"Version ([\w.()]+)", ver)
+            boot = cc.send_command("show boot | include BOOT",
+                                   read_timeout=60)
+            switch = ""
+            try:
+                switch = cc.send_command("show switch", read_timeout=60)
+            except Exception: pass
+            rows = _SWITCH_ROW_RE.findall(switch)
+            nr = sum(1 for _, st in rows
+                     if st.lower() not in ("ready", "standby"))
+            return {"hostname": host, "ip": ip,
+                    "version": m.group(1) if m else "?",
+                    "boot_ok": "packages.conf" in boot,
+                    "stack_members": len(rows), "stack_not_ready": nr,
+                    "ts": datetime.now().isoformat(timespec="seconds")}
+        except Exception as e:
+            return {"hostname": host, "ip": ip, "version": "?",
+                    "boot_ok": False, "stack_members": 0,
+                    "stack_not_ready": 0, "error": str(e)[:80],
+                    "ts": datetime.now().isoformat(timespec="seconds")}
+        finally:
+            if cc:
+                try: cc.disconnect()
+                except Exception: pass
+    snaps = []
+    with ThreadPoolExecutor(max_workers=min(20, len(devices))) as ex:
+        for f in as_completed([ex.submit(_chk, h, ip)
+                               for h, ip in devices]):
+            snaps.append(f.result())
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"run_id": RUN_ID, "snapshots": snaps}, f, indent=2)
+        print("  Health: %s" % path)
+    except Exception as e:
+        master_log("health err: %s" % e)
+
+
+def save_inventory_cache(devices, path):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"ts": time.time(), "run_id": RUN_ID,
+                       "version_string": VERSION_STRING,
+                       "devices": devices}, f, indent=2)
+        print("  Inventory cache: %s" % path)
+        return True
+    except Exception as e:
+        master_log("inv err: %s" % e)
+        return False
+
+
+def load_inventory_cache(path, max_age_sec=86400):
+    if not os.path.isfile(path): return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        age = time.time() - data.get("ts", 0)
+        if age > max_age_sec:
+            print("  (Inventory cache is %.1fh old -- ignoring)"
+                  % (age/3600))
+            return None
+        print("  (Reusing inventory cache from %.0fm ago)" % (age/60))
+        return data.get("devices", [])
+    except Exception:
+        return None
+
+
+def filter_only_upgrade_needed(devices, user, pw):
+    need, target, unreach = [], [], []
+    def _chk(d):
+        host, ip = d["hostname"], d["ip"]
+        cc = None
+        try:
+            cc = do_connect(ip, user, pw)
+            tacacs_enable(cc, host, ssh_pw=pw)
+            if not is_privileged(cc):
+                return d, "other", ""
+            model = get_model(cc) or ""
+            fw = pick_firmware(model)
+            if not fw:
+                return d, "other", "unsupported model '%s'" % model
+            _, tg = fw
+            ver = cc.send_command("show version | include Version",
+                                  read_timeout=60)
+            return d, ("target"
+                       if _norm_ver(parse_running_version(ver))
+                       == _norm_ver(tg) else "needs"), tg
+        except Exception as e:
+            return d, "unreach", str(e)[:80]
+        finally:
+            if cc:
+                try: cc.disconnect()
+                except Exception: pass
+    with ThreadPoolExecutor(max_workers=min(20, max(len(devices), 1))) as ex:
+        for d, st, info in ex.map(_chk, devices):
+            if st == "needs":    need.append((d, info))
+            elif st == "target": target.append((d, info))
+            elif st == "unreach": unreach.append((d, info))
+            else:                need.append((d, info))
+    return need, target, unreach
+
+
+def print_change_preview(all_devices, user, pw):
+    print("\n" + "=" * 70)
+    print("  CHANGE PREVIEW (read-only)")
+    print("=" * 70)
+    rows = []
+    def _chk(d):
+        host, ip = d["hostname"], d["ip"]
+        cc = None
+        try:
+            cc = do_connect(ip, user, pw)
+            tacacs_enable(cc, host, ssh_pw=pw)
+            model = get_model(cc) or "?"
+            fw = pick_firmware(model)
+            tg = fw[1] if fw else "?"
+            vo = cc.send_command("show version | include Version",
+                                 read_timeout=60)
+            cur = parse_running_version(vo) or "?"
+            action = ("skip (already on target)"
+                      if _norm_ver(cur) == _norm_ver(tg)
+                      else "upgrade -> %s" % tg if fw
+                      else "unsupported model")
+            return (host, ip, model, cur, tg, action)
+        except Exception as e:
+            return (host, ip, "?", "?", "?",
+                    "unreachable: %s" % str(e)[:40])
+        finally:
+            if cc:
+                try: cc.disconnect()
+                except Exception: pass
+    with ThreadPoolExecutor(max_workers=min(20,
+                                            max(len(all_devices), 1))) as ex:
+        for row in ex.map(_chk, all_devices):
+            rows.append(row)
+    wc = [r for r in rows if r[5].startswith("upgrade")]
+    ws = [r for r in rows if r[5].startswith("skip")]
+    wf = [r for r in rows if r[5].startswith("unreachable")
+          or r[5] == "unsupported model"]
+    print("  %2s %-30s %-15s %-18s %-12s Action"
+          % ("", "Hostname", "IP", "Model", "Current"))
+    print("  " + "-" * 100)
+    for host, ip, model, cur, tg, action in sorted(rows):
+        mk = (">" if action.startswith("upgrade")
+              else "-" if action.startswith("skip") else "X")
+        print("  %s  %-30s %-15s %-18s %-12s %s"
+              % (mk, host, ip, model, cur, action))
+    print("  " + "-" * 100)
+    print("  %d will upgrade, %d already on target, %d need attention"
+          % (len(wc), len(ws), len(wf)))
+    print("=" * 70 + "\n")
+    return wc, ws, wf
+
+
+def estimate_runtime(all_devices, user, pw):
+    print("\n" + "=" * 70)
+    print("  RUNTIME ESTIMATE (no changes made)")
+    print("=" * 70)
+    rows = []
+    def _chk(d):
+        host, ip = d["hostname"], d["ip"]
+        cc = None
+        try:
+            cc = do_connect(ip, user, pw)
+            tacacs_enable(cc, host, ssh_pw=pw)
+            model = get_model(cc) or "?"
+            fw = pick_firmware(model)
+            if not fw: return (host, ip, model, "?", 0)
+            fwf, tg = fw
+            vo = cc.send_command("show version | include Version",
+                                 read_timeout=60)
+            cur = parse_running_version(vo) or "?"
+            return (host, ip, model, cur, get_firmware_size(fwf))
+        except Exception:
+            return (host, ip, "?", "?", 0)
+        finally:
+            if cc:
+                try: cc.disconnect()
+                except Exception: pass
+    with ThreadPoolExecutor(max_workers=min(20,
+                                            max(len(all_devices), 1))) as ex:
+        rows = list(ex.map(_chk, all_devices))
+    total_s = 0
+    for host, ip, model, cur, sz in sorted(rows):
+        per = 30 + (sz / 20e6) + 120 + 600 + 480 + 180 + 90
+        total_s += per
+    parallel = max(1, min(TRANSFER_SLOTS, INSTALL_WORKERS))
+    wall = total_s / parallel
+    print("  %d device(s), ~%d concurrent pipelines" % (len(rows), parallel))
+    if rows:
+        print("  Per-device avg: %s"
+              % _fmt_duration(int(total_s / max(len(rows), 1))))
+    print("  Estimated wall time: %s (+/-40%%)" % _fmt_duration(int(wall)))
+    print("=" * 70 + "\n")
+    return 0
+
+
+def prompt_resume_or_abort(stale_files):
+    print("\n  Un-reverted temp-config state from an earlier run exists:")
+    for s in stale_files:
+        print("     - %s" % s)
+    print("\n  Options:")
+    print("    [R] Resume -- skip already-verified devices")
+    print("    [S] Skip failed -- retry only previously failed devices")
+    print("    [A] Abort -- exit cleanly (--recover to revert temp config)")
+    try:
+        ans = input("  Choice [R/S/A]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return "abort"
+    if ans.startswith("r"): return "resume"
+    if ans.startswith("s"): return "skip"
+    return "abort"
+
+
+_CONFIG_KEYS = {
+    "LOCATIONS_TO_RUN", "TRANSFER_SLOTS", "INSTALL_WORKERS",
+    "MAX_SAFE_SSH_SESSIONS", "PRESERVE_ROLLBACK", "MIN_FREE_BYTES",
+    "EXTRA_HEADROOM_BYTES", "STACK_MEMBER_HEADROOM", "RETRY_FAILED_DEVICES",
+    "MAX_RETRIES", "RETRY_DELAY_SEC", "ABORT_GATE_THRESHOLD",
+    "ABORT_GATE_MIN_DEVICES", "SCP_TIMEOUT_SEC", "SCP_MAX_ATTEMPTS",
+    "SCP_RETRY_DELAY", "SCP_STALL_TIMEOUT", "SCP_PROGRESS_POLL",
+    "ENABLE_SCP_MONITOR", "USE_PSCP", "PSCP_TRANSFER_FALLBACK",
+    "TRANSFER_RETRY_ATTEMPTS", "TRANSFER_RETRY_DELAY_SEC",
+    "TRANSFER_VERIFY_TIMEOUT", "VERIFY_TRANSFER_HASH",
+    "LARGE_MODEL_PARALLEL", "USE_PARAMIKO_TUNED", "PARAMIKO_PRIMARY",
+    "PARAMIKO_CHANNEL_CHUNK", "PARAMIKO_WINDOW_BYTES",
+    "PARAMIKO_DISABLE_REKEY", "CHEAP_CRYPTO_TUNING", "CHEAP_CIPHER",
+    "CHEAP_MAC", "PREFER_CHEAP_CIPHERS", "BULK_MODE_WINDOW_SIZE",
+    "LEGACY_WINDOW_SIZE", "RECONNECT_MAX_ATTEMPTS", "RECONNECT_DELAY_SEC",
+    "PING_TIMEOUT_MS", "PING_DOWN_POLL_SEC", "PING_DOWN_TIMEOUT_SEC",
+    "PING_UP_POLL_SEC", "PING_UP_TIMEOUT_SEC", "PING_STABILITY_SEC",
+    "POST_REBOOT_SSH_WAIT_SEC", "POST_REBOOT_SETTLE_SEC",
+    "POST_REBOOT_MAX_ATTEMPTS", "POST_REBOOT_DELAY_SEC",
+    "PROBE_CONNECT_RETRIES", "PROBE_CONNECT_DELAY_SEC",
+    "RECONCILE_FAILED_AT_END", "HEALTH_RETRIES", "HEALTH_RETRY_DELAY_SEC",
+    "INSTALL_TOTAL_TIMEOUT", "INSTALL_SILENT_TIMEOUT",
+    "INSTALL_PROBE_INTERVAL", "ISSU_VERIFY_TIMEOUT", "ISSU_VERIFY_MAX_ERRORS",
+    "COMMIT_VERIFY_TIMEOUT", "COMMIT_VERIFY_RETRY_SEC",
+    "SESSION_SLOT_ACQUIRE_TIMEOUT",
+    "DO_BACKUP", "DO_VERIFY_MD5", "WIPE_BEFORE_TRANSFER",
+    "DO_RESET_DEVICE_LOGS", "PRE_SAVE_CONFIG", "SKIP_CONFIG_DRIFT_CHECK",
+    "ALLOW_BUNDLE_MODE_CONVERSION", "POOL_LOCATIONS",
+    "REVERT_TEMP_CONFIG_POST_LOCATION", "REVERT_MAX_ATTEMPTS",
+    "REVERT_RETRY_DELAY_SEC", "REVERT_UPTIME_GATE_MIN",
+    "REVERT_WRITE_MEMORY", "REVERT_VERIFY_AFTER", "LIVE_LOG_PANEL_PHASES",
+    "LIVE_LOG_FEED_TRANSFER", "LARGE_MODEL_PREFIXES",
+    "SERIAL_TRANSFER_LARGE_MODELS", "BACKUP_MAX_FILES",
+    "BACKUP_MAX_SIZE_GB", "LOG_ARCHIVE_MAX_DAYS", "LOG_ARCHIVE_MAX_SIZE_GB",
+    "CLOCK_DRIFT_WARN_SEC", "CLOCK_DRIFT_FIX_SEC", "STRICT_FAMILY_CHECK",
+    "MONITOR_INTERVAL", "LOG_MAX_AGE_DAYS", "LOG_MAX_SIZE_GB",
+    "MODEL_FIRMWARE_MAP", "MODELS_REQUIRING_SSH_TUNE",
+    "FAMILY_SIZE_BOUNDS_STRICT", "MAX_FIRMWARE_BYTES",
+    "MIN_FIRMWARE_BYTES", "DASHBOARD_REPAINT_SEC",
+    "EXTRACTION_OVERHEAD_FACTOR", "ALLOW_ACTIVE_PKG_PURGE",
+}
+
+
+def apply_config_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print("  Could not read config file %s: %s" % (path, e))
+        return False
+    g = globals()
+    for k, v in data.items():
+        if k not in _CONFIG_KEYS:
+            print("  Config key not recognized: %s" % k); continue
+        if k == "MODEL_FIRMWARE_MAP":
+            v = [tuple(x) for x in v]
+            v.sort(key=lambda x: -len(x[0]))
+        if k in ("MODELS_REQUIRING_SSH_TUNE", "LARGE_MODEL_PREFIXES",
+                 "LIVE_LOG_PANEL_PHASES"):
+            v = tuple(v)
+        g[k] = v
+    print("  Loaded config: %s" % path)
+    return True
+
+
+_SIG_COUNT = [0]
+
+
+def _on_signal(signum, frame):
+    _SIG_COUNT[0] += 1
+    if _SIG_COUNT[0] == 1:
+        SHUTDOWN_REQ.set()
+        msg = ("\n  !! Shutdown requested -- finishing safely; temp config "
+               "will be reverted.\n  !! Press Ctrl-C again to force exit.\n")
+    else:
+        msg = "\n  !! Forced exit. Run --recover afterwards.\n"
+    try: os.write(2, msg.encode("utf-8", "replace"))
+    except Exception: pass
+    if _SIG_COUNT[0] >= 2: os._exit(130)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Cisco IOS-XE upgrade orchestrator v%s" % VERSION_STRING)
+    for a in ("--base-dir", "--config", "--user", "--enable-pass",
+              "--enable-user"):
+        p.add_argument(a)
+    p.add_argument("--locations", nargs="+")
+    for a in ("--dry-run", "--skip-issu", "--auto-rollback", "--no-pause",
+              "--yes", "--precache-hostkeys", "--ignore-stale-state",
+              "--force-run-with-stale-state", "--resume", "--recover",
+              "--revert-only", "--dry-run-revert", "--preflight-only",
+              "--inventory", "--check", "--rollback", "--rollback-dry-run",
+              "--no-verify-revert", "--show-live-transfer",
+              "--no-serial-large", "--no-drift-check", "--no-hash-verify",
+              "--no-reconcile", "--resume-checkpoint", "--retry-failed",
+              "--write-manifest", "--verify-mapping", "--validate",
+              "--no-bundle-mode", "--no-pool-locations", "--paramiko-primary",
+              "--allow-lenient-firmware", "--allow-active-pkg-purge"):
+        p.add_argument(a, action="store_true")
+    p.add_argument("--allow-bundle-mode", action="store_true", default=None)
+    p.add_argument("--pool-locations", action="store_true", default=None)
+    p.add_argument("--parallel-large", type=int, default=None, metavar="N")
+    p.add_argument("--bulk-window", type=int, default=None, metavar="N")
+    p.add_argument("--limit", nargs="+")
+    p.add_argument("--exclude", nargs="+")
+    p.add_argument("--hosts", nargs="+")
+    p.add_argument("--version", action="version",
+                   version="cisco_upgrade v%s" % VERSION_STRING)
+    p.add_argument("--only-upgrade-needed", action="store_true")
+    p.add_argument("--preview", action="store_true")
+    p.add_argument("--preview-only", action="store_true")
+    p.add_argument("--quiet-skipped", action="store_true")
+    p.add_argument("--no-html-report", action="store_true")
+    p.add_argument("--no-health-snapshot", action="store_true")
+    p.add_argument("--use-inventory-cache", action="store_true")
+    p.add_argument("--no-colour", "--no-color", action="store_true",
+                   dest="no_colour")
+    p.add_argument("--estimate-only", action="store_true")
+    p.add_argument("--interactive-resume", action="store_true")
+    return p.parse_args()
+
+
+def get_credentials(args):
+    user = (args.user or os.environ.get("CISCO_USER")
+            or input("  SSH username: ").strip())
+    pw = os.environ.get("CISCO_PASS") or getpass("  SSH password: ")
+    return user, pw
+
+
+def confirm(msg, assume_yes=False):
+    if assume_yes: return True
+    try:
+        return input("%s [y/N]: " % msg).strip().lower() in ("y", "yes")
+    except EOFError: return False
+
+
+def filter_devices(devices, args):
+    if args.hosts:
+        wanted = {h.strip() for h in args.hosts}
+        return [d for d in devices if d["hostname"] in wanted]
+    out = devices
+    if args.limit:
+        wanted = {h.strip() for h in args.limit}
+        out = [d for d in out if d["hostname"] in wanted]
+    if args.exclude:
+        skip = {h.strip() for h in args.exclude}
+        out = [d for d in out if d["hostname"] not in skip]
+    return out
+
+
+def mode_dry_run_revert():
+    n = load_state_for_recovery(consume=False)
+    if not n:
+        print("  No recorded temp changes found."); return 0
+    hostmap = build_host_ip_map()
+    print("\n  %d device(s) have un-reverted temp changes:\n" % n)
+    with TEMP_CHANGES_LOCK:
+        snap = {h: list(e["changes"]) for h, e in TEMP_CHANGES.items()}
+    for host in sorted(snap):
+        ip = hostmap.get(host, "??? (not in any location file)")
+        print("  %s  (%s)" % (host, ip))
+        for ch in snap[host]:
+            print("      - %s: %s" % (ch["type"], json.dumps(ch["details"])))
+    print("\n  (nothing changed; use --recover to apply)")
+    return 0
+
+
+def mode_recover(args, locations_filter=None):
+    n = load_state_for_recovery(consume=True)
+    if not n:
+        print("  No recorded temp changes found."); return 0
+    hostmap = build_host_ip_map()
+    if locations_filter:
+        allowed = set()
+        for loc in locations_filter:
+            p = os.path.join(LOCATIONS_DIR, "%s.txt" % loc)
+            if os.path.isfile(p):
+                allowed |= {d["hostname"] for d in load_location(p)}
+            else:
+                print("  Missing location file: %s" % p)
+        hosts = [h for h in list(TEMP_CHANGES) if h in allowed]
+    else:
+        hosts = list(TEMP_CHANGES)
+    devices, unknown = [], []
+    for h in hosts:
+        if h in hostmap:
+            devices.append({"hostname": h, "ip": hostmap[h]})
+        else: unknown.append(h)
+    if unknown: print("  No IP known for: %s" % ", ".join(unknown))
+    if not devices: return 1 if unknown else 0
+    if not confirm("  Revert temp config on %d device(s)?" % len(devices),
+                   args.yes):
+        print("  Aborted (state kept)."); return 1
+    user, pw = get_credentials(args)
+    _, no_conn, failed, expected = revert_devices(devices, user, pw,
+                                                  "RECOVERY")
+    rc = 1 if (no_conn or failed or unknown) else 0
+    if REVERT_VERIFY_AFTER and expected:
+        rv = verify_revert_clean(devices, user, pw, "RECOVERY", expected)
+        if rv and any(not r.get("ok") for r in rv.values()):
+            rc = 1
+    return rc
+
+
+def mode_inventory(devices, user, pw):
+    print("\n  INVENTORY")
+    print("  " + "-" * 68)
+    out_devices = []
+    for d in devices:
+        host, ip = d["hostname"], d["ip"]
+        c_ = None
+        try:
+            c_ = do_connect(ip, user, pw)
+            tacacs_enable(c_, host, ssh_pw=pw)
+            model = get_model(c_) or "?"
+            ver_out = c_.send_command("show version | include Version")
+            ver = parse_running_version(ver_out) or "?"
+            boot = c_.send_command("show boot | include BOOT")
+            mode = "install" if "packages.conf" in boot else "bundle"
+            free = get_flash_free_bytes(c_)
+            flag = "LARGE" if _is_large_model(model) else "small"
+            vt = get_ios_xe_version_tuple(c_)
+            tier = _bulk_mode_tier(vt) or "?"
+            bulk = ("bulk" if _verify_config_line(c_, "ip ssh bulk-mode")
+                    else "no-bulk")
+            print("  %-32s %-15s %-18s ver=%-12s mode=%-7s free=%s %s "
+                  "tier=%s %s"
+                  % (host, ip, model, ver, mode, _fmt_bytes(free), flag,
+                     tier, bulk))
+            out_devices.append({"hostname": host, "ip": ip, "model": model,
+                                "version": ver, "mode": mode,
+                                "free_bytes": free, "tier": tier,
+                                "bulk": bulk})
+        except Exception as e:
+            tag = _classify_connect_error(e)
+            print("  %-32s %-15s ERROR: %s"
+                  % (host, ip, tag or str(e)[:60]))
+        finally:
+            if c_:
+                try: c_.disconnect()
+                except Exception: pass
+    try:
+        save_inventory_cache(out_devices,
+                             os.path.join(BASE_DIR, "inventory_cache.json"))
+    except Exception: pass
+    return 0
+
+
+def mode_check(devices, user, pw):
+    print("\n  VERSION CHECK")
+    print("  " + "-" * 68)
+    for d in devices:
+        host, ip = d["hostname"], d["ip"]
+        c_ = None
+        try:
+            c_ = do_connect(ip, user, pw)
+            tacacs_enable(c_, host, ssh_pw=pw)
+            model = get_model(c_) or ""
+            fw = pick_firmware(model)
+            if not fw:
+                print("  %-32s unsupported model '%s'" % (host, model))
+                continue
+            _, target_ver = fw
+            ver_out = c_.send_command("show version | include Version")
+            cur = parse_running_version(ver_out) or "?"
+            status = ("OK (target)"
+                      if _norm_ver(cur) == _norm_ver(target_ver)
+                      else "upgrade needed -> %s" % target_ver)
+            print("  %-32s %-15s current=%-14s %s"
+                  % (host, ip, cur, status))
+        except Exception as e:
+            tag = _classify_connect_error(e)
+            print("  %-32s %-15s ERROR: %s"
+                  % (host, ip, tag or str(e)[:60]))
+        finally:
+            if c_:
+                try: c_.disconnect()
+                except Exception: pass
+    return 0
+
+
+def mode_rollback(devices, user, pw, args, dry=False):
+    verb = "DRY-RUN " if dry else ""
+    if not confirm("  %sIssue `install rollback to committed` on "
+                   "%d device(s)?" % (verb, len(devices)), args.yes):
+        print("  Aborted."); return 1
+    print("\n  ROLLBACK%s" % (" (DRY-RUN)" if dry else ""))
+    print("  " + "-" * 68)
+    rc = 0
+    for d in devices:
+        host, ip = d["hostname"], d["ip"]
+        conn = None
+        try:
+            conn = do_connect(ip, user, pw)
+            tacacs_enable(conn, host, ssh_pw=pw)
+            cur = ""
+            try:
+                _o = conn.send_command("show version | include Version",
+                                       read_timeout=30)
+                cur = parse_running_version(_o)
+            except Exception: pass
+            if dry:
+                try:
+                    summ = conn.send_command("show install summary",
+                                             read_timeout=60)
+                    feed_live_log(host,
+                                  "[rollback-dry] show install summary\n%s"
+                                  % summ)
+                    entries = _parse_install_summary(summ)
+                    inactive = [v for v, s in entries.items() if s == "I"]
+                    print("  %-32s current=%-14s inactive_images=%d %s"
+                          % (host, cur, len(inactive),
+                             "(rollback possible)" if inactive
+                             else "(no inactive image)"))
+                except Exception as e:
+                    print("  %-32s DRY-RUN ERROR: %s" % (host, str(e)[:60]))
+                    rc = 1
+            else:
+                if attempt_rollback(conn, host, ip=ip, user=user, pw=pw,
+                                    original_version=cur):
+                    print("  %-32s rollback issued" % host)
+                else:
+                    print("  %-32s rollback FAILED" % host); rc = 1
+        except Exception as e:
+            tag = _classify_connect_error(e)
+            print("  %-32s ERROR: %s" % (host, tag or str(e)[:60])); rc = 1
+        finally:
+            if conn:
+                try: conn.disconnect()
+                except Exception: pass
+    return rc
+
+
+def mode_verify_mapping(devices, user, pw):
+    print("\n  FIRMWARE MAPPING VERIFICATION")
+    print("  " + "-" * 68)
+    for d in devices:
+        host, ip = d["hostname"], d["ip"]
+        c_ = None
+        try:
+            c_ = do_connect(ip, user, pw)
+            tacacs_enable(c_, host, ssh_pw=pw)
+            model = get_model(c_) or ""
+            fw = pick_firmware(model)
+            if not fw:
+                print("  %-32s %-18s UNSUPPORTED" % (host, model))
+                continue
+            fwf, tg = fw
+            ok, reason = verify_model_firmware_consistency(model, fwf, tg)
+            print("  %-32s %-18s %-42s %s"
+                  % (host, model, fwf, "OK" if ok else reason))
+        except Exception as e:
+            tag = _classify_connect_error(e)
+            print("  %-32s ERROR: %s" % (host, tag or str(e)[:60]))
+        finally:
+            if c_:
+                try: c_.disconnect()
+                except Exception: pass
+    return 0
+
+
+def _validate():
+    passed, failed = [], []
+    def _t(name, fn):
+        try:
+            fn(); passed.append(name)
+        except AssertionError as e:
+            failed.append((name, "assertion: %s" % e))
+        except Exception as e:
+            failed.append((name, "%s: %s" % (type(e).__name__, e)))
+
+    def t_family():
+        assert _family_for_model("C9200L-24P") == ("lite", "_lite_")
+        assert _family_for_model("C9300-48P") == ("full", None)
+        assert _family_for_model("C9500-24Y4C") == ("full", None)
+        assert _family_for_model("C9200CX-8P") == ("lite", "_lite_")
+        assert _family_for_model("") == (None, None)
+        assert _family_for_model("Unknown") == (None, None)
+    _t("_family_for_model", t_family)
+
+    def t_size():
+        assert _family_size_ok("lite", 500_000_000)[0]
+        assert not _family_size_ok("lite", 1_500_000_000)[0]
+        assert _family_size_ok("full", 1_200_000_000)[0]
+        assert not _family_size_ok("full", 400_000_000)[0]
+        assert _family_size_ok(None, 0)[0]
+    _t("_family_size_ok", t_size)
+
+    def t_norm():
+        raw = "\n".join([
+            "Building configuration...",
+            "Current configuration : 2345 bytes",
+            "!", "! Last configuration change at 12:00",
+            "version 17.18", "hostname SW1", "!",
+            "endpoint-tracking", "end-user-acl 1", "end", "",
+            "3d04h: %SYS-5-CONFIG_I: Configured from console"])
+        out = _normalize_config(raw)
+        assert "version 17.18" in out
+        assert "hostname SW1" in out
+        assert "endpoint-tracking" in out
+        assert "end-user-acl 1" in out
+        assert "end" not in out
+        assert all(not l.startswith("!") for l in out)
+    _t("_normalize_config keeps endpoint-* lines", t_norm)
+
+    def t_drift_noise():
+        assert _is_drift_noise("- exec-timeout 60 0")
+        assert _is_drift_noise("+ exec-timeout 30 0")
+        assert _is_drift_noise("- ip ssh bulk-mode window-size 131072")
+        assert _is_drift_noise("+ ip scp server enable")
+        assert not _is_drift_noise("+ hostname SW1")
+        assert not _is_drift_noise("+++ b/file")
+        assert not _is_drift_noise("--- a/file")
+    _t("config-drift noise filters both sides", t_drift_noise)
+
+    def t_norm_ver():
+        assert _norm_ver("17.18.04") == "17.18.4"
+        assert _norm_ver("17.18.4")  == "17.18.4"
+        assert _norm_ver("") == ""
+        assert _norm_ver(None) == ""
+        assert _norm_ver("garbage") == "garbage"
+    _t("_norm_ver", t_norm_ver)
+
+    def t_member_required():
+        fw = 478_710_000
+        need_act_have = _member_required_bytes(
+            fw, True, bin_already_present=True, is_standby=False)
+        assert 550_000_000 < need_act_have < 650_000_000, need_act_have
+        need_act_no = _member_required_bytes(
+            fw, True, bin_already_present=False, is_standby=False)
+        assert 1_050_000_000 < need_act_no < 1_100_000_000, need_act_no
+        need_stby = _member_required_bytes(
+            fw, True, bin_already_present=True, is_standby=True)
+        assert 1_050_000_000 < need_stby < 1_100_000_000, need_stby
+        assert need_stby == need_act_no
+        assert _member_required_bytes(0, True) == MIN_FREE_BYTES
+    _t("v35.9.34 _member_required_bytes (active vs standby)",
+       t_member_required)
+
+    def t_extraction_factor_realistic():
+        assert 1.0 <= EXTRACTION_OVERHEAD_FACTOR <= 1.15, \
+            "extraction factor must be >=1.0 (bin is compressed)"
+    _t("v35.9.33 extraction factor >= 1.0", t_extraction_factor_realistic)
+
+    def t_space_markers_extended():
+        assert "not enough free disk" in _SPACE_MARKERS
+        assert "free disk available" in _SPACE_MARKERS
+        assert "not enough space" in _SPACE_MARKERS
+        assert "insufficient space" in _SPACE_MARKERS
+    _t("v35.9.30 Cisco space markers", t_space_markers_extended)
+
+    def t_runinstall_uses_space_marker():
+        import inspect as _i
+        src = _i.getsource(run_install)
+        assert "_SPACE_MARKERS" in src
+        assert "insufficient_space: install engine rejected" in src
+    _t("v35.9.30 run_install short-circuits on Cisco space error",
+       t_runinstall_uses_space_marker)
+
+    def t_precheck_uses_new_formula():
+        import inspect as _i
+        src = _i.getsource(precheck_device)
+        assert "_member_required_bytes" in src
+        assert "EXTRACTION_OVERHEAD_FACTOR" in src
+        assert "insufficient_space_stack" in src
+    _t("v35.9.31 precheck uses new formula",
+       t_precheck_uses_new_formula)
+
+    def t_force_wipe_allows_running_bin():
+        import inspect as _i
+        src = _i.getsource(_force_wipe_flash)
+        assert "allow_running_bin_delete" in src
+        assert "_is_install_mode" in src
+        assert "keep_bin" in src
+    _t("v35.9.31 force-wipe can delete running .bin in install mode",
+       t_force_wipe_allows_running_bin)
+
+    def t_do_connect_call():
+        import inspect as _i
+        src = _i.getsource(wait_reboot_and_verify)
+        assert "do_connect(ip, host, user, pw" not in src
+        assert "do_connect(ip, user, pw)" in src
+    _t("v35.9.31 wait_reboot_and_verify uses correct do_connect",
+       t_do_connect_call)
+
+    def t_verify_boot_and_install_ready():
+        import inspect as _i
+        src = _i.getsource(verify_boot_and_install_ready)
+        assert "packages.conf" in src
+        assert "install_busy" in src
+        assert "size_mismatch" in src
+    _t("v35.9.31 verify_boot_and_install_ready",
+       t_verify_boot_and_install_ready)
+
+    def t_purge_unnecessary():
+        import inspect as _i
+        src = _i.getsource(_purge_unnecessary_files)
+        assert "_read_active_packages" in src
+        assert "aggressive" in src
+        assert "active_pkgs" in src
+    _t("v35.9.31 _purge_unnecessary_files", t_purge_unnecessary)
+
+    def t_summary_multi():
+        out = "\n".join([
+            "Install Summary", "===============", "",
+            "IMG: flash:cat9k_iosxe.17.18.04.SPA.bin",
+            "  Version : 17.18.04", "  Status  : C"])
+        assert summary_committed_on_target(out, "17.18.04")
+        assert summary_committed_on_target(out, "17.18.4")
+        assert not summary_committed_on_target(out, "17.15.01")
+    _t("summary_committed_on_target (multi-block)", t_summary_multi)
+
+    def t_summary_with_leftover_I():
+        out = "\n".join([
+            "IMG: flash:cat9k_iosxe.17.18.04.SPA.bin",
+            "  Version : 17.18.04", "  Status  : C",
+            "IMG: flash:cat9k_iosxe.17.15.03.SPA.bin",
+            "  Version : 17.15.03", "  Status  : I"])
+        assert summary_committed_on_target(out, "17.18.04")
+    _t("summary accepts leftover I", t_summary_with_leftover_I)
+
+    def t_summary_two_C_rejected():
+        out = "\n".join([
+            "IMG: flash:cat9k_iosxe.17.18.04.SPA.bin",
+            "  Version : 17.18.04", "  Status  : C",
+            "IMG: flash:cat9k_iosxe.17.15.03.SPA.bin",
+            "  Version : 17.15.03", "  Status  : C"])
+        assert not summary_committed_on_target(out, "17.18.04")
+    _t("summary rejects two-C", t_summary_two_C_rejected)
+
+    def t_summary_uncommitted():
+        out = "\n".join([
+            "IMG: flash:cat9k_iosxe.17.18.04.SPA.bin",
+            "  Version : 17.18.04", "  Status  : U"])
+        assert not summary_committed_on_target(out, "17.18.04")
+    _t("summary rejects Uncommitted", t_summary_uncommitted)
+
+    def t_summary_rows_ok():
+        out = "\n".join(["  IMG  C  17.18.04"])
+        assert summary_committed_on_target(out, "17.18.04")
+    _t("summary rows form accepts single C", t_summary_rows_ok)
+
+    def t_parse_summary_multi():
+        out = ("IMG: flash:cat9k_iosxe.17.18.04.SPA.bin\n"
+               "  Version : 17.18.04\n"
+               "  Status  : C\n"
+               "IMG: flash:cat9k_iosxe.17.15.03.SPA.bin\n"
+               "  Version : 17.15.03\n"
+               "  Status  : I")
+        r = _parse_install_summary(out)
+        assert r.get("17.18.4") == "C"
+        assert r.get("17.15.3") == "I"
+    _t("_parse_install_summary (multi-block)", t_parse_summary_multi)
+
+    def t_parse_summary_rows():
+        out = "  IMG  C  17.18.04\n  IMG  A  17.15.03\n  IMG  U  17.12.04\n  IMG  I  17.11.01"
+        r = _parse_install_summary(out)
+        assert r.get("17.18.4") == "C"
+        assert r.get("17.15.3") == "A"
+        assert r.get("17.12.4") == "U"
+        assert r.get("17.11.1") == "I"
+    _t("_parse_install_summary (rows)", t_parse_summary_rows)
+
+    def t_parse_summary_empty():
+        assert _parse_install_summary("") == {}
+        assert _parse_install_summary(None) == {}
+    _t("_parse_install_summary (empty)", t_parse_summary_empty)
+
+    def t_dead_socket():
+        for txt in ("Socket is closed", "connection reset",
+                    "broken pipe", "EOF", "channel closed",
+                    "no existing session", "EOF occurred",
+                    "EOF when reading a line"):
+            assert _is_dead_socket_error(txt) is True, txt
+        assert _is_dead_socket_error("parser found no EOF marker") is False
+        assert _is_dead_socket_error("random error") is False
+        assert _is_dead_socket_error("no EOF found") is False
+    _t("_is_dead_socket_error (anchored)", t_dead_socket)
+
+    def t_bulk():
+        assert _bulk_mode_tier((17, 10, 1)) == "A"
+        assert _bulk_mode_tier((17, 12, 3)) == "A"
+        assert _bulk_mode_tier((17, 6, 5)) == "B"
+        assert _bulk_mode_tier((17, 2, 1)) == "C"
+        assert _bulk_mode_tier((16, 12, 5)) == "D"
+        assert _bulk_mode_tier(None) is None
+    _t("_bulk_mode_tier", t_bulk)
+
+    def t_bins():
+        out = "\n".join([
+            "Directory of flash:/", "",
+            "    1  -rw-  12345678   Mar 1 2025 12:00:00 +00:00  "
+            "cat9k_iosxe.17.18.04.SPA.bin",
+            "    2  -rw-   9876543   Mar 1 2025 12:00:00 +00:00  "
+            "cat9k_lite_iosxe.17.18.04.SPA.bin",
+            "    3  drwx        4096  Mar 1 2025 12:00:00 +00:00  .installer"])
+        bins = parse_dir_bins(out)
+        assert "cat9k_iosxe.17.18.04.SPA.bin" in bins
+        assert "cat9k_lite_iosxe.17.18.04.SPA.bin" in bins
+    _t("parse_dir_bins", t_bins)
+
+    def t_fsize():
+        out = ("-rw-   123456789   Mar 1 2025 12:00:00 +00:00  "
+               "cat9k_iosxe.17.18.04.SPA.bin")
+        assert _parse_file_size_from_dir(
+            out, "cat9k_iosxe.17.18.04.SPA.bin") == 123456789
+    _t("_parse_file_size_from_dir", t_fsize)
+
+    def t_uptime():
+        assert parse_uptime_minutes("2 weeks, 3 days, 4 hours, 5 minutes") \
+            == 2*10080 + 3*1440 + 4*60 + 5
+        assert parse_uptime_minutes("1 year, 12 weeks") == 525600 + 12*10080
+        assert parse_uptime_minutes("garbage") is None
+    _t("parse_uptime_minutes", t_uptime)
+
+    def t_vty():
+        out = "\n".join([
+            "line vty 0 4", " exec-timeout 60 0", " transport input ssh",
+            "line vty 5 15", " transport input ssh"])
+        b = parse_vty_blocks(out)
+        assert len(b) == 2
+        assert b[0]["vty"] == "0 4"
+        assert b[0]["minutes"] == 60
+        assert b[1]["vty"] == "5 15"
+        assert b[1].get("was_default") is True
+    _t("parse_vty_blocks", t_vty)
+
+    def t_class():
+        e = Exception("No acceptable KEX algorithm")
+        assert _classify_connect_error(e) == "SSH negotiation failed"
+        e = Exception("No acceptable host key")
+        assert _classify_connect_error(e) == "SSH host-key negotiation failed"
+        e = Exception("some random error")
+        assert _classify_connect_error(e) == ""
+    _t("_classify_connect_error", t_class)
+
+    def t_large():
+        assert _is_large_model("C9300-48P")
+        assert _is_large_model("C9500-24Y4C")
+        assert not _is_large_model("C9200L-24P")
+        assert not _is_large_model("")
+    _t("_is_large_model", t_large)
+
+    def t_map_selfcheck():
+        errs, _ = verify_firmware_map()
+        structural = [e for e in errs if "not found at" not in e
+                      and "exceeds the absolute" not in e
+                      and "too small" not in e]
+        assert not structural, "structural errors: %s" % structural
+    _t("verify_firmware_map (structural)", t_map_selfcheck)
+
+    def t_fw_hard_cap():
+        import inspect as _i
+        src = _i.getsource(verify_firmware_map)
+        assert "MAX_FIRMWARE_BYTES" in src
+        assert "exceeds the absolute" in src
+    _t("firmware hard cap", t_fw_hard_cap)
+
+    def t_fw_size_constants():
+        assert MAX_FIRMWARE_BYTES == 2_000_000_000
+        assert MIN_FIRMWARE_BYTES == 100_000_000
+        assert FAMILY_SIZE_BOUNDS_STRICT is True
+    _t("firmware size constants", t_fw_size_constants)
+
+    def t_cmd_tracking():
+        assert "set_cmd" in globals() and "get_cmd" in globals()
+        set_cmd("testhost", "show version")
+        assert get_cmd("testhost") == "show version"
+    _t("Cmd tracking", t_cmd_tracking)
+
+    def t_long_running_phases():
+        assert "INSTALL" in LIVE_LOG_PANEL_PHASES
+        assert "SERVICE-LOCKS" in LIVE_LOG_PANEL_PHASES
+        assert "PRE-CHECK" in LIVE_LOG_PANEL_PHASES
+        assert "PKG-PURGE" in LIVE_LOG_PANEL_PHASES
+    _t("long-running phases", t_long_running_phases)
+
+    def t_activate_forms():
+        assert len(_ACTIVATE_FORMS) >= 3
+        assert any("activate file flash" in f for f in _ACTIVATE_FORMS)
+        assert any(f == "install activate" for f in _ACTIVATE_FORMS)
+        import inspect as _i
+        src = _i.getsource(_try_all_activate_forms)
+        assert "_nudge_install_activate" in src
+    _t("activate forms", t_activate_forms)
+
+    def t_fast_reboot_probe():
+        import inspect as _i
+        src = _i.getsource(wait_reboot_and_verify)
+        assert "fast-reboot probe" in src
+        assert "_verify_after_reboot_impl" in src
+    _t("fast-reboot probe", t_fast_reboot_probe)
+
+    def t_residual_detector():
+        assert "_detect_residual_temp_config" in globals()
+        import inspect as _i
+        src = _i.getsource(_detect_residual_temp_config)
+        assert "exec_timeout" in src
+        assert "ssh_tune" in src
+    _t("residual detector", t_residual_detector)
+
+    def t_precheck_checks_commit():
+        import inspect as _i
+        src = _i.getsource(precheck_device)
+        assert "already_on_target_needs_finalize" in src
+        assert "_detect_residual_temp_config" in src
+        assert "summary_committed_on_target" in src
+    _t("precheck commit + residual audit",
+       t_precheck_checks_commit)
+
+    def t_install_fixup_path():
+        import inspect as _i
+        src = _i.getsource(install_worker)
+        assert "already_on_target_fixup" in src
+    _t("install fixup path (safety net)", t_install_fixup_path)
+
+    def t_fixup_inline():
+        import inspect as _i
+        src = _i.getsource(transfer_worker)
+        assert "fixup_done" in src
+        assert "_finalize_install_commit" in src
+        assert "revert_device_temp_changes" in src
+    _t("v35.9.29 fixup inline in transfer_worker", t_fixup_inline)
+
+    def t_fixup_done_routes_in_collect():
+        import inspect as _i
+        src = _i.getsource(_collect_transfer_result)
+        assert "fixup_done" in src
+    _t("v35.9.29 fixup_done routes", t_fixup_done_routes_in_collect)
+
+    def t_drain_install_futures():
+        import inspect as _i
+        src = _i.getsource(run_pass)
+        assert "_drain_install" in src
+        assert "block=False" in src
+    _t("v35.9.29 run_pass drains installs", t_drain_install_futures)
+
+    def t_pool_rebalance():
+        # v35.9.42 FIX-WORKER-FLEX: no specific counts asserted; just
+        # ensure the config is self-consistent and sane.
+        assert isinstance(TRANSFER_SLOTS, int) and TRANSFER_SLOTS >= 1
+        assert isinstance(INSTALL_WORKERS, int) and INSTALL_WORKERS >= 1
+        assert isinstance(MAX_SAFE_SSH_SESSIONS, int)
+        assert MAX_SAFE_SSH_SESSIONS >= 1
+    _t("v35.9.42 worker counts sane (flexible)", t_pool_rebalance)
+
+    def t_probe_overhead_reduced():
+        assert INSTALL_PROBE_INTERVAL == 300
+        assert PROBE_CONNECT_RETRIES == 2
+        assert COMMIT_VERIFY_TIMEOUT == 300
+        assert COMMIT_VERIFY_RETRY_SEC == 15
+        assert SESSION_SLOT_ACQUIRE_TIMEOUT == 60
+    _t("v35.9.29 probe overhead reduced", t_probe_overhead_reduced)
+
+    def t_clock_cache():
+        assert "_ensure_device_clock_correct_cached" in globals()
+        assert "_CLOCK_TTL_SEC" in globals()
+        import inspect as _i
+        src_pc = _i.getsource(precheck_device)
+        assert "_ensure_device_clock_correct_cached" in src_pc
+    _t("v35.9.29 clock check is cached", t_clock_cache)
+
+    def t_state_hosts():
+        v2 = {"schema": 2, "run_id": "x",
+              "hosts": {"sw1": {"changes": []}}}
+        assert _state_hosts(v2) == {"sw1": {"changes": []}}
+        v1 = {"sw1": {"changes": []}}
+        assert _state_hosts(v1) == v1
+        assert _state_hosts(None) == {}
+    _t("_state_hosts", t_state_hosts)
+
+    def t_row():
+        d = {"hostname": "sw1", "ip": "10.0.0.1"}
+        st = {"verify_pending": True, "target_version": "17.18.04",
+              "clock_corrected": True, "config_diff_lines": 4}
+        r = _row(d, "failed", "install", "test", st=st)
+        assert r["verify_pending"] is True
+        assert r["clock_corrected"] is True
+        assert r["config_diff_lines"] == 4
+        assert r["target_version"] == "17.18.04"
+    _t("_row fields", t_row)
+
+    def t_revert_markers():
+        m = _revert_markers_for_types(["ssh_tune", "cheap_crypto"])
+        names = [x[0] for x in m]
+        assert "ip ssh bulk-mode" in names
+        assert "ip ssh server algorithm encryption" in names
+    _t("_revert_markers_for_types", t_revert_markers)
+
+    def t_rollback_syntax():
+        import inspect as _i
+        src = _i.getsource(_issue_rollback_commands)
+        assert "install rollback to committed" in src
+        assert "install rollback to base" in src
+    _t("rollback tries modern then legacy", t_rollback_syntax)
+
+    def t_safe_reload():
+        import inspect as _i
+        src = _i.getsource(_safe_manual_reload)
+        assert "_RELOAD_MARKERS" in src
+        assert "proceed with reload" in src.lower()
+    _t("_safe_manual_reload marker-driven", t_safe_reload)
+
+    def t_install_stages():
+        import inspect as _i
+        src = _i.getsource(run_install)
+        assert "install_add" in src
+        assert "install_activate" in src
+        assert "install_commit" in src
+    _t("run_install stage detection", t_install_stages)
+
+    def t_runinstall_done():
+        import inspect as _i
+        src = _i.getsource(run_install)
+        assert "_DONE" in src
+        assert "image committed on " in src
+        assert "already on " in src
+        assert "Probe confirms on target" in src
+    _t("run_install exits on done", t_runinstall_done)
+
+    def t_probe_version_first():
+        import inspect as _i
+        src = _i.getsource(_probe_install_status)
+        ver_pos = src.find('show version | include Version')
+        summ_pos = src.find('show install summary')
+        assert ver_pos != -1 and summ_pos != -1
+        assert ver_pos < summ_pos
+    _t("probe checks version first", t_probe_version_first)
+
+    def t_probe_uses_parser():
+        import inspect as _i
+        src = _i.getsource(_probe_install_status)
+        assert "_parse_install_summary" in src
+    _t("probe uses _parse_install_summary", t_probe_uses_parser)
+
+    def t_runinstall_activate_before_cap():
+        import inspect as _i
+        src = _i.getsource(run_install)
+        inactive_pos = src.find('"image inactive" in probe_msg')
+        cap_pos = src.find("if same_total >= 12")
+        assert 0 <= inactive_pos < cap_pos
+    _t("activate nudge before cap", t_runinstall_activate_before_cap)
+
+    def t_nudge_helper():
+        import inspect as _i
+        src = _i.getsource(_nudge_install_activate)
+        assert "install activate file flash:" in src
+        assert "_PROMPT_MARKERS" in src
+        assert "_RELOAD_MARKERS" in src
+        assert "_is_dead_socket_error" in src
+    _t("nudge helper complete", t_nudge_helper)
+
+    def t_escalation_helper():
+        import inspect as _i
+        src = _i.getsource(_run_install_abort_and_reissue)
+        assert "install abort" in src
+        assert "install add file flash:" in src
+        assert "_is_dead_socket_error" in src
+    _t("escalation helper", t_escalation_helper)
+
+    def t_finalize_helper():
+        import inspect as _i
+        src = _i.getsource(_finalize_install_commit)
+        assert "install commit" in src
+        assert "summary_committed_on_target" in src
+        assert "_parse_install_summary" in src
+        assert "_run_install_remove_inactive" in src
+        sig = _i.signature(_finalize_install_commit)
+        assert "fw_file" in sig.parameters
+        assert "_norm_ver" in src
+    _t("finalize commit helper", t_finalize_helper)
+
+    def t_finalize_respects_rollback():
+        import inspect as _i
+        src = _i.getsource(_finalize_install_commit)
+        assert "PRESERVE_ROLLBACK" in src
+    _t("finalize respects PRESERVE_ROLLBACK",
+       t_finalize_respects_rollback)
+
+    def t_finalize_detects_two_committed():
+        import inspect as _i
+        src = _i.getsource(_finalize_install_commit)
+        assert "two committed versions" in src
+    _t("finalize detects two-committed state",
+       t_finalize_detects_two_committed)
+
+    def t_finalize_uses_fw_file_not_running():
+        import inspect as _i
+        src = _i.getsource(_finalize_install_commit)
+        assert "_get_running_image" not in src
+    _t("finalize Path 3a uses fw_file",
+       t_finalize_uses_fw_file_not_running)
+
+    def t_finalize_refuses_empty_fw():
+        import inspect as _i
+        src = _i.getsource(_finalize_install_commit)
+        assert "filename is unknown" in src
+    _t("finalize refuses unknown fw", t_finalize_refuses_empty_fw)
+
+    def t_wait_reboot_calls_finalize():
+        import inspect as _i
+        src = _i.getsource(wait_reboot_and_verify)
+        assert "_finalize_install_commit" in src or \
+            "_verify_after_reboot_impl" in src
+        assert "fw_file" in _i.signature(wait_reboot_and_verify).parameters
+    _t("wait_reboot calls finalize with fw_file",
+       t_wait_reboot_calls_finalize)
+
+    def t_reconcile_calls_finalize():
+        import inspect as _i
+        src = _i.getsource(_reconcile_failed_devices)
+        assert "_finalize_install_commit" in src
+    _t("reconcile calls finalize", t_reconcile_calls_finalize)
+
+    def t_health_no_commit_check():
+        import inspect as _i
+        src = _i.getsource(post_upgrade_health_check)
+        assert "summary_committed_on_target" not in src
+    _t("health check has no commit re-check", t_health_no_commit_check)
+
+    def t_stack_version_multi_syntax():
+        import inspect as _i
+        src = _i.getsource(check_stack_versions)
+        assert "_per_member_version" in src
+    _t("v35.9.36 stack per-member verify", t_stack_version_multi_syntax)
+
+    def t_precheck_members_count_early():
+        import inspect as _i
+        src = _i.getsource(precheck_device)
+        early = src.find("members_count = 1")
+        assert early != -1
+    _t("members_count defined early", t_precheck_members_count_early)
+
+    def t_precheck_skips_gate_on_unreadable():
+        import inspect as _i
+        src = _i.getsource(precheck_device)
+        assert "skip_per_member_gate" in src
+        assert "SKIPPING pre-check space gate" in src
+    _t("precheck skips gate on unreadable members",
+       t_precheck_skips_gate_on_unreadable)
+
+    def t_report_force():
+        import inspect as _i
+        sig = _i.signature(write_location_report)
+        assert "force" in sig.parameters
+        src = _i.getsource(_reconcile_failed_devices)
+        assert "force=True" in src
+    _t("report rewrite force=True", t_report_force)
+
+    def t_atexit():
+        src = open(__file__, "r", encoding="utf-8").read()
+        assert "atexit.register(_cleanup_orphan_pwfiles)" in src
+    _t("atexit pwfile cleanup", t_atexit)
+
+    def t_lock_order():
+        src = open(__file__, "r", encoding="utf-8").read()
+        lock_pos = src.find("lock_handle = _acquire_instance_lock()")
+        rot_pos = src.find("rotate_backups()")
+        assert lock_pos != -1 and rot_pos != -1
+        assert lock_pos < rot_pos
+    _t("instance lock precedes rotation", t_lock_order)
+
+    def t_fmt_dur():
+        assert _fmt_duration(0) == "0s"
+        assert _fmt_duration(45) == "45s"
+        assert _fmt_duration(60) == "1m00s"
+        assert _fmt_duration(200) == "3m20s"
+        assert _fmt_duration(3725) == "1h02m05s"
+        assert _fmt_duration(None) == "0s"
+    _t("_fmt_duration", t_fmt_dur)
+
+    def t_fmt_bytes():
+        assert _fmt_bytes(500) == "500.00B"
+        assert _fmt_bytes(1024 * 1024) == "1.00MB"
+        assert _fmt_bytes(1024 * 1024 * 1024) == "1.00GB"
+        assert _fmt_bytes(None) == "?"
+    _t("_fmt_bytes", t_fmt_bytes)
+
+    def t_device_line():
+        s = _device_line({"hostname": "sw1", "ip": "10.0.0.1",
+                          "status": "success",
+                          "start_version": "17.15.01",
+                          "target_version": "17.18.04",
+                          "duration_sec": 720,
+                          "md5_ok": True, "reboot_detected": True,
+                          "clock_corrected": True})
+        assert s.startswith("OK sw1")
+        assert "17.15.01 -> 17.18.04" in s
+        assert "12m00s" in s
+    _t("_device_line", t_device_line)
+
+    def t_summary_return():
+        fake = {"LocA": {
+            "sw1": {"hostname": "sw1", "ip": "10.0.0.1", "status": "success",
+                    "stage": "install", "start_version": "17.15.01",
+                    "target_version": "17.18.04", "post_version": "17.18.04",
+                    "duration_sec": 720, "md5_ok": True,
+                    "reboot_detected": True, "install_started": True,
+                    "verify_pending": False, "clock_corrected": False,
+                    "config_diff_lines": 0, "attempts": 1, "error": ""},
+            "sw2": {"hostname": "sw2", "ip": "10.0.0.2", "status": "failed",
+                    "stage": "install", "start_version": "17.15.01",
+                    "target_version": "17.18.04", "post_version": "",
+                    "duration_sec": 100, "md5_ok": False,
+                    "reboot_detected": False, "install_started": True,
+                    "verify_pending": True, "clock_corrected": False,
+                    "config_diff_lines": 0, "attempts": 1,
+                    "error": "install probe: not priv-15"},
+        }}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            n = print_summary(fake, {})
+        assert n == 1
+        out = buf.getvalue()
+        assert "FINAL SUMMARY" in out
+        assert "TOTAL" in out
+    _t("print_summary returns failed count", t_summary_return)
+
+    def t_anomaly():
+        prev = {"run_id": "OLD", "results": [
+            {"hostname": "sw1", "status": "success",
+             "post_version": "17.18.04"}]}
+        cur = {"LocA": {"sw1": {"hostname": "sw1", "status": "success",
+                                "post_version": "17.15.01"}}}
+        issues = detect_anomalies(cur, prev)
+        assert any("regressed" in m for _, m in issues)
+    _t("detect_anomalies", t_anomaly)
+
+    def t_cli():
+        real = sys.argv
+        try:
+            for flags in (["--only-upgrade-needed"], ["--preview"],
+                          ["--preview-only"], ["--quiet-skipped"],
+                          ["--no-html-report"], ["--no-health-snapshot"],
+                          ["--use-inventory-cache"], ["--no-colour"],
+                          ["--estimate-only"], ["--interactive-resume"],
+                          ["--no-reconcile"], ["--no-hash-verify"],
+                          ["--allow-lenient-firmware"],
+                          ["--allow-active-pkg-purge"]):
+                sys.argv = ["prog"] + flags
+                parse_args()
+        finally:
+            sys.argv = real
+    _t("CLI flags parse", t_cli)
+
+    def t_pscp_retry_drops_pwfile():
+        import inspect as _i
+        src = _i.getsource(transfer_via_pscp)
+        assert '"-pw", pw' in src
+    _t("pscp retry drops -pwfile", t_pscp_retry_drops_pwfile)
+
+    def t_clock_returns_entry_drift():
+        import inspect as _i
+        src = _i.getsource(_ensure_device_clock_correct)
+        assert "entry_drift" in src
+    _t("clock helper returns entry drift",
+       t_clock_returns_entry_drift)
+
+    def t_transfer_verify_local_size():
+        import inspect as _i
+        src = _i.getsource(_transfer_with_wipe_retry)
+        assert "local_size" in src
+    _t("transfer verifies local size", t_transfer_verify_local_size)
+
+    def t_is_install_mode():
+        assert "_is_install_mode" in globals()
+        import inspect as _i
+        src = _i.getsource(_is_install_mode)
+        assert "packages.conf" in src
+    _t("v35.9.31 _is_install_mode helper", t_is_install_mode)
+
+    def t_read_active_packages_json():
+        import inspect as _i
+        src = _i.getsource(_read_active_packages)
+        assert "file_name" in src
+        assert "return active_conf, None" in src
+        assert "boot\\s+flash:" in src
+    _t("v35.9.32 _read_active_packages handles JSON + text + fail-safe",
+       t_read_active_packages_json)
+
+    def t_read_active_fallback():
+        import inspect as _i
+        src = _i.getsource(_read_active_packages)
+        assert "install summary" in src
+        assert "committed" in src
+    _t("v35.9.36 _read_active_packages falls back to install summary",
+       t_read_active_fallback)
+
+    def t_pre_install_pkg_purge():
+        import inspect as _i
+        src = _i.getsource(_pre_install_pkg_purge)
+        assert "ALLOW_ACTIVE_PKG_PURGE" in src
+        assert "target .bin not on flash" in src
+        assert "cannot determine active .pkg set" in src
+    _t("v35.9.32 _pre_install_pkg_purge gated + verified",
+       t_pre_install_pkg_purge)
+
+    def t_transfer_worker_invokes_pkg_purge():
+        import inspect as _i
+        src = _i.getsource(transfer_worker)
+        assert "_pre_install_pkg_purge" in src
+        assert "ALLOW_ACTIVE_PKG_PURGE" in src
+    _t("v35.9.32 transfer_worker invokes last-resort purge",
+       t_transfer_worker_invokes_pkg_purge)
+
+    def t_purge_refuses_when_unknown():
+        import inspect as _i
+        src = _i.getsource(_purge_unnecessary_files)
+        assert "active_pkgs is None" in src
+        assert "REFUSING to delete any .pkg" in src
+    _t("v35.9.32 aggressive purge refuses when active set unknown",
+       t_purge_refuses_when_unknown)
+
+    def t_config_keys_has_flags():
+        assert "ALLOW_ACTIVE_PKG_PURGE" in _CONFIG_KEYS
+    _t("v35.9.35 _CONFIG_KEYS includes purge flag",
+       t_config_keys_has_flags)
+
+    def t_purge_standby_exists():
+        import inspect as _i
+        src = _i.getsource(_purge_standby_members)
+        assert "stby-flash:" in src
+        assert "flash-%d:" in src
+    _t("v35.9.35 _purge_standby_members", t_purge_standby_exists)
+
+    def t_pkg_set_present_detection():
+        import inspect as _i
+        src = _i.getsource(_is_target_pkg_set_present)
+        assert "status=I" in src
+        assert "status=A" in src
+        assert "status=U" in src
+    _t("v35.9.36 _is_target_pkg_set_present",
+       t_pkg_set_present_detection)
+
+    def t_precheck_early_return():
+        import inspect as _i
+        src = _i.getsource(precheck_device)
+        assert "already_added_needs_activate" in src
+        assert "_is_target_pkg_set_present" in src
+    _t("v35.9.36 precheck skips gate when .pkg already present",
+       t_precheck_early_return)
+
+    def t_transfer_short_circuit():
+        import inspect as _i
+        src = _i.getsource(transfer_worker)
+        assert "already_added_needs_activate" in src
+        assert 'result["already_added"] = True' in src
+    _t("v35.9.36 transfer_worker short-circuits already-added",
+       t_transfer_short_circuit)
+
+    def t_activate_only_helper():
+        assert "_run_install_activate_only" in globals()
+        assert "_run_install_commit_only" in globals()
+        import inspect as _i
+        src = _i.getsource(_run_install_activate_only)
+        assert "install activate" in src
+        assert "install add file" not in src
+    _t("v35.9.37 activate-only helper", t_activate_only_helper)
+
+    def t_commit_only_helper():
+        import inspect as _i
+        src = _i.getsource(_run_install_commit_only)
+        assert "_finalize_install_commit" in src
+    _t("v35.9.37 commit-only helper", t_commit_only_helper)
+
+    def t_install_worker_alreadyadded_cmd():
+        import inspect as _i
+        src = _i.getsource(install_worker)
+        assert "_run_install_activate_only" in src
+        assert "_run_install_commit_only" in src
+    _t("v35.9.37 install_worker uses activate+commit path",
+       t_install_worker_alreadyadded_cmd)
+
+    def t_no_abort_after_add():
+        import inspect as _i
+        src = _i.getsource(install_worker)
+        assert "allow_abort=False" in src
+    _t("v35.9.37 no install abort after add", t_no_abort_after_add)
+
+    def t_runver_match_normalized():
+        import inspect as _i
+        src = _i.getsource(_purge_standby_members)
+        assert "fver_key == running_key" in src
+        assert "_VER3_NORM_RE" in src
+    _t("v35.9.37 standby running-version match normalised",
+       t_runver_match_normalized)
+
+    def t_standby_junk_purge():
+        import inspect as _i
+        src = _i.getsource(_purge_standby_members)
+        assert ".USWAP" in src
+        assert "tech_support" in src
+    _t("v35.9.37 standby junk dir purge", t_standby_junk_purge)
+
+    def t_runinstall_detects_already_added():
+        import inspect as _i
+        src = _i.getsource(run_install)
+        assert "_ALREADY_ADDED_MARKERS" in src
+        assert "already_added_refused" in src
+        assert "super package already added" in _ALREADY_ADDED_MARKERS
+    _t("v35.9.37 run_install detects super-package-already-added",
+       t_runinstall_detects_already_added)
+
+    def t_conf_keep():
+        import inspect as _i
+        src = _i.getsource(_purge_unnecessary_files)
+        assert "FIX-CONF-KEEP" in src or "keep (target .conf)" in src
+        assert "keep (target .conf)" in src
+    _t("v35.9.38 keeps target .conf during purge", t_conf_keep)
+
+    def t_precommit_helper():
+        assert "_state_needs_precommit" in globals()
+        assert "_run_install_commit_for_precommit" in globals()
+    _t("v35.9.38 pre-commit helpers exist", t_precommit_helper)
+
+    def t_activate_handles_cannot_activate():
+        import inspect as _i
+        src = _i.getsource(_run_install_activate_only)
+        assert "cannot activate; please first perform" in src
+        assert "_state_needs_precommit" in src
+    _t("v35.9.38 activate handles cannot-activate",
+       t_activate_handles_cannot_activate)
+
+    def t_activate_detects_partial():
+        import inspect as _i
+        src = _i.getsource(_run_install_activate_only)
+        assert "partial activation" in src
+        assert "per_member_fail" in src
+    _t("v35.9.38 activate detects partial failure",
+       t_activate_detects_partial)
+
+    def t_pwfile_unique():
+        a = _pwfile_for_thread()
+        b = _pwfile_for_thread()
+        assert a != b
+        assert _PWFILE_COUNTER >= 2
+    _t("v35.9.38 pwfile paths are unique", t_pwfile_unique)
+
+    def t_pscp_retry_window_widened():
+        import inspect as _i
+        src = _i.getsource(transfer_via_pscp)
+        assert "elapsed < 60" in src
+        assert "elapsed < 5" not in src
+    _t("v35.9.38 pscp retry window widened",
+       t_pscp_retry_window_widened)
+
+    def t_finalize_no_infinite_activate():
+        import inspect as _i
+        src = _i.getsource(_finalize_install_commit)
+        assert "st_attempts" in src
+        assert "reissued_activate" in src
+    _t("v35.9.38 finalize refuses to loop on target=I",
+       t_finalize_no_infinite_activate)
+
+    def t_stack_verify_platform_safe():
+        import inspect as _i
+        src = _i.getsource(_per_member_version)
+        assert "per_member_syntax_ok" in src
+        assert "show version | include Version" in src
+        src2 = _i.getsource(check_stack_versions)
+        assert "unverified" in src2 or " X" in src2
+    _t("v35.9.38 stack-verify is platform-safe",
+       t_stack_verify_platform_safe)
+
+    def t_precheck_passes_target_ver_to_purge():
+        import inspect as _i
+        src = _i.getsource(precheck_device)
+        assert "target_ver=target_ver" in src
+    _t("v35.9.38 precheck passes target_ver to purge",
+       t_precheck_passes_target_ver_to_purge)
+
+    def t_runinstall_nudge_returns_on_dead_transport():
+        import inspect as _i
+        src = _i.getsource(run_install)
+        assert "tr.is_active()" in src
+        assert "dead = True" in src
+        assert "activate nudged, transport" in src or \
+               "reload in progress" in src
+    _t("v35.9.38 run_install returns on dead transport",
+       t_runinstall_nudge_returns_on_dead_transport)
+
+    def t_runinstall_precommits_on_u_state():
+        import inspect as _i
+        src = _i.getsource(run_install)
+        assert "_state_needs_precommit" in src
+        assert "_run_install_commit_for_precommit" in src
+    _t("v35.9.38 run_install pre-commits U state",
+       t_runinstall_precommits_on_u_state)
+
+    def t_md5_nonfatal():
+        import inspect as _i
+        src = _i.getsource(install_worker)
+        assert "send_command_timing" in src
+        assert "MD5 not confirmed" in src
+        assert "non-fatal" in src
+    _t("v35.9.38 MD5 verify is non-fatal", t_md5_nonfatal)
+
+    def t_retry_install_failures():
+        import inspect as _i
+        src = _i.getsource(is_retryable)
+        assert "recoverable" in src
+    _t("v35.9.38 install failures are retryable when recoverable",
+       t_retry_install_failures)
+
+    def t_revert_verify_default():
+        import inspect as _i
+        src = _i.getsource(verify_revert_clean)
+        assert "hmac-sha1" in src
+        assert "aes128-ctr" in src
+        assert "ip ssh server algorithm mac" in src
+    _t("v35.9.38 revert-verify ignores defaults",
+       t_revert_verify_default)
+
+    def t_low_unbound_fixed():
+        import inspect as _i
+        src = _i.getsource(_run_install_activate_only)
+        assert "FIX-LOW-UNBOUND" in src or 'low = ""' in src
+        assert 'low = ""' in src
+    _t("v35.9.39 _run_install_activate_only binds `low`",
+       t_low_unbound_fixed)
+
+    def t_already_added_ordered():
+        import inspect as _i
+        src = _i.getsource(run_install)
+        p_already = src.find("_ALREADY_ADDED_MARKERS")
+        p_failed  = src.find('re.search(r"failed:\\s*install", low)')
+        assert p_already != -1, "_ALREADY_ADDED_MARKERS not found in run_install"
+        assert p_failed  != -1, 'failed:install check not found in run_install'
+        assert p_already < p_failed, (
+            "_ALREADY_ADDED_MARKERS at offset %d must appear before "
+            "failed:install at offset %d" % (p_already, p_failed))
+    _t("v35.9.39 already-added is checked before failed:install",
+       t_already_added_ordered)
+
+    def t_already_added_markers():
+        assert "_ALREADY_ADDED_MARKERS" in globals()
+        assert "super package already added" in _ALREADY_ADDED_MARKERS
+        assert "add operation not allowed" in _ALREADY_ADDED_MARKERS
+    _t("v35.9.39 _ALREADY_ADDED_MARKERS present",
+       t_already_added_markers)
+
+    def t_already_added_3tuple():
+        import inspect as _i
+        src = _i.getsource(run_install)
+        idx = src.find("_ALREADY_ADDED_MARKERS")
+        assert idx != -1
+        tail = src[idx:idx + 600]
+        assert 'already_added_refused' in tail
+        ret_start = tail.find('"add because .pkg set is already on flash"')
+        assert ret_start != -1
+        ret_end = tail.find("\n", ret_start)
+        ret_line = tail[ret_start:ret_end]
+        assert ", conn" in ret_line, \
+            "already_added_refused return must carry conn: %r" % ret_line
+    _t("v35.9.39 already-added return carries conn",
+       t_already_added_3tuple)
+
+    def t_read_active_pkg_version_match():
+        wanted = {_norm_ver("17.12.04")}
+        assert wanted == {"17.12.4"}
+        for fn in ("cat9k_lite-rpbase.17.12.04.SPA.pkg",
+                   "cat9k_lite-webui.17.12.04.SPA.pkg",
+                   "cat9k_lite-rpboot.17.12.04.SPA.pkg",
+                   "cat9k_lite-srdriver.17.12.04.SPA.pkg"):
+            fm = _VER3_NORM_RE.search(fn)
+            assert fm is not None
+            assert _norm_ver(fm.group(0)) in wanted, fn
+        for fn in ("cat9k_lite-rpbase.17.06.03.SPA.pkg",
+                   "cat9k_lite-webui.17.06.03.SPA.pkg",
+                   "cat9k_lite-rpboot.17.09.04a.SPA.pkg"):
+            fm = _VER3_NORM_RE.search(fn)
+            assert fm is not None
+            assert _norm_ver(fm.group(0)) not in wanted, fn
+    _t("v35.9.41 active-pkg version match (17.12.4 vs 17.12.04)",
+       t_read_active_pkg_version_match)
+
+    def t_read_active_pkg_uses_running():
+        import inspect as _i
+        src = _i.getsource(_read_active_packages)
+        assert "FIX-ACTIVE-PKG-RUNNING" in src
+        assert "_get_running_version_string" in src
+        assert "_VER3_NORM_RE" in src
+    _t("v35.9.41 active-pkg fallback consults running version",
+       t_read_active_pkg_uses_running)
+
+    def t_wait_install_op_idle_exists():
+        assert "_wait_install_op_idle" in globals()
+        import inspect as _i
+        src = _i.getsource(_wait_install_op_idle)
+        assert "FIX-WAIT-OP-IDLE" in src
+        assert "show install summary" in src
+    _t("v35.9.42 _wait_install_op_idle helper present",
+       t_wait_install_op_idle_exists)
+
+    def t_activate_fastpath_check():
+        import inspect as _i
+        src = _i.getsource(_run_install_activate_only)
+        assert "FIX-FASTPATH-ALREADY-ON-TARGET" in src
+        assert "already on target -- skipping activate" in src
+        assert "_wait_install_op_idle" in src
+    _t("v35.9.42 activate has fast-path + busy-wait",
+       t_activate_fastpath_check)
+
+    def t_commit_busy_wait():
+        import inspect as _i
+        src = _i.getsource(_finalize_install_commit)
+        assert "FIX-COMMIT-BUSY-WAIT" in src
+        assert "commit: install engine busy" in src
+    _t("v35.9.42 commit backs off when engine busy",
+       t_commit_busy_wait)
+
+    def t_pscp_stall_detection():
+        import inspect as _i
+        src = _i.getsource(_pscp_run_once)
+        assert "FIX-PSCP-STALL" in src
+        assert "SCP_STALL_TIMEOUT" in src
+        assert "proc.kill()" in src
+        assert "chunks.get(timeout=1.0)" in src or "queue.Empty" in src
+    _t("v35.9.43 pscp kills stalled transfers", t_pscp_stall_detection)
+
+    def t_version_string_v43():
+        assert VERSION_STRING == "35.9.43", \
+            "VERSION_STRING should be 35.9.43, got %s" % VERSION_STRING
+    _t("VERSION_STRING is 35.9.43", t_version_string_v43)
+
+    def t_activate_settle():
+        import inspect as _i
+        src = _i.getsource(_run_install_activate_only)
+        assert "FIX-ACT-SETTLE" in src
+        assert "time.sleep(30)" in src
+    _t("v35.9.43 activate waits for engine to settle",
+       t_activate_settle)
+
+    total = len(passed) + len(failed)
+    print("\n" + "=" * 70)
+    print("  VALIDATION -- %d check(s)" % total)
+    print("=" * 70)
+    for name in passed: print("  OK %s" % name)
+    if failed:
+        print()
+        for name, err in failed: print("  FAIL %s: %s" % (name, err))
+    print("-" * 70)
+    print("  Passed: %d/%d" % (len(passed), total))
+    print("  Failed: %d/%d" % (len(failed), total))
+    print("=" * 70 + "\n")
+    return 0 if not failed else 1
+
+
+def main():
+    global DRY_RUN, SKIP_ISSU, PAUSE_BETWEEN_LOCATIONS, AUTO_ROLLBACK_ON_FAIL
+    global LOCATIONS_TO_RUN, ENABLE_PASSWORD, ENABLE_USER, REVERT_VERIFY_AFTER
+    global LIVE_LOG_FEED_TRANSFER, SERIAL_TRANSFER_LARGE_MODELS
+    global SKIP_CONFIG_DRIFT_CHECK, ALLOW_BUNDLE_MODE_CONVERSION
+    global POOL_LOCATIONS, VERIFY_TRANSFER_HASH, RECONCILE_FAILED_AT_END
+    global LARGE_MODEL_PARALLEL, PARAMIKO_PRIMARY, LARGE_MODEL_SEMAPHORE
+    global BULK_MODE_WINDOW_SIZE, USE_COLOUR, QUIET_SKIPPED
+    global FAMILY_SIZE_BOUNDS_STRICT, ALLOW_ACTIVE_PKG_PURGE
+    args = parse_args()
+
+    if args.validate:
+        return _validate()
+
+    if args.config: apply_config_file(args.config)
+    if args.base_dir: update_paths(args.base_dir)
+    for d in (LOG_DIR, STATE_DIR, REPORT_DIR, BACKUP_DIR, CHECKPOINT_DIR):
+        try: os.makedirs(d, exist_ok=True)
+        except OSError: pass
+    if args.write_manifest:
+        _cleanup_orphan_pwfiles(); _write_manifest(); return 0
+
+    lock_handle = _acquire_instance_lock()
+    if lock_handle is None: return 3
+    _cleanup_orphan_pwfiles()
+    _check_local_disk_space()
+    rotate_backups()
+    rotate_log_archive()
+
+    if args.dry_run:          DRY_RUN = True
+    if args.skip_issu:        SKIP_ISSU = True
+    if args.auto_rollback:    AUTO_ROLLBACK_ON_FAIL = True
+    if args.no_pause:         PAUSE_BETWEEN_LOCATIONS = False
+    if args.locations:        LOCATIONS_TO_RUN = args.locations
+    if args.no_verify_revert: REVERT_VERIFY_AFTER = False
+    if args.show_live_transfer: LIVE_LOG_FEED_TRANSFER = True
+    if args.no_serial_large:  SERIAL_TRANSFER_LARGE_MODELS = False
+    if args.no_drift_check:   SKIP_CONFIG_DRIFT_CHECK = True
+    if args.no_hash_verify:   VERIFY_TRANSFER_HASH = False
+    if args.no_reconcile:     RECONCILE_FAILED_AT_END = False
+    if args.no_bundle_mode:   ALLOW_BUNDLE_MODE_CONVERSION = False
+    if args.allow_bundle_mode: ALLOW_BUNDLE_MODE_CONVERSION = True
+    if args.no_pool_locations: POOL_LOCATIONS = False
+    if args.pool_locations:   POOL_LOCATIONS = True
+    if args.allow_lenient_firmware:
+        FAMILY_SIZE_BOUNDS_STRICT = False
+        print("  ! --allow-lenient-firmware: strict family size check "
+              "disabled (absolute 2 GB cap still applies)")
+    if args.allow_active_pkg_purge:
+        ALLOW_ACTIVE_PKG_PURGE = True
+        print("  ! --allow-active-pkg-purge: active .pkg deletion enabled. "
+              "If install fails after this point, MANUAL CONSOLE RECOVERY "
+              "will be required.")
+    if args.parallel_large is not None:
+        LARGE_MODEL_PARALLEL = max(1, args.parallel_large)
+        LARGE_MODEL_SEMAPHORE = threading.Semaphore(LARGE_MODEL_PARALLEL)
+    if args.paramiko_primary: PARAMIKO_PRIMARY = True
+    if args.bulk_window is not None:
+        if args.bulk_window < 131072:
+            print("  --bulk-window %d < 131072 -- ignored"
+                  % args.bulk_window)
+        else:
+            BULK_MODE_WINDOW_SIZE = args.bulk_window
+    if args.quiet_skipped: QUIET_SKIPPED = True
+    if args.no_colour: USE_COLOUR = False
+
+    if os.name == "nt" and not args.no_colour:
+        try:
+            import ctypes
+            _k = ctypes.windll.kernel32
+            _h = _k.GetStdHandle(-11)
+            _m = ctypes.c_ulong()
+            if _k.GetConsoleMode(_h, ctypes.byref(_m)):
+                _k.SetConsoleMode(_h, _m.value | 0x0004)
+        except Exception: pass
+
+    if args.resume:
+        print("  --resume deprecated; use --force-run-with-stale-state.")
+        args.ignore_stale_state = True
+    if args.force_run_with_stale_state:
+        args.ignore_stale_state = True
+    if args.enable_pass:
+        print("  --enable-pass visible in process list; prefer "
+              "$CISCO_ENABLE.")
+    ENABLE_PASSWORD = (args.enable_pass or os.environ.get("CISCO_ENABLE")
+                       or None)
+    ENABLE_USER = (args.enable_user
+                   or os.environ.get("CISCO_ENABLE_USER") or None)
+    if ENABLE_PASSWORD is None and not args.dry_run_revert:
+        print("  (enable password not set -- falling back to SSH password)")
+
+    signal.signal(signal.SIGINT, _on_signal)
+    try: signal.signal(signal.SIGTERM, _on_signal)
+    except (ValueError, OSError, AttributeError): pass
+    if hasattr(signal, "SIGBREAK"):
+        try: signal.signal(signal.SIGBREAK, _on_signal)
+        except (ValueError, OSError): pass
+
+    if args.dry_run_revert: return mode_dry_run_revert()
+    if args.recover:        return mode_recover(args)
+    if args.revert_only:    return mode_recover(
+        args, locations_filter=LOCATIONS_TO_RUN)
+
+    rotate_logs()
+    print_ssh_banner()
+
+    stale = list_state_files()
+    if stale and not (args.ignore_stale_state
+                      or args.force_run_with_stale_state or args.resume):
+        if args.interactive_resume:
+            choice = prompt_resume_or_abort(stale)
+            if choice == "abort":
+                print("  Aborted (state kept)."); return 2
+            args.ignore_stale_state = True
+            if choice == "resume": args.resume_checkpoint = True
+            if choice == "skip":   args.retry_failed = True
+        else:
+            print("\n  Un-reverted temp-config state from earlier run:")
+            for s in stale: print("     - %s" % s)
+            print("  Use --dry-run-revert to inspect, --recover to fix, "
+                  "--interactive-resume to prompt, or "
+                  "--force-run-with-stale-state to proceed.\n")
+            return 2
+
+    for _, fw, _ in MODEL_FIRMWARE_MAP:
+        p = os.path.join(FIRMWARE_DIR, fw)
+        if os.path.isfile(p):
+            FIRMWARE_SIZES[fw] = os.path.getsize(p)
+
+    print("\n  -- Firmware inventory --")
+    for fw_name in sorted(set(fw for _, fw, _ in MODEL_FIRMWARE_MAP)):
+        p = os.path.join(FIRMWARE_DIR, fw_name)
+        if os.path.isfile(p):
+            print("    %-45s %s" % (fw_name, _fmt_bytes(os.path.getsize(p))))
+        else:
+            print("    %-45s MISSING" % fw_name)
+    map_errors, map_warnings = verify_firmware_map()
+    if map_errors:
+        print("\n  FIRMWARE pre-flight FAILED (hard stop):")
+        for e in map_errors: print("     - %s" % e)
+        print("\n  Fix the firmware files and re-run.  If you are certain")
+        print("  the sizes are correct for your platform, override with")
+        print("  --allow-lenient-firmware (NOT recommended).\n")
+        return 1
+    if map_warnings:
+        print("\n  MODEL_FIRMWARE_MAP warnings:")
+        for w in map_warnings: print("     - %s" % w)
+    print("  Firmware pre-flight passed")
+
+    loc_devices = {}
+    if args.hosts:
+        hostmap = build_host_ip_map()
+        all_known = sorted(hostmap.keys())
+        wanted = {h.strip() for h in args.hosts}
+        devices = [{"hostname": h, "ip": hostmap[h]}
+                   for h in wanted if h in hostmap]
+        for h in [x for x in wanted if x not in hostmap]:
+            print("  Host not found: %s" % h)
+            suggestions = suggest_similar_hosts(h, all_known)
+            if suggestions:
+                print("     Did you mean: %s" % ", ".join(suggestions[:3]))
+        if devices: loc_devices["ad-hoc"] = devices
+    else:
+        seen = set()
+        for loc in LOCATIONS_TO_RUN:
+            p = os.path.join(LOCATIONS_DIR, "%s.txt" % loc)
+            if not os.path.isfile(p):
+                print("  Missing: %s -- skipping" % p); continue
+            loc_devices[loc] = load_location(p, reference_hosts=seen)
+            seen.update(d["hostname"] for d in loc_devices[loc])
+
+    dups = detect_duplicate_hostnames(loc_devices)
+    if dups:
+        print("\n  Duplicate hostnames/IPs:")
+        for h, a, b in dups: print("     - %s: %s and %s" % (h, a, b))
+    for loc in list(loc_devices):
+        loc_devices[loc] = filter_devices(loc_devices[loc], args)
+
+    all_devices = [d for ds in loc_devices.values() for d in ds]
+    if not all_devices:
+        print("  No devices to process."); return 1
+
+    user, pw = get_credentials(args)
+
+    if args.inventory:
+        return mode_inventory(all_devices, user, pw)
+    if args.check:
+        return mode_check(all_devices, user, pw)
+    if args.verify_mapping:
+        return mode_verify_mapping(all_devices, user, pw)
+    if args.rollback_dry_run:
+        return mode_rollback(all_devices, user, pw, args, dry=True)
+    if args.rollback:
+        return mode_rollback(all_devices, user, pw, args)
+    if args.estimate_only:
+        return estimate_runtime(all_devices, user, pw)
+
+    if args.only_upgrade_needed:
+        print("\n  -- Filtering to devices that need upgrade --")
+        need, tgt, unr = filter_only_upgrade_needed(all_devices, user, pw)
+        print("    %d need upgrade, %d already on target, %d unreachable"
+              % (len(need), len(tgt), len(unr)))
+        if not need:
+            print("  Nothing to do -- every reachable device is on target.")
+            return 0
+        all_devices = [d for d, _ in need]
+        keep = {d["hostname"] for d in all_devices}
+        loc_devices = {loc: [d for d in devs if d["hostname"] in keep]
+                       for loc, devs in loc_devices.items()}
+        loc_devices = {loc: ds for loc, ds in loc_devices.items() if ds}
+        if not loc_devices:
+            print("  No locations left after filtering."); return 0
+
+    if args.preview or args.preview_only or not args.yes:
+        print_change_preview(all_devices, user, pw)
+        if args.preview_only:
+            print("  Preview-only mode -- exiting."); return 0
+
+    if args.precache_hostkeys:
+        precache_host_keys(all_devices, user, pw)
+    errors, _ = preflight_validation(all_devices, user, pw)
+    if errors:
+        print("  Pre-flight failed -- aborting."); return 1
+    if args.preflight_only:
+        print("  Pre-flight-only mode -- exiting."); return 0
+
+    if not confirm("  Proceed with %supgrade of %d device(s)?"
+                   % ("DRY-RUN of " if DRY_RUN else "",
+                      len(all_devices)), args.yes):
+        print("  Cancelled."); return 1
+
+    all_results, all_revert = {}, {}
+    start_monitor_thread()
+    try:
+        if POOL_LOCATIONS and len(loc_devices) > 1:
+            print("\n  -- POOLED MODE (per-location abort gates) --")
+            master_log("POOLED START: %d locations" % len(loc_devices))
+            all_results, all_revert = _run_pooled(
+                loc_devices, user, pw,
+                resume_checkpoint=args.resume_checkpoint,
+                retry_failed=args.retry_failed)
+        else:
+            locs = list(loc_devices)
+            for i, loc in enumerate(locs):
+                if SHUTDOWN_REQ.is_set(): break
+                p = os.path.join(LOCATIONS_DIR, "%s.txt" % loc)
+                if os.path.isfile(p):
+                    fresh = load_location(p)
+                    if fresh:
+                        loc_devices[loc] = filter_devices(fresh, args)
+                results, aborted, rv = run_location(
+                    loc, loc_devices[loc], user, pw,
+                    resume_checkpoint=args.resume_checkpoint,
+                    retry_failed=args.retry_failed)
+                all_results[loc] = results
+                all_revert[loc] = rv
+                if aborted: break
+                if (PAUSE_BETWEEN_LOCATIONS and i < len(locs) - 1
+                        and not SHUTDOWN_REQ.is_set()):
+                    if not confirm("\n  %s finished. Continue to %s?"
+                                   % (loc, locs[i+1])):
+                        print("  Stopping at operator request."); break
+    finally:
+        stop_monitor_thread()
+        try:
+            all_results, all_revert = _reconcile_failed_devices(
+                all_results, all_revert, user, pw)
+        except Exception as e:
+            master_log("Reconcile pass raised: %s" % e)
+            print("\n  Reconcile pass raised: %s\n" % e)
+        try:
+            write_run_summary(
+                all_results, all_revert, RUN_ID,
+                os.path.join(REPORT_DIR, "run_summary_%s.json" % RUN_ID))
+        except Exception as e:
+            master_log("run_summary raised: %s" % e)
+        if not args.no_html_report:
+            try:
+                write_html_report(
+                    all_results,
+                    os.path.join(REPORT_DIR, "run_%s.html" % RUN_ID))
+            except Exception as e:
+                master_log("HTML raised: %s" % e)
+        if not args.no_health_snapshot and not DRY_RUN:
+            try:
+                post_run_health_snapshot(
+                    all_results, user, pw,
+                    os.path.join(REPORT_DIR, "health_%s.json" % RUN_ID))
+            except Exception as e:
+                master_log("Health raised: %s" % e)
+        failed = print_summary(all_results, all_revert)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

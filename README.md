@@ -4,6 +4,30 @@
 ![Cisco](https://img.shields.io/badge/Cisco-IOS--XE-00A3E0)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
 ![License](https://img.shields.io/badge/License-MIT-green)
+![Status](https://img.shields.io/badge/status-work--in--progress-orange)
+
+> ## ⚠️ Work in progress — this build is not runnable yet
+>
+> `orchestrator.py` in this repository is the **v35.9.43 development merge**, and that file is
+> **incomplete**: it holds the last ~4,900 lines of the program *twice*, but not its header
+> (imports, constants) or its helper block.
+>
+> Static analysis (`pyflakes`) reports **226 undefined names** — 14 stdlib imports, 57 that
+> exist in the older build, and **155 that are not in any source on the development machine**:
+> `wlog`, `set_state`, `do_connect`, `_classify_connect_error`, `_force_wipe_flash`,
+> `_delete_firmware_from_flash`, `_get_all_member_free_bytes`, `_ensure_device_clock_correct`,
+> `_acquire_instance_lock`, `_SWITCH_ROW_RE`, `_ACTIVATE_FORMS`, `_PROMPT_MARKERS` and the
+> timeout/retry constants they need.
+>
+> Consequence: **`python orchestrator.py --help` fails with `NameError`.** It cannot log a
+> line, connect, transfer or install.
+>
+> The complete, tested build is preserved at tag **`v35.9.34`**:
+> `git checkout v35.9.34` (or `git show v35.9.34:orchestrator.py`).
+>
+> Restoring v35.9.43 needs one thing: the top section of the original file — everything from
+> the first line down to `def _run_install_commit_only(...)`. See
+> [Project status](#-project-status).
 
 An enterprise-grade, multi-threaded Python automation tool that orchestrates, executes and
 monitors bulk firmware upgrades across large fleets of Cisco Catalyst switches.
@@ -15,6 +39,23 @@ Upgrading hundreds of network switches by hand is slow, error-prone and disrupti
 SCP transfer, `install add/activate/commit`, reboot monitoring and post-upgrade
 verification — from one resumable, checkpointed run, and it reverts every temporary
 configuration change it made before it exits.
+
+## 🚧 Project status
+
+| | |
+|---|---|
+| Version in this tree | **v35.9.43** (development merge) |
+| State | **Incomplete** — header, constants and helper block are missing |
+| Runnable? | **No.** `NameError` on the first undefined helper/constant |
+| Complete, tested build | tag **`v35.9.34`** → `git checkout v35.9.34` |
+| Evidence | `pyflakes`: 1,160 diagnostics, **226 undefined names** |
+| Breakdown | 14 stdlib imports · 57 defined in v35.9.34 · **155 missing everywhere** |
+| What restores it | the file's top section: imports, constants, helpers up to `def _run_install_commit_only(...)` |
+| Already present in the tail | pscp stall detector, HTML report (`write_html_report`), v35.9.43 self-test entries |
+
+The documentation below describes the complete tool (the v35.9.34 behaviour plus the v35.9.43
+additions that are present in this tree). Run it against the `v35.9.34` tag until the missing
+section is restored.
 
 ## ✨ Key Features
 
@@ -160,6 +201,10 @@ export CISCO_UPGRADE_BASE=/path/to/repo
 
 ### Usage
 
+> These commands apply to a **complete build**. In this tree use tag `v35.9.34`
+> (`git checkout v35.9.34`) — the v35.9.43 merge is missing its header, so the CLI cannot
+> start yet (see [Project status](#-project-status)).
+
 ```bash
 # 1. Self-test the script itself (no devices touched)
 python orchestrator.py --validate
@@ -202,6 +247,7 @@ After each location the orchestrator writes:
 | Artefact | Contents |
 |---|---|
 | `reports/<location>_<RUN_ID>.csv` | One row per device: model, start/target version, timings, result, failure reason |
+| `reports/run_<RUN_ID>.html` | Visual success/failure dashboard (v35.9.43) |
 | `logs/ROLLBACK_<location>_<RUN_ID>.txt` | Per-device rollback hint (previous image / `install` rollback commands) |
 | `logs/master_*.log` + per-device logs | Full audit trail, including every command issued |
 | `state/temp_changes_<RUN_ID>.json` | Temporary config changes that must be (and were) reverted |
