@@ -1,33 +1,17 @@
 # Enterprise Cisco IOS-XE Upgrade Orchestrator
 
+[![CI](https://github.com/rainykarthick-crypto/cisco-xe-upgrade-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/rainykarthick-crypto/cisco-xe-upgrade-orchestrator/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![Cisco](https://img.shields.io/badge/Cisco-IOS--XE-00A3E0)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Status](https://img.shields.io/badge/status-work--in--progress-orange)
+[![Release](https://img.shields.io/github/v/tag/rainykarthick-crypto/cisco-xe-upgrade-orchestrator?label=release)](https://github.com/rainykarthick-crypto/cisco-xe-upgrade-orchestrator/tags)
 
-> ## ⚠️ Work in progress — this build is not runnable yet
->
-> `orchestrator.py` in this repository is the **v35.9.43 development merge**, and that file is
-> **incomplete**: it holds the last ~4,900 lines of the program *twice*, but not its header
-> (imports, constants) or its helper block.
->
-> Static analysis (`pyflakes`) reports **226 undefined names** — 14 stdlib imports, 57 that
-> exist in the older build, and **155 that are not in any source on the development machine**:
-> `wlog`, `set_state`, `do_connect`, `_classify_connect_error`, `_force_wipe_flash`,
-> `_delete_firmware_from_flash`, `_get_all_member_free_bytes`, `_ensure_device_clock_correct`,
-> `_acquire_instance_lock`, `_SWITCH_ROW_RE`, `_ACTIVATE_FORMS`, `_PROMPT_MARKERS` and the
-> timeout/retry constants they need.
->
-> Consequence: **`python orchestrator.py --help` fails with `NameError`.** It cannot log a
-> line, connect, transfer or install.
->
-> The complete, tested build is preserved at tag **`v35.9.34`**:
-> `git checkout v35.9.34` (or `git show v35.9.34:orchestrator.py`).
->
-> Restoring v35.9.43 needs one thing: the top section of the original file — everything from
-> the first line down to `def _run_install_commit_only(...)`. See
-> [Project status](#-project-status).
+> **Build status.** `main` carries the **v35.9.43 development merge**, whose header/helper block
+> is still missing. The runnable, tested build is the **`v35.9.34`** tag —
+> `git checkout v35.9.34`. CI gates on that build (syntax, pyflakes, and the built-in
+> **20/20 self-test**). Full evidence and the exact missing section:
+> [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md).
 
 An enterprise-grade, multi-threaded Python automation tool that orchestrates, executes and
 monitors bulk firmware upgrades across large fleets of Cisco Catalyst switches.
@@ -40,22 +24,23 @@ SCP transfer, `install add/activate/commit`, reboot monitoring and post-upgrade
 verification — from one resumable, checkpointed run, and it reverts every temporary
 configuration change it made before it exits.
 
-## 🚧 Project status
+## 🚦 Project status & quality gates
 
-| | |
-|---|---|
-| Version in this tree | **v35.9.43** (development merge) |
-| State | **Incomplete** — header, constants and helper block are missing |
-| Runnable? | **No.** `NameError` on the first undefined helper/constant |
-| Complete, tested build | tag **`v35.9.34`** → `git checkout v35.9.34` |
-| Evidence | `pyflakes`: 1,160 diagnostics, **226 undefined names** |
-| Breakdown | 14 stdlib imports · 57 defined in v35.9.34 · **155 missing everywhere** |
-| What restores it | the file's top section: imports, constants, helpers up to `def _run_install_commit_only(...)` |
-| Already present in the tail | pscp stall detector, HTML report (`write_html_report`), v35.9.43 self-test entries |
+| Build | State | Use it? |
+|---|---|---|
+| `main` | v35.9.43 development merge — header, constants and helper block missing | ❌ not runnable |
+| `v35.9.34` (tag) | complete build, **20/20 self-tests pass** | ✅ **use this** |
 
-The documentation below describes the complete tool (the v35.9.34 behaviour plus the v35.9.43
-additions that are present in this tree). Run it against the `v35.9.34` tag until the missing
-section is restored.
+| Check | Complete build `v35.9.34` | Working tree `main` |
+|---|---|---|
+| `python -m py_compile orchestrator.py` | passes | passes |
+| `python -m pyflakes orchestrator.py` | clean | 226 undefined names (expected — see status doc) |
+| `python orchestrator.py --validate` | **20/20** | cannot run |
+| `python orchestrator.py --help` | works | `NameError` |
+
+The missing-symbol breakdown (14 stdlib imports · 57 available in v35.9.34 · 155 absent
+everywhere) and the short path to finishing v35.9.43 are in
+[`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md).
 
 ## ✨ Key Features
 
@@ -113,14 +98,24 @@ More detail in [`docs/architecture_workflow.md`](docs/architecture_workflow.md).
 
 ```text
 cisco-xe-upgrade-orchestrator/
-├── orchestrator.py            # the orchestrator (single file, stdlib + netmiko/paramiko)
+├── orchestrator.py            # v35.9.43 merge on main · complete build at tag v35.9.34
 ├── requirements.txt
 ├── config.example.json        # optional tuning overrides -> copy to config.json
 ├── examples/
 │   ├── Location_HQ.txt        # sample inventory (safe placeholder IPs)
 │   └── Location_Wada.txt
 ├── docs/
-│   └── architecture_workflow.md
+│   ├── architecture_workflow.md   # phases, state machine, failure taxonomy
+│   └── PROJECT_STATUS.md          # what is complete, what is missing, how to finish
+├── .github/
+│   ├── workflows/ci.yml       # syntax, pyflakes, 20/20 self-test, repo hygiene
+│   ├── dependabot.yml
+│   ├── ISSUE_TEMPLATE/
+│   └── pull_request_template.md
+├── CHANGELOG.md
+├── CONTRIBUTING.md
+├── SECURITY.md
+├── .gitattributes
 ├── LICENSE
 └── README.md
 ```
@@ -264,11 +259,27 @@ After each location the orchestrator writes:
 * The tool refuses to upgrade on a firmware/model mismatch or when the image cannot fit in
   flash.
 
+## 📚 Documentation
+
+| Document | Contents |
+|---|---|
+| [`docs/architecture_workflow.md`](docs/architecture_workflow.md) | phase model, per-device state machine, concurrency, failure taxonomy, checkpoints |
+| [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) | build status, missing-symbol breakdown, how to finish v35.9.43 |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | invariants, dev setup, checks to run, PR process |
+| [`SECURITY.md`](SECURITY.md) | vulnerability reporting and the credential/host-key risks of this tool |
+| [`CHANGELOG.md`](CHANGELOG.md) | release history |
+| [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | CI: syntax, pyflakes, self-test, repo hygiene |
+| [`LICENSE`](LICENSE) | MIT |
+
 ## 🤝 Contributing
 
 Issues and pull requests are welcome. Please never commit real inventory files, firmware
 images or credentials — `locations/`, `firmware/`, `logs/`, `reports/`, `state/` and
 `backups/` are already git-ignored, and `examples/` contains placeholder data only.
+
+Before opening a pull request run `python -m py_compile orchestrator.py`,
+`python -m pyflakes orchestrator.py` and `python orchestrator.py --validate` — see
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## 📄 License
 
