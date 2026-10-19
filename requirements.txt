@@ -4,5 +4,5 @@
 # The orchestrator imports these lazily, so `--validate`, `--check`, `--help` and
 # `--version` work even before they are installed.
 
-paramiko>=3.4
+paramiko>=5.0.0
 netmiko>=4.3
