@@ -34,7 +34,7 @@ configuration change it made before it exits.
 | Check | Complete build `v35.9.34` | Working tree `main` |
 |---|---|---|
 | `python -m py_compile orchestrator.py` | passes | passes |
-| `python -m pyflakes orchestrator.py` | clean | 226 undefined names (expected — see status doc) |
+| `python -m pyflakes orchestrator.py` | no undefined names (2 unused-import notices) | 226 undefined names (expected — see status doc) |
 | `python orchestrator.py --validate` | **20/20** | cannot run |
 | `python orchestrator.py --help` | works | `NameError` |
 

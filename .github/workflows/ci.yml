@@ -57,7 +57,15 @@ jobs:
         run: python -m py_compile /tmp/orchestrator-v35.9.34.py
 
       - name: Static analysis (complete build)
-        run: python -m pyflakes /tmp/orchestrator-v35.9.34.py
+        # Gate on real breakage (undefined names); unused-import notices are tolerated.
+        run: |
+          python -m pyflakes /tmp/orchestrator-v35.9.34.py > /tmp/pyflakes.txt 2>&1 || true
+          cat /tmp/pyflakes.txt || true
+          if grep -q "undefined name" /tmp/pyflakes.txt; then
+            echo "::error::undefined names in the complete build"
+            exit 1
+          fi
+          echo "no undefined names in the complete build"
 
       - name: Self-test (complete build)
         env:

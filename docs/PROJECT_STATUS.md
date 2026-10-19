@@ -92,8 +92,9 @@ Passed: 20/20
 
 `.github/workflows/ci.yml` (Python 3.10 / 3.11 / 3.12):
 
-* **gating** — syntax check of the working tree; syntax, pyflakes and `--validate` of the
-  tagged v35.9.34 build; documentation/repository hygiene checks;
+* **gating** — syntax check of the working tree; syntax, an undefined-name gate
+  (`pyflakes`, unused-import notices tolerated) and `--validate` of the tagged v35.9.34
+  build; documentation/repository hygiene checks;
 * **informational** (`continue-on-error`) — pyflakes on the incomplete merge, so the missing
   header is visible in the CI log without turning every push red.
 
