@@ -5,4 +5,4 @@
 # `--version` work even before they are installed.
 
 paramiko>=3.4
-netmiko>=4.3
+netmiko>=4.8.0
