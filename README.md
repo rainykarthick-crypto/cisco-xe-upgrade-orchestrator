@@ -67,15 +67,17 @@ wiping, install-state markers, timeouts). Full breakdown and the short path to f
 ## 🏗️ Architecture & Workflow
 
 ```mermaid
-graph TD
-    A[Start] --> B[Phase 1 · Validate & discover]
-    B --> C[Phase 2 · Pre-check: version, model, flash space, boot mode]
-    C --> D[Phase 3 · SCP transfer with stall detection]
-    D --> E[Phase 4 · install add → activate → commit]
-    E --> F[Phase 5 · Reload & boot-loop monitoring]
-    F --> G[Phase 6 · Verify stack, interfaces, image hash, config drift]
-    G --> H[Phase 7 · Revert temp changes · CSV report · rollback doc]
+flowchart TD
+    A([Start]) --> B["Phase 1<br/>Validate and discover"]
+    B --> C["Phase 2<br/>Pre-check: version,<br/>model, space, boot mode"]
+    C --> D["Phase 3<br/>SCP transfer<br/>(stall detection)"]
+    D --> E["Phase 4<br/>install add,<br/>activate, commit"]
+    E --> F["Phase 5<br/>Reload and<br/>boot-loop monitoring"]
+    F --> G["Phase 6<br/>Verify stack,<br/>interfaces, hash, drift"]
+    G --> H["Phase 7<br/>Revert temp changes,<br/>CSV and HTML report"]
 ```
+
+*Static render of the same diagram: [`docs/architecture_workflow.png`](docs/architecture_workflow.png).*
 
 | Phase | What happens | Fails safe by |
 |---|---|---|
