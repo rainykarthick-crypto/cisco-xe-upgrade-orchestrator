@@ -20,7 +20,7 @@ assignees: ''
 
 | | |
 |---|---|
-| Orchestrator version | <!-- v35.9.34 tag / main (v35.9.43 merge) / commit sha --> |
+| Commit (`git rev-parse --short HEAD`) | |
 | Python version (`python -V`) | |
 | OS | |
 | Switch models | <!-- e.g. C9300-48P, C9200L-24P --> |

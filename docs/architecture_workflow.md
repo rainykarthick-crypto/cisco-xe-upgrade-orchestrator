@@ -4,7 +4,7 @@ This document explains how `orchestrator.py` drives a fleet upgrade: the phase m
 per-device state machine, the concurrency model, the safety invariants it must never break,
 and the artefacts a run leaves behind.
 
-Version: **35.9.34** · Target release: **IOS-XE 17.18.04** · Platforms: Catalyst 9200 /
+Target release: **IOS-XE 17.18.04** · Platforms: Catalyst 9200 /
 9200L / 9200CX / 9300 / 9500.
 
 ---

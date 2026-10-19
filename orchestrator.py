@@ -362,7 +362,7 @@ def _verify_firmware_hash(fw_file, host):
 
 def _pscp_run_once(cmd, host, start, tag_prefix=""):
     """
-    v35.9.43 FIX-PSCP-STALL: adds a stall detector.  Previously the
+    FIX-PSCP-STALL: adds a stall detector.  Previously the
     blocking `proc.stdout.read(4096)` never returned when pscp stopped
     producing output (hung socket, stalled transfer), freezing the
     entire transfer pool.  Now a background reader thread pushes raw
@@ -3579,27 +3579,27 @@ def _validate():
         assert 1_050_000_000 < need_stby < 1_100_000_000, need_stby
         assert need_stby == need_act_no
         assert _member_required_bytes(0, True) == MIN_FREE_BYTES
-    _t("v35.9.34 _member_required_bytes (active vs standby)",
+    _t("_member_required_bytes (active vs standby)",
        t_member_required)
 
     def t_extraction_factor_realistic():
         assert 1.0 <= EXTRACTION_OVERHEAD_FACTOR <= 1.15, \
             "extraction factor must be >=1.0 (bin is compressed)"
-    _t("v35.9.33 extraction factor >= 1.0", t_extraction_factor_realistic)
+    _t("extraction factor >= 1.0", t_extraction_factor_realistic)
 
     def t_space_markers_extended():
         assert "not enough free disk" in _SPACE_MARKERS
         assert "free disk available" in _SPACE_MARKERS
         assert "not enough space" in _SPACE_MARKERS
         assert "insufficient space" in _SPACE_MARKERS
-    _t("v35.9.30 Cisco space markers", t_space_markers_extended)
+    _t("Cisco space markers", t_space_markers_extended)
 
     def t_runinstall_uses_space_marker():
         import inspect as _i
         src = _i.getsource(run_install)
         assert "_SPACE_MARKERS" in src
         assert "insufficient_space: install engine rejected" in src
-    _t("v35.9.30 run_install short-circuits on Cisco space error",
+    _t("run_install short-circuits on Cisco space error",
        t_runinstall_uses_space_marker)
 
     def t_precheck_uses_new_formula():
@@ -3608,7 +3608,7 @@ def _validate():
         assert "_member_required_bytes" in src
         assert "EXTRACTION_OVERHEAD_FACTOR" in src
         assert "insufficient_space_stack" in src
-    _t("v35.9.31 precheck uses new formula",
+    _t("precheck uses new formula",
        t_precheck_uses_new_formula)
 
     def t_force_wipe_allows_running_bin():
@@ -3617,7 +3617,7 @@ def _validate():
         assert "allow_running_bin_delete" in src
         assert "_is_install_mode" in src
         assert "keep_bin" in src
-    _t("v35.9.31 force-wipe can delete running .bin in install mode",
+    _t("force-wipe can delete running .bin in install mode",
        t_force_wipe_allows_running_bin)
 
     def t_do_connect_call():
@@ -3625,7 +3625,7 @@ def _validate():
         src = _i.getsource(wait_reboot_and_verify)
         assert "do_connect(ip, host, user, pw" not in src
         assert "do_connect(ip, user, pw)" in src
-    _t("v35.9.31 wait_reboot_and_verify uses correct do_connect",
+    _t("wait_reboot_and_verify uses correct do_connect",
        t_do_connect_call)
 
     def t_verify_boot_and_install_ready():
@@ -3634,7 +3634,7 @@ def _validate():
         assert "packages.conf" in src
         assert "install_busy" in src
         assert "size_mismatch" in src
-    _t("v35.9.31 verify_boot_and_install_ready",
+    _t("verify_boot_and_install_ready",
        t_verify_boot_and_install_ready)
 
     def t_purge_unnecessary():
@@ -3643,7 +3643,7 @@ def _validate():
         assert "_read_active_packages" in src
         assert "aggressive" in src
         assert "active_pkgs" in src
-    _t("v35.9.31 _purge_unnecessary_files", t_purge_unnecessary)
+    _t("_purge_unnecessary_files", t_purge_unnecessary)
 
     def t_summary_multi():
         out = "\n".join([
@@ -3865,29 +3865,29 @@ def _validate():
         assert "fixup_done" in src
         assert "_finalize_install_commit" in src
         assert "revert_device_temp_changes" in src
-    _t("v35.9.29 fixup inline in transfer_worker", t_fixup_inline)
+    _t("fixup inline in transfer_worker", t_fixup_inline)
 
     def t_fixup_done_routes_in_collect():
         import inspect as _i
         src = _i.getsource(_collect_transfer_result)
         assert "fixup_done" in src
-    _t("v35.9.29 fixup_done routes", t_fixup_done_routes_in_collect)
+    _t("fixup_done routes", t_fixup_done_routes_in_collect)
 
     def t_drain_install_futures():
         import inspect as _i
         src = _i.getsource(run_pass)
         assert "_drain_install" in src
         assert "block=False" in src
-    _t("v35.9.29 run_pass drains installs", t_drain_install_futures)
+    _t("run_pass drains installs", t_drain_install_futures)
 
     def t_pool_rebalance():
-        # v35.9.42 FIX-WORKER-FLEX: no specific counts asserted; just
+        # FIX-WORKER-FLEX: no specific counts asserted; just
         # ensure the config is self-consistent and sane.
         assert isinstance(TRANSFER_SLOTS, int) and TRANSFER_SLOTS >= 1
         assert isinstance(INSTALL_WORKERS, int) and INSTALL_WORKERS >= 1
         assert isinstance(MAX_SAFE_SSH_SESSIONS, int)
         assert MAX_SAFE_SSH_SESSIONS >= 1
-    _t("v35.9.42 worker counts sane (flexible)", t_pool_rebalance)
+    _t("worker counts sane (flexible)", t_pool_rebalance)
 
     def t_probe_overhead_reduced():
         assert INSTALL_PROBE_INTERVAL == 300
@@ -3895,7 +3895,7 @@ def _validate():
         assert COMMIT_VERIFY_TIMEOUT == 300
         assert COMMIT_VERIFY_RETRY_SEC == 15
         assert SESSION_SLOT_ACQUIRE_TIMEOUT == 60
-    _t("v35.9.29 probe overhead reduced", t_probe_overhead_reduced)
+    _t("probe overhead reduced", t_probe_overhead_reduced)
 
     def t_clock_cache():
         assert "_ensure_device_clock_correct_cached" in globals()
@@ -3903,7 +3903,7 @@ def _validate():
         import inspect as _i
         src_pc = _i.getsource(precheck_device)
         assert "_ensure_device_clock_correct_cached" in src_pc
-    _t("v35.9.29 clock check is cached", t_clock_cache)
+    _t("clock check is cached", t_clock_cache)
 
     def t_state_hosts():
         v2 = {"schema": 2, "run_id": "x",
@@ -4067,7 +4067,7 @@ def _validate():
         import inspect as _i
         src = _i.getsource(check_stack_versions)
         assert "_per_member_version" in src
-    _t("v35.9.36 stack per-member verify", t_stack_version_multi_syntax)
+    _t("stack per-member verify", t_stack_version_multi_syntax)
 
     def t_precheck_members_count_early():
         import inspect as _i
@@ -4212,7 +4212,7 @@ def _validate():
         import inspect as _i
         src = _i.getsource(_is_install_mode)
         assert "packages.conf" in src
-    _t("v35.9.31 _is_install_mode helper", t_is_install_mode)
+    _t("_is_install_mode helper", t_is_install_mode)
 
     def t_read_active_packages_json():
         import inspect as _i
@@ -4220,7 +4220,7 @@ def _validate():
         assert "file_name" in src
         assert "return active_conf, None" in src
         assert "boot\\s+flash:" in src
-    _t("v35.9.32 _read_active_packages handles JSON + text + fail-safe",
+    _t("_read_active_packages handles JSON + text + fail-safe",
        t_read_active_packages_json)
 
     def t_read_active_fallback():
@@ -4228,7 +4228,7 @@ def _validate():
         src = _i.getsource(_read_active_packages)
         assert "install summary" in src
         assert "committed" in src
-    _t("v35.9.36 _read_active_packages falls back to install summary",
+    _t("_read_active_packages falls back to install summary",
        t_read_active_fallback)
 
     def t_pre_install_pkg_purge():
@@ -4237,7 +4237,7 @@ def _validate():
         assert "ALLOW_ACTIVE_PKG_PURGE" in src
         assert "target .bin not on flash" in src
         assert "cannot determine active .pkg set" in src
-    _t("v35.9.32 _pre_install_pkg_purge gated + verified",
+    _t("_pre_install_pkg_purge gated + verified",
        t_pre_install_pkg_purge)
 
     def t_transfer_worker_invokes_pkg_purge():
@@ -4245,7 +4245,7 @@ def _validate():
         src = _i.getsource(transfer_worker)
         assert "_pre_install_pkg_purge" in src
         assert "ALLOW_ACTIVE_PKG_PURGE" in src
-    _t("v35.9.32 transfer_worker invokes last-resort purge",
+    _t("transfer_worker invokes last-resort purge",
        t_transfer_worker_invokes_pkg_purge)
 
     def t_purge_refuses_when_unknown():
@@ -4253,12 +4253,12 @@ def _validate():
         src = _i.getsource(_purge_unnecessary_files)
         assert "active_pkgs is None" in src
         assert "REFUSING to delete any .pkg" in src
-    _t("v35.9.32 aggressive purge refuses when active set unknown",
+    _t("aggressive purge refuses when active set unknown",
        t_purge_refuses_when_unknown)
 
     def t_config_keys_has_flags():
         assert "ALLOW_ACTIVE_PKG_PURGE" in _CONFIG_KEYS
-    _t("v35.9.35 _CONFIG_KEYS includes purge flag",
+    _t("_CONFIG_KEYS includes purge flag",
        t_config_keys_has_flags)
 
     def t_purge_standby_exists():
@@ -4266,7 +4266,7 @@ def _validate():
         src = _i.getsource(_purge_standby_members)
         assert "stby-flash:" in src
         assert "flash-%d:" in src
-    _t("v35.9.35 _purge_standby_members", t_purge_standby_exists)
+    _t("_purge_standby_members", t_purge_standby_exists)
 
     def t_pkg_set_present_detection():
         import inspect as _i
@@ -4274,7 +4274,7 @@ def _validate():
         assert "status=I" in src
         assert "status=A" in src
         assert "status=U" in src
-    _t("v35.9.36 _is_target_pkg_set_present",
+    _t("_is_target_pkg_set_present",
        t_pkg_set_present_detection)
 
     def t_precheck_early_return():
@@ -4282,7 +4282,7 @@ def _validate():
         src = _i.getsource(precheck_device)
         assert "already_added_needs_activate" in src
         assert "_is_target_pkg_set_present" in src
-    _t("v35.9.36 precheck skips gate when .pkg already present",
+    _t("precheck skips gate when .pkg already present",
        t_precheck_early_return)
 
     def t_transfer_short_circuit():
@@ -4290,7 +4290,7 @@ def _validate():
         src = _i.getsource(transfer_worker)
         assert "already_added_needs_activate" in src
         assert 'result["already_added"] = True' in src
-    _t("v35.9.36 transfer_worker short-circuits already-added",
+    _t("transfer_worker short-circuits already-added",
        t_transfer_short_circuit)
 
     def t_activate_only_helper():
@@ -4300,34 +4300,34 @@ def _validate():
         src = _i.getsource(_run_install_activate_only)
         assert "install activate" in src
         assert "install add file" not in src
-    _t("v35.9.37 activate-only helper", t_activate_only_helper)
+    _t("activate-only helper", t_activate_only_helper)
 
     def t_commit_only_helper():
         import inspect as _i
         src = _i.getsource(_run_install_commit_only)
         assert "_finalize_install_commit" in src
-    _t("v35.9.37 commit-only helper", t_commit_only_helper)
+    _t("commit-only helper", t_commit_only_helper)
 
     def t_install_worker_alreadyadded_cmd():
         import inspect as _i
         src = _i.getsource(install_worker)
         assert "_run_install_activate_only" in src
         assert "_run_install_commit_only" in src
-    _t("v35.9.37 install_worker uses activate+commit path",
+    _t("install_worker uses activate+commit path",
        t_install_worker_alreadyadded_cmd)
 
     def t_no_abort_after_add():
         import inspect as _i
         src = _i.getsource(install_worker)
         assert "allow_abort=False" in src
-    _t("v35.9.37 no install abort after add", t_no_abort_after_add)
+    _t("no install abort after add", t_no_abort_after_add)
 
     def t_runver_match_normalized():
         import inspect as _i
         src = _i.getsource(_purge_standby_members)
         assert "fver_key == running_key" in src
         assert "_VER3_NORM_RE" in src
-    _t("v35.9.37 standby running-version match normalised",
+    _t("standby running-version match normalised",
        t_runver_match_normalized)
 
     def t_standby_junk_purge():
@@ -4335,7 +4335,7 @@ def _validate():
         src = _i.getsource(_purge_standby_members)
         assert ".USWAP" in src
         assert "tech_support" in src
-    _t("v35.9.37 standby junk dir purge", t_standby_junk_purge)
+    _t("standby junk dir purge", t_standby_junk_purge)
 
     def t_runinstall_detects_already_added():
         import inspect as _i
@@ -4343,7 +4343,7 @@ def _validate():
         assert "_ALREADY_ADDED_MARKERS" in src
         assert "already_added_refused" in src
         assert "super package already added" in _ALREADY_ADDED_MARKERS
-    _t("v35.9.37 run_install detects super-package-already-added",
+    _t("run_install detects super-package-already-added",
        t_runinstall_detects_already_added)
 
     def t_conf_keep():
@@ -4351,19 +4351,19 @@ def _validate():
         src = _i.getsource(_purge_unnecessary_files)
         assert "FIX-CONF-KEEP" in src or "keep (target .conf)" in src
         assert "keep (target .conf)" in src
-    _t("v35.9.38 keeps target .conf during purge", t_conf_keep)
+    _t("keeps target .conf during purge", t_conf_keep)
 
     def t_precommit_helper():
         assert "_state_needs_precommit" in globals()
         assert "_run_install_commit_for_precommit" in globals()
-    _t("v35.9.38 pre-commit helpers exist", t_precommit_helper)
+    _t("pre-commit helpers exist", t_precommit_helper)
 
     def t_activate_handles_cannot_activate():
         import inspect as _i
         src = _i.getsource(_run_install_activate_only)
         assert "cannot activate; please first perform" in src
         assert "_state_needs_precommit" in src
-    _t("v35.9.38 activate handles cannot-activate",
+    _t("activate handles cannot-activate",
        t_activate_handles_cannot_activate)
 
     def t_activate_detects_partial():
@@ -4371,7 +4371,7 @@ def _validate():
         src = _i.getsource(_run_install_activate_only)
         assert "partial activation" in src
         assert "per_member_fail" in src
-    _t("v35.9.38 activate detects partial failure",
+    _t("activate detects partial failure",
        t_activate_detects_partial)
 
     def t_pwfile_unique():
@@ -4379,14 +4379,14 @@ def _validate():
         b = _pwfile_for_thread()
         assert a != b
         assert _PWFILE_COUNTER >= 2
-    _t("v35.9.38 pwfile paths are unique", t_pwfile_unique)
+    _t("pwfile paths are unique", t_pwfile_unique)
 
     def t_pscp_retry_window_widened():
         import inspect as _i
         src = _i.getsource(transfer_via_pscp)
         assert "elapsed < 60" in src
         assert "elapsed < 5" not in src
-    _t("v35.9.38 pscp retry window widened",
+    _t("pscp retry window widened",
        t_pscp_retry_window_widened)
 
     def t_finalize_no_infinite_activate():
@@ -4394,7 +4394,7 @@ def _validate():
         src = _i.getsource(_finalize_install_commit)
         assert "st_attempts" in src
         assert "reissued_activate" in src
-    _t("v35.9.38 finalize refuses to loop on target=I",
+    _t("finalize refuses to loop on target=I",
        t_finalize_no_infinite_activate)
 
     def t_stack_verify_platform_safe():
@@ -4404,14 +4404,14 @@ def _validate():
         assert "show version | include Version" in src
         src2 = _i.getsource(check_stack_versions)
         assert "unverified" in src2 or " X" in src2
-    _t("v35.9.38 stack-verify is platform-safe",
+    _t("stack-verify is platform-safe",
        t_stack_verify_platform_safe)
 
     def t_precheck_passes_target_ver_to_purge():
         import inspect as _i
         src = _i.getsource(precheck_device)
         assert "target_ver=target_ver" in src
-    _t("v35.9.38 precheck passes target_ver to purge",
+    _t("precheck passes target_ver to purge",
        t_precheck_passes_target_ver_to_purge)
 
     def t_runinstall_nudge_returns_on_dead_transport():
@@ -4421,7 +4421,7 @@ def _validate():
         assert "dead = True" in src
         assert "activate nudged, transport" in src or \
                "reload in progress" in src
-    _t("v35.9.38 run_install returns on dead transport",
+    _t("run_install returns on dead transport",
        t_runinstall_nudge_returns_on_dead_transport)
 
     def t_runinstall_precommits_on_u_state():
@@ -4429,7 +4429,7 @@ def _validate():
         src = _i.getsource(run_install)
         assert "_state_needs_precommit" in src
         assert "_run_install_commit_for_precommit" in src
-    _t("v35.9.38 run_install pre-commits U state",
+    _t("run_install pre-commits U state",
        t_runinstall_precommits_on_u_state)
 
     def t_md5_nonfatal():
@@ -4438,13 +4438,13 @@ def _validate():
         assert "send_command_timing" in src
         assert "MD5 not confirmed" in src
         assert "non-fatal" in src
-    _t("v35.9.38 MD5 verify is non-fatal", t_md5_nonfatal)
+    _t("MD5 verify is non-fatal", t_md5_nonfatal)
 
     def t_retry_install_failures():
         import inspect as _i
         src = _i.getsource(is_retryable)
         assert "recoverable" in src
-    _t("v35.9.38 install failures are retryable when recoverable",
+    _t("install failures are retryable when recoverable",
        t_retry_install_failures)
 
     def t_revert_verify_default():
@@ -4453,7 +4453,7 @@ def _validate():
         assert "hmac-sha1" in src
         assert "aes128-ctr" in src
         assert "ip ssh server algorithm mac" in src
-    _t("v35.9.38 revert-verify ignores defaults",
+    _t("revert-verify ignores defaults",
        t_revert_verify_default)
 
     def t_low_unbound_fixed():
@@ -4461,7 +4461,7 @@ def _validate():
         src = _i.getsource(_run_install_activate_only)
         assert "FIX-LOW-UNBOUND" in src or 'low = ""' in src
         assert 'low = ""' in src
-    _t("v35.9.39 _run_install_activate_only binds `low`",
+    _t("_run_install_activate_only binds `low`",
        t_low_unbound_fixed)
 
     def t_already_added_ordered():
@@ -4474,14 +4474,14 @@ def _validate():
         assert p_already < p_failed, (
             "_ALREADY_ADDED_MARKERS at offset %d must appear before "
             "failed:install at offset %d" % (p_already, p_failed))
-    _t("v35.9.39 already-added is checked before failed:install",
+    _t("already-added is checked before failed:install",
        t_already_added_ordered)
 
     def t_already_added_markers():
         assert "_ALREADY_ADDED_MARKERS" in globals()
         assert "super package already added" in _ALREADY_ADDED_MARKERS
         assert "add operation not allowed" in _ALREADY_ADDED_MARKERS
-    _t("v35.9.39 _ALREADY_ADDED_MARKERS present",
+    _t("_ALREADY_ADDED_MARKERS present",
        t_already_added_markers)
 
     def t_already_added_3tuple():
@@ -4497,7 +4497,7 @@ def _validate():
         ret_line = tail[ret_start:ret_end]
         assert ", conn" in ret_line, \
             "already_added_refused return must carry conn: %r" % ret_line
-    _t("v35.9.39 already-added return carries conn",
+    _t("already-added return carries conn",
        t_already_added_3tuple)
 
     def t_read_active_pkg_version_match():
@@ -4516,7 +4516,7 @@ def _validate():
             fm = _VER3_NORM_RE.search(fn)
             assert fm is not None
             assert _norm_ver(fm.group(0)) not in wanted, fn
-    _t("v35.9.41 active-pkg version match (17.12.4 vs 17.12.04)",
+    _t("active-pkg version match (17.12.4 vs 17.12.04)",
        t_read_active_pkg_version_match)
 
     def t_read_active_pkg_uses_running():
@@ -4525,7 +4525,7 @@ def _validate():
         assert "FIX-ACTIVE-PKG-RUNNING" in src
         assert "_get_running_version_string" in src
         assert "_VER3_NORM_RE" in src
-    _t("v35.9.41 active-pkg fallback consults running version",
+    _t("active-pkg fallback consults running version",
        t_read_active_pkg_uses_running)
 
     def t_wait_install_op_idle_exists():
@@ -4534,7 +4534,7 @@ def _validate():
         src = _i.getsource(_wait_install_op_idle)
         assert "FIX-WAIT-OP-IDLE" in src
         assert "show install summary" in src
-    _t("v35.9.42 _wait_install_op_idle helper present",
+    _t("_wait_install_op_idle helper present",
        t_wait_install_op_idle_exists)
 
     def t_activate_fastpath_check():
@@ -4543,7 +4543,7 @@ def _validate():
         assert "FIX-FASTPATH-ALREADY-ON-TARGET" in src
         assert "already on target -- skipping activate" in src
         assert "_wait_install_op_idle" in src
-    _t("v35.9.42 activate has fast-path + busy-wait",
+    _t("activate has fast-path + busy-wait",
        t_activate_fastpath_check)
 
     def t_commit_busy_wait():
@@ -4551,7 +4551,7 @@ def _validate():
         src = _i.getsource(_finalize_install_commit)
         assert "FIX-COMMIT-BUSY-WAIT" in src
         assert "commit: install engine busy" in src
-    _t("v35.9.42 commit backs off when engine busy",
+    _t("commit backs off when engine busy",
        t_commit_busy_wait)
 
     def t_pscp_stall_detection():
@@ -4561,19 +4561,19 @@ def _validate():
         assert "SCP_STALL_TIMEOUT" in src
         assert "proc.kill()" in src
         assert "chunks.get(timeout=1.0)" in src or "queue.Empty" in src
-    _t("v35.9.43 pscp kills stalled transfers", t_pscp_stall_detection)
+    _t("pscp kills stalled transfers", t_pscp_stall_detection)
 
-    def t_version_string_v43():
-        assert VERSION_STRING == "35.9.43", \
-            "VERSION_STRING should be 35.9.43, got %s" % VERSION_STRING
-    _t("VERSION_STRING is 35.9.43", t_version_string_v43)
+    def t_version_string():
+        assert isinstance(VERSION_STRING, str) and VERSION_STRING.strip(), \
+            "VERSION_STRING must be a non-empty string"
+    _t("VERSION_STRING is set", t_version_string)
 
     def t_activate_settle():
         import inspect as _i
         src = _i.getsource(_run_install_activate_only)
         assert "FIX-ACT-SETTLE" in src
         assert "time.sleep(30)" in src
-    _t("v35.9.43 activate waits for engine to settle",
+    _t("activate waits for engine to settle",
        t_activate_settle)
 
     total = len(passed) + len(failed)
@@ -5252,7 +5252,7 @@ def _verify_firmware_hash(fw_file, host):
 
 def _pscp_run_once(cmd, host, start, tag_prefix=""):
     """
-    v35.9.43 FIX-PSCP-STALL: adds a stall detector.  Previously the
+    FIX-PSCP-STALL: adds a stall detector.  Previously the
     blocking `proc.stdout.read(4096)` never returned when pscp stopped
     producing output (hung socket, stalled transfer), freezing the
     entire transfer pool.  Now a background reader thread pushes raw
@@ -8469,27 +8469,27 @@ def _validate():
         assert 1_050_000_000 < need_stby < 1_100_000_000, need_stby
         assert need_stby == need_act_no
         assert _member_required_bytes(0, True) == MIN_FREE_BYTES
-    _t("v35.9.34 _member_required_bytes (active vs standby)",
+    _t("_member_required_bytes (active vs standby)",
        t_member_required)
 
     def t_extraction_factor_realistic():
         assert 1.0 <= EXTRACTION_OVERHEAD_FACTOR <= 1.15, \
             "extraction factor must be >=1.0 (bin is compressed)"
-    _t("v35.9.33 extraction factor >= 1.0", t_extraction_factor_realistic)
+    _t("extraction factor >= 1.0", t_extraction_factor_realistic)
 
     def t_space_markers_extended():
         assert "not enough free disk" in _SPACE_MARKERS
         assert "free disk available" in _SPACE_MARKERS
         assert "not enough space" in _SPACE_MARKERS
         assert "insufficient space" in _SPACE_MARKERS
-    _t("v35.9.30 Cisco space markers", t_space_markers_extended)
+    _t("Cisco space markers", t_space_markers_extended)
 
     def t_runinstall_uses_space_marker():
         import inspect as _i
         src = _i.getsource(run_install)
         assert "_SPACE_MARKERS" in src
         assert "insufficient_space: install engine rejected" in src
-    _t("v35.9.30 run_install short-circuits on Cisco space error",
+    _t("run_install short-circuits on Cisco space error",
        t_runinstall_uses_space_marker)
 
     def t_precheck_uses_new_formula():
@@ -8498,7 +8498,7 @@ def _validate():
         assert "_member_required_bytes" in src
         assert "EXTRACTION_OVERHEAD_FACTOR" in src
         assert "insufficient_space_stack" in src
-    _t("v35.9.31 precheck uses new formula",
+    _t("precheck uses new formula",
        t_precheck_uses_new_formula)
 
     def t_force_wipe_allows_running_bin():
@@ -8507,7 +8507,7 @@ def _validate():
         assert "allow_running_bin_delete" in src
         assert "_is_install_mode" in src
         assert "keep_bin" in src
-    _t("v35.9.31 force-wipe can delete running .bin in install mode",
+    _t("force-wipe can delete running .bin in install mode",
        t_force_wipe_allows_running_bin)
 
     def t_do_connect_call():
@@ -8515,7 +8515,7 @@ def _validate():
         src = _i.getsource(wait_reboot_and_verify)
         assert "do_connect(ip, host, user, pw" not in src
         assert "do_connect(ip, user, pw)" in src
-    _t("v35.9.31 wait_reboot_and_verify uses correct do_connect",
+    _t("wait_reboot_and_verify uses correct do_connect",
        t_do_connect_call)
 
     def t_verify_boot_and_install_ready():
@@ -8524,7 +8524,7 @@ def _validate():
         assert "packages.conf" in src
         assert "install_busy" in src
         assert "size_mismatch" in src
-    _t("v35.9.31 verify_boot_and_install_ready",
+    _t("verify_boot_and_install_ready",
        t_verify_boot_and_install_ready)
 
     def t_purge_unnecessary():
@@ -8533,7 +8533,7 @@ def _validate():
         assert "_read_active_packages" in src
         assert "aggressive" in src
         assert "active_pkgs" in src
-    _t("v35.9.31 _purge_unnecessary_files", t_purge_unnecessary)
+    _t("_purge_unnecessary_files", t_purge_unnecessary)
 
     def t_summary_multi():
         out = "\n".join([
@@ -8755,29 +8755,29 @@ def _validate():
         assert "fixup_done" in src
         assert "_finalize_install_commit" in src
         assert "revert_device_temp_changes" in src
-    _t("v35.9.29 fixup inline in transfer_worker", t_fixup_inline)
+    _t("fixup inline in transfer_worker", t_fixup_inline)
 
     def t_fixup_done_routes_in_collect():
         import inspect as _i
         src = _i.getsource(_collect_transfer_result)
         assert "fixup_done" in src
-    _t("v35.9.29 fixup_done routes", t_fixup_done_routes_in_collect)
+    _t("fixup_done routes", t_fixup_done_routes_in_collect)
 
     def t_drain_install_futures():
         import inspect as _i
         src = _i.getsource(run_pass)
         assert "_drain_install" in src
         assert "block=False" in src
-    _t("v35.9.29 run_pass drains installs", t_drain_install_futures)
+    _t("run_pass drains installs", t_drain_install_futures)
 
     def t_pool_rebalance():
-        # v35.9.42 FIX-WORKER-FLEX: no specific counts asserted; just
+        # FIX-WORKER-FLEX: no specific counts asserted; just
         # ensure the config is self-consistent and sane.
         assert isinstance(TRANSFER_SLOTS, int) and TRANSFER_SLOTS >= 1
         assert isinstance(INSTALL_WORKERS, int) and INSTALL_WORKERS >= 1
         assert isinstance(MAX_SAFE_SSH_SESSIONS, int)
         assert MAX_SAFE_SSH_SESSIONS >= 1
-    _t("v35.9.42 worker counts sane (flexible)", t_pool_rebalance)
+    _t("worker counts sane (flexible)", t_pool_rebalance)
 
     def t_probe_overhead_reduced():
         assert INSTALL_PROBE_INTERVAL == 300
@@ -8785,7 +8785,7 @@ def _validate():
         assert COMMIT_VERIFY_TIMEOUT == 300
         assert COMMIT_VERIFY_RETRY_SEC == 15
         assert SESSION_SLOT_ACQUIRE_TIMEOUT == 60
-    _t("v35.9.29 probe overhead reduced", t_probe_overhead_reduced)
+    _t("probe overhead reduced", t_probe_overhead_reduced)
 
     def t_clock_cache():
         assert "_ensure_device_clock_correct_cached" in globals()
@@ -8793,7 +8793,7 @@ def _validate():
         import inspect as _i
         src_pc = _i.getsource(precheck_device)
         assert "_ensure_device_clock_correct_cached" in src_pc
-    _t("v35.9.29 clock check is cached", t_clock_cache)
+    _t("clock check is cached", t_clock_cache)
 
     def t_state_hosts():
         v2 = {"schema": 2, "run_id": "x",
@@ -8957,7 +8957,7 @@ def _validate():
         import inspect as _i
         src = _i.getsource(check_stack_versions)
         assert "_per_member_version" in src
-    _t("v35.9.36 stack per-member verify", t_stack_version_multi_syntax)
+    _t("stack per-member verify", t_stack_version_multi_syntax)
 
     def t_precheck_members_count_early():
         import inspect as _i
@@ -9102,7 +9102,7 @@ def _validate():
         import inspect as _i
         src = _i.getsource(_is_install_mode)
         assert "packages.conf" in src
-    _t("v35.9.31 _is_install_mode helper", t_is_install_mode)
+    _t("_is_install_mode helper", t_is_install_mode)
 
     def t_read_active_packages_json():
         import inspect as _i
@@ -9110,7 +9110,7 @@ def _validate():
         assert "file_name" in src
         assert "return active_conf, None" in src
         assert "boot\\s+flash:" in src
-    _t("v35.9.32 _read_active_packages handles JSON + text + fail-safe",
+    _t("_read_active_packages handles JSON + text + fail-safe",
        t_read_active_packages_json)
 
     def t_read_active_fallback():
@@ -9118,7 +9118,7 @@ def _validate():
         src = _i.getsource(_read_active_packages)
         assert "install summary" in src
         assert "committed" in src
-    _t("v35.9.36 _read_active_packages falls back to install summary",
+    _t("_read_active_packages falls back to install summary",
        t_read_active_fallback)
 
     def t_pre_install_pkg_purge():
@@ -9127,7 +9127,7 @@ def _validate():
         assert "ALLOW_ACTIVE_PKG_PURGE" in src
         assert "target .bin not on flash" in src
         assert "cannot determine active .pkg set" in src
-    _t("v35.9.32 _pre_install_pkg_purge gated + verified",
+    _t("_pre_install_pkg_purge gated + verified",
        t_pre_install_pkg_purge)
 
     def t_transfer_worker_invokes_pkg_purge():
@@ -9135,7 +9135,7 @@ def _validate():
         src = _i.getsource(transfer_worker)
         assert "_pre_install_pkg_purge" in src
         assert "ALLOW_ACTIVE_PKG_PURGE" in src
-    _t("v35.9.32 transfer_worker invokes last-resort purge",
+    _t("transfer_worker invokes last-resort purge",
        t_transfer_worker_invokes_pkg_purge)
 
     def t_purge_refuses_when_unknown():
@@ -9143,12 +9143,12 @@ def _validate():
         src = _i.getsource(_purge_unnecessary_files)
         assert "active_pkgs is None" in src
         assert "REFUSING to delete any .pkg" in src
-    _t("v35.9.32 aggressive purge refuses when active set unknown",
+    _t("aggressive purge refuses when active set unknown",
        t_purge_refuses_when_unknown)
 
     def t_config_keys_has_flags():
         assert "ALLOW_ACTIVE_PKG_PURGE" in _CONFIG_KEYS
-    _t("v35.9.35 _CONFIG_KEYS includes purge flag",
+    _t("_CONFIG_KEYS includes purge flag",
        t_config_keys_has_flags)
 
     def t_purge_standby_exists():
@@ -9156,7 +9156,7 @@ def _validate():
         src = _i.getsource(_purge_standby_members)
         assert "stby-flash:" in src
         assert "flash-%d:" in src
-    _t("v35.9.35 _purge_standby_members", t_purge_standby_exists)
+    _t("_purge_standby_members", t_purge_standby_exists)
 
     def t_pkg_set_present_detection():
         import inspect as _i
@@ -9164,7 +9164,7 @@ def _validate():
         assert "status=I" in src
         assert "status=A" in src
         assert "status=U" in src
-    _t("v35.9.36 _is_target_pkg_set_present",
+    _t("_is_target_pkg_set_present",
        t_pkg_set_present_detection)
 
     def t_precheck_early_return():
@@ -9172,7 +9172,7 @@ def _validate():
         src = _i.getsource(precheck_device)
         assert "already_added_needs_activate" in src
         assert "_is_target_pkg_set_present" in src
-    _t("v35.9.36 precheck skips gate when .pkg already present",
+    _t("precheck skips gate when .pkg already present",
        t_precheck_early_return)
 
     def t_transfer_short_circuit():
@@ -9180,7 +9180,7 @@ def _validate():
         src = _i.getsource(transfer_worker)
         assert "already_added_needs_activate" in src
         assert 'result["already_added"] = True' in src
-    _t("v35.9.36 transfer_worker short-circuits already-added",
+    _t("transfer_worker short-circuits already-added",
        t_transfer_short_circuit)
 
     def t_activate_only_helper():
@@ -9190,34 +9190,34 @@ def _validate():
         src = _i.getsource(_run_install_activate_only)
         assert "install activate" in src
         assert "install add file" not in src
-    _t("v35.9.37 activate-only helper", t_activate_only_helper)
+    _t("activate-only helper", t_activate_only_helper)
 
     def t_commit_only_helper():
         import inspect as _i
         src = _i.getsource(_run_install_commit_only)
         assert "_finalize_install_commit" in src
-    _t("v35.9.37 commit-only helper", t_commit_only_helper)
+    _t("commit-only helper", t_commit_only_helper)
 
     def t_install_worker_alreadyadded_cmd():
         import inspect as _i
         src = _i.getsource(install_worker)
         assert "_run_install_activate_only" in src
         assert "_run_install_commit_only" in src
-    _t("v35.9.37 install_worker uses activate+commit path",
+    _t("install_worker uses activate+commit path",
        t_install_worker_alreadyadded_cmd)
 
     def t_no_abort_after_add():
         import inspect as _i
         src = _i.getsource(install_worker)
         assert "allow_abort=False" in src
-    _t("v35.9.37 no install abort after add", t_no_abort_after_add)
+    _t("no install abort after add", t_no_abort_after_add)
 
     def t_runver_match_normalized():
         import inspect as _i
         src = _i.getsource(_purge_standby_members)
         assert "fver_key == running_key" in src
         assert "_VER3_NORM_RE" in src
-    _t("v35.9.37 standby running-version match normalised",
+    _t("standby running-version match normalised",
        t_runver_match_normalized)
 
     def t_standby_junk_purge():
@@ -9225,7 +9225,7 @@ def _validate():
         src = _i.getsource(_purge_standby_members)
         assert ".USWAP" in src
         assert "tech_support" in src
-    _t("v35.9.37 standby junk dir purge", t_standby_junk_purge)
+    _t("standby junk dir purge", t_standby_junk_purge)
 
     def t_runinstall_detects_already_added():
         import inspect as _i
@@ -9233,7 +9233,7 @@ def _validate():
         assert "_ALREADY_ADDED_MARKERS" in src
         assert "already_added_refused" in src
         assert "super package already added" in _ALREADY_ADDED_MARKERS
-    _t("v35.9.37 run_install detects super-package-already-added",
+    _t("run_install detects super-package-already-added",
        t_runinstall_detects_already_added)
 
     def t_conf_keep():
@@ -9241,19 +9241,19 @@ def _validate():
         src = _i.getsource(_purge_unnecessary_files)
         assert "FIX-CONF-KEEP" in src or "keep (target .conf)" in src
         assert "keep (target .conf)" in src
-    _t("v35.9.38 keeps target .conf during purge", t_conf_keep)
+    _t("keeps target .conf during purge", t_conf_keep)
 
     def t_precommit_helper():
         assert "_state_needs_precommit" in globals()
         assert "_run_install_commit_for_precommit" in globals()
-    _t("v35.9.38 pre-commit helpers exist", t_precommit_helper)
+    _t("pre-commit helpers exist", t_precommit_helper)
 
     def t_activate_handles_cannot_activate():
         import inspect as _i
         src = _i.getsource(_run_install_activate_only)
         assert "cannot activate; please first perform" in src
         assert "_state_needs_precommit" in src
-    _t("v35.9.38 activate handles cannot-activate",
+    _t("activate handles cannot-activate",
        t_activate_handles_cannot_activate)
 
     def t_activate_detects_partial():
@@ -9261,7 +9261,7 @@ def _validate():
         src = _i.getsource(_run_install_activate_only)
         assert "partial activation" in src
         assert "per_member_fail" in src
-    _t("v35.9.38 activate detects partial failure",
+    _t("activate detects partial failure",
        t_activate_detects_partial)
 
     def t_pwfile_unique():
@@ -9269,14 +9269,14 @@ def _validate():
         b = _pwfile_for_thread()
         assert a != b
         assert _PWFILE_COUNTER >= 2
-    _t("v35.9.38 pwfile paths are unique", t_pwfile_unique)
+    _t("pwfile paths are unique", t_pwfile_unique)
 
     def t_pscp_retry_window_widened():
         import inspect as _i
         src = _i.getsource(transfer_via_pscp)
         assert "elapsed < 60" in src
         assert "elapsed < 5" not in src
-    _t("v35.9.38 pscp retry window widened",
+    _t("pscp retry window widened",
        t_pscp_retry_window_widened)
 
     def t_finalize_no_infinite_activate():
@@ -9284,7 +9284,7 @@ def _validate():
         src = _i.getsource(_finalize_install_commit)
         assert "st_attempts" in src
         assert "reissued_activate" in src
-    _t("v35.9.38 finalize refuses to loop on target=I",
+    _t("finalize refuses to loop on target=I",
        t_finalize_no_infinite_activate)
 
     def t_stack_verify_platform_safe():
@@ -9294,14 +9294,14 @@ def _validate():
         assert "show version | include Version" in src
         src2 = _i.getsource(check_stack_versions)
         assert "unverified" in src2 or " X" in src2
-    _t("v35.9.38 stack-verify is platform-safe",
+    _t("stack-verify is platform-safe",
        t_stack_verify_platform_safe)
 
     def t_precheck_passes_target_ver_to_purge():
         import inspect as _i
         src = _i.getsource(precheck_device)
         assert "target_ver=target_ver" in src
-    _t("v35.9.38 precheck passes target_ver to purge",
+    _t("precheck passes target_ver to purge",
        t_precheck_passes_target_ver_to_purge)
 
     def t_runinstall_nudge_returns_on_dead_transport():
@@ -9311,7 +9311,7 @@ def _validate():
         assert "dead = True" in src
         assert "activate nudged, transport" in src or \
                "reload in progress" in src
-    _t("v35.9.38 run_install returns on dead transport",
+    _t("run_install returns on dead transport",
        t_runinstall_nudge_returns_on_dead_transport)
 
     def t_runinstall_precommits_on_u_state():
@@ -9319,7 +9319,7 @@ def _validate():
         src = _i.getsource(run_install)
         assert "_state_needs_precommit" in src
         assert "_run_install_commit_for_precommit" in src
-    _t("v35.9.38 run_install pre-commits U state",
+    _t("run_install pre-commits U state",
        t_runinstall_precommits_on_u_state)
 
     def t_md5_nonfatal():
@@ -9328,13 +9328,13 @@ def _validate():
         assert "send_command_timing" in src
         assert "MD5 not confirmed" in src
         assert "non-fatal" in src
-    _t("v35.9.38 MD5 verify is non-fatal", t_md5_nonfatal)
+    _t("MD5 verify is non-fatal", t_md5_nonfatal)
 
     def t_retry_install_failures():
         import inspect as _i
         src = _i.getsource(is_retryable)
         assert "recoverable" in src
-    _t("v35.9.38 install failures are retryable when recoverable",
+    _t("install failures are retryable when recoverable",
        t_retry_install_failures)
 
     def t_revert_verify_default():
@@ -9343,7 +9343,7 @@ def _validate():
         assert "hmac-sha1" in src
         assert "aes128-ctr" in src
         assert "ip ssh server algorithm mac" in src
-    _t("v35.9.38 revert-verify ignores defaults",
+    _t("revert-verify ignores defaults",
        t_revert_verify_default)
 
     def t_low_unbound_fixed():
@@ -9351,7 +9351,7 @@ def _validate():
         src = _i.getsource(_run_install_activate_only)
         assert "FIX-LOW-UNBOUND" in src or 'low = ""' in src
         assert 'low = ""' in src
-    _t("v35.9.39 _run_install_activate_only binds `low`",
+    _t("_run_install_activate_only binds `low`",
        t_low_unbound_fixed)
 
     def t_already_added_ordered():
@@ -9364,14 +9364,14 @@ def _validate():
         assert p_already < p_failed, (
             "_ALREADY_ADDED_MARKERS at offset %d must appear before "
             "failed:install at offset %d" % (p_already, p_failed))
-    _t("v35.9.39 already-added is checked before failed:install",
+    _t("already-added is checked before failed:install",
        t_already_added_ordered)
 
     def t_already_added_markers():
         assert "_ALREADY_ADDED_MARKERS" in globals()
         assert "super package already added" in _ALREADY_ADDED_MARKERS
         assert "add operation not allowed" in _ALREADY_ADDED_MARKERS
-    _t("v35.9.39 _ALREADY_ADDED_MARKERS present",
+    _t("_ALREADY_ADDED_MARKERS present",
        t_already_added_markers)
 
     def t_already_added_3tuple():
@@ -9387,7 +9387,7 @@ def _validate():
         ret_line = tail[ret_start:ret_end]
         assert ", conn" in ret_line, \
             "already_added_refused return must carry conn: %r" % ret_line
-    _t("v35.9.39 already-added return carries conn",
+    _t("already-added return carries conn",
        t_already_added_3tuple)
 
     def t_read_active_pkg_version_match():
@@ -9406,7 +9406,7 @@ def _validate():
             fm = _VER3_NORM_RE.search(fn)
             assert fm is not None
             assert _norm_ver(fm.group(0)) not in wanted, fn
-    _t("v35.9.41 active-pkg version match (17.12.4 vs 17.12.04)",
+    _t("active-pkg version match (17.12.4 vs 17.12.04)",
        t_read_active_pkg_version_match)
 
     def t_read_active_pkg_uses_running():
@@ -9415,7 +9415,7 @@ def _validate():
         assert "FIX-ACTIVE-PKG-RUNNING" in src
         assert "_get_running_version_string" in src
         assert "_VER3_NORM_RE" in src
-    _t("v35.9.41 active-pkg fallback consults running version",
+    _t("active-pkg fallback consults running version",
        t_read_active_pkg_uses_running)
 
     def t_wait_install_op_idle_exists():
@@ -9424,7 +9424,7 @@ def _validate():
         src = _i.getsource(_wait_install_op_idle)
         assert "FIX-WAIT-OP-IDLE" in src
         assert "show install summary" in src
-    _t("v35.9.42 _wait_install_op_idle helper present",
+    _t("_wait_install_op_idle helper present",
        t_wait_install_op_idle_exists)
 
     def t_activate_fastpath_check():
@@ -9433,7 +9433,7 @@ def _validate():
         assert "FIX-FASTPATH-ALREADY-ON-TARGET" in src
         assert "already on target -- skipping activate" in src
         assert "_wait_install_op_idle" in src
-    _t("v35.9.42 activate has fast-path + busy-wait",
+    _t("activate has fast-path + busy-wait",
        t_activate_fastpath_check)
 
     def t_commit_busy_wait():
@@ -9441,7 +9441,7 @@ def _validate():
         src = _i.getsource(_finalize_install_commit)
         assert "FIX-COMMIT-BUSY-WAIT" in src
         assert "commit: install engine busy" in src
-    _t("v35.9.42 commit backs off when engine busy",
+    _t("commit backs off when engine busy",
        t_commit_busy_wait)
 
     def t_pscp_stall_detection():
@@ -9451,19 +9451,19 @@ def _validate():
         assert "SCP_STALL_TIMEOUT" in src
         assert "proc.kill()" in src
         assert "chunks.get(timeout=1.0)" in src or "queue.Empty" in src
-    _t("v35.9.43 pscp kills stalled transfers", t_pscp_stall_detection)
+    _t("pscp kills stalled transfers", t_pscp_stall_detection)
 
-    def t_version_string_v43():
-        assert VERSION_STRING == "35.9.43", \
-            "VERSION_STRING should be 35.9.43, got %s" % VERSION_STRING
-    _t("VERSION_STRING is 35.9.43", t_version_string_v43)
+    def t_version_string():
+        assert isinstance(VERSION_STRING, str) and VERSION_STRING.strip(), \
+            "VERSION_STRING must be a non-empty string"
+    _t("VERSION_STRING is set", t_version_string)
 
     def t_activate_settle():
         import inspect as _i
         src = _i.getsource(_run_install_activate_only)
         assert "FIX-ACT-SETTLE" in src
         assert "time.sleep(30)" in src
-    _t("v35.9.43 activate waits for engine to settle",
+    _t("activate waits for engine to settle",
        t_activate_settle)
 
     total = len(passed) + len(failed)

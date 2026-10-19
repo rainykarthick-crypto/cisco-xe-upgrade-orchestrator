@@ -5,13 +5,12 @@
 ![Cisco](https://img.shields.io/badge/Cisco-IOS--XE-00A3E0)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
 ![License](https://img.shields.io/badge/License-MIT-green)
-[![Release](https://img.shields.io/github/v/tag/rainykarthick-crypto/cisco-xe-upgrade-orchestrator?label=release)](https://github.com/rainykarthick-crypto/cisco-xe-upgrade-orchestrator/tags)
+[![Status](https://img.shields.io/badge/status-development-orange)](docs/PROJECT_STATUS.md)
 
-> **Build status.** `main` carries the **v35.9.43 development merge**, whose header/helper block
-> is still missing. The runnable, tested build is the **`v35.9.34`** tag —
-> `git checkout v35.9.34`. CI gates on that build (syntax, pyflakes, and the built-in
-> **20/20 self-test**). Full evidence and the exact missing section:
-> [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md).
+> **Development build.** The single-file module is still being assembled — its header
+> (imports, constants) and helper block are not in place yet, so the CLI exits immediately.
+> [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) lists exactly what is missing and how to
+> finish it.
 
 An enterprise-grade, multi-threaded Python automation tool that orchestrates, executes and
 monitors bulk firmware upgrades across large fleets of Cisco Catalyst switches.
@@ -24,22 +23,18 @@ SCP transfer, `install add/activate/commit`, reboot monitoring and post-upgrade
 verification — from one resumable, checkpointed run, and it reverts every temporary
 configuration change it made before it exits.
 
-## 🚦 Project status & quality gates
+## 🚦 Development status
 
-| Build | State | Use it? |
-|---|---|---|
-| `main` | v35.9.43 development merge — header, constants and helper block missing | ❌ not runnable |
-| `v35.9.34` (tag) | complete build, **20/20 self-tests pass** | ✅ **use this** |
+| Check | Result |
+|---|---|
+| `python -m py_compile orchestrator.py` | passes (syntax is valid) |
+| `python -m pyflakes orchestrator.py` | 226 undefined names — the header/helper block is missing |
+| `python orchestrator.py --help` | fails (`NameError`) until that section is added |
+| `python orchestrator.py --validate` | cannot run yet |
 
-| Check | Complete build `v35.9.34` | Working tree `main` |
-|---|---|---|
-| `python -m py_compile orchestrator.py` | passes | passes |
-| `python -m pyflakes orchestrator.py` | no undefined names (2 unused-import notices) | 226 undefined names (expected — see status doc) |
-| `python orchestrator.py --validate` | **20/20** | cannot run |
-| `python orchestrator.py --help` | works | `NameError` |
-
-The missing-symbol breakdown (14 stdlib imports · 57 available in v35.9.34 · 155 absent
-everywhere) and the short path to finishing v35.9.43 are in
+The undefined names are 14 stdlib imports, 57 helpers/constants that exist in the earlier
+single-file build, and 155 engine definitions (logging, connection classification, flash
+wiping, install-state markers, timeouts). Full breakdown and the short path to finishing:
 [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md).
 
 ## ✨ Key Features
@@ -98,7 +93,7 @@ More detail in [`docs/architecture_workflow.md`](docs/architecture_workflow.md).
 
 ```text
 cisco-xe-upgrade-orchestrator/
-├── orchestrator.py            # v35.9.43 merge on main · complete build at tag v35.9.34
+├── orchestrator.py            # single-file orchestrator (stdlib + netmiko/paramiko)
 ├── requirements.txt
 ├── config.example.json        # optional tuning overrides -> copy to config.json
 ├── examples/
@@ -196,9 +191,9 @@ export CISCO_UPGRADE_BASE=/path/to/repo
 
 ### Usage
 
-> These commands apply to a **complete build**. In this tree use tag `v35.9.34`
-> (`git checkout v35.9.34`) — the v35.9.43 merge is missing its header, so the CLI cannot
-> start yet (see [Project status](#-project-status)).
+> These are the target commands. They work once the module's header/helper section is in
+> place — today the CLI exits before it can parse arguments (see
+> [Development status](#-development-status)).
 
 ```bash
 # 1. Self-test the script itself (no devices touched)
@@ -242,7 +237,7 @@ After each location the orchestrator writes:
 | Artefact | Contents |
 |---|---|
 | `reports/<location>_<RUN_ID>.csv` | One row per device: model, start/target version, timings, result, failure reason |
-| `reports/run_<RUN_ID>.html` | Visual success/failure dashboard (v35.9.43) |
+| `reports/run_<RUN_ID>.html` | Visual success/failure dashboard |
 | `logs/ROLLBACK_<location>_<RUN_ID>.txt` | Per-device rollback hint (previous image / `install` rollback commands) |
 | `logs/master_*.log` + per-device logs | Full audit trail, including every command issued |
 | `state/temp_changes_<RUN_ID>.json` | Temporary config changes that must be (and were) reverted |
@@ -264,7 +259,7 @@ After each location the orchestrator writes:
 | Document | Contents |
 |---|---|
 | [`docs/architecture_workflow.md`](docs/architecture_workflow.md) | phase model, per-device state machine, concurrency, failure taxonomy, checkpoints |
-| [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) | build status, missing-symbol breakdown, how to finish v35.9.43 |
+| [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) | what is complete, what is missing, and the path to finishing |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | invariants, dev setup, checks to run, PR process |
 | [`SECURITY.md`](SECURITY.md) | vulnerability reporting and the credential/host-key risks of this tool |
 | [`CHANGELOG.md`](CHANGELOG.md) | release history |

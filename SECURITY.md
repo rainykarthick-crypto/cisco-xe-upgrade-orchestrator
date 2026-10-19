@@ -1,11 +1,10 @@
 # Security Policy
 
-## Supported versions
+## Supported builds
 
-| Version | Supported |
-|---|---|
-| `v35.9.34` (tag) | ✅ — complete, tested build |
-| `main` (v35.9.43 merge) | ⚠️ incomplete, **not runnable** — see [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) |
+The repository tracks a single development build on `main`. Its current state — including
+what is still missing before it can run — is recorded in
+[docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md).
 
 ## Reporting a vulnerability
 

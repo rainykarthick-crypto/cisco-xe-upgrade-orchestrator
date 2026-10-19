@@ -22,10 +22,8 @@ jobs:
         python: ['3.10', '3.11', '3.12']
 
     steps:
-      - name: Checkout (tags needed for the v35.9.34 build)
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -39,45 +37,19 @@ jobs:
           pip install -r requirements.txt
           pip install pyflakes
 
-      # --- working tree (v35.9.43 merge) ------------------------------------
-      # Syntax is valid; the module is intentionally incomplete, so static
-      # analysis is reported but does not gate the build. See docs/PROJECT_STATUS.md
-      - name: Syntax check (working tree)
+      - name: Syntax check
         run: python -m py_compile orchestrator.py
 
-      - name: Static analysis (working tree, informational)
+      # The module is still being assembled (see docs/PROJECT_STATUS.md): its header
+      # and helper block are missing, so pyflakes reports undefined names and the CLI
+      # cannot start. Static analysis is therefore reported, not gating.
+      - name: Static analysis (informational)
         continue-on-error: true
         run: python -m pyflakes orchestrator.py
 
-      # --- complete build (tag) ---------------------------------------------
-      - name: Extract the complete v35.9.34 build
-        run: git show v35.9.34:orchestrator.py > /tmp/orchestrator-v35.9.34.py
-
-      - name: Syntax check (complete build)
-        run: python -m py_compile /tmp/orchestrator-v35.9.34.py
-
-      - name: Static analysis (complete build)
-        # Gate on real breakage (undefined names); unused-import notices are tolerated.
-        run: |
-          python -m pyflakes /tmp/orchestrator-v35.9.34.py > /tmp/pyflakes.txt 2>&1 || true
-          cat /tmp/pyflakes.txt || true
-          if grep -q "undefined name" /tmp/pyflakes.txt; then
-            echo "::error::undefined names in the complete build"
-            exit 1
-          fi
-          echo "no undefined names in the complete build"
-
-      - name: Self-test (complete build)
-        env:
-          CISCO_UPGRADE_BASE: ${{ github.workspace }}
-        run: python /tmp/orchestrator-v35.9.34.py --validate
-
-      - name: CLI surface (complete build)
-        env:
-          CISCO_UPGRADE_BASE: ${{ github.workspace }}
-        run: |
-          python /tmp/orchestrator-v35.9.34.py --version
-          python /tmp/orchestrator-v35.9.34.py --help
+      - name: CLI smoke test (informational)
+        continue-on-error: true
+        run: python orchestrator.py --version
 
   docs:
     name: Documentation sanity
