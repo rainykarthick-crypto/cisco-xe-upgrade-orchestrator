@@ -1,0 +1,45 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---------------------------------------------------------------------------
+# Network data - NEVER commit real inventory, images or credentials
+# ---------------------------------------------------------------------------
+# locations/*.txt hold internal hostnames and management IP addresses.
+locations/
+# firmware/ holds multi-hundred-MB images and the portable pscp.exe.
+firmware/
+*.bin
+*.pkg
+
+# Portable PuTTY binaries and password files
+pscp.exe
+plink.exe
+_pscp_pw*
+*.tmp
+
+# ---------------------------------------------------------------------------
+# Run artefacts
+# ---------------------------------------------------------------------------
+logs/
+reports/
+state/
+checkpoints/
+backups/
+.upgrade.lock
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

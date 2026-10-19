@@ -1,0 +1,8 @@
+# Runtime dependencies for the Cisco IOS-XE Upgrade Orchestrator.
+# Python 3.10+ is required (see README).
+#
+# The orchestrator imports these lazily, so `--validate`, `--check`, `--help` and
+# `--version` work even before they are installed.
+
+paramiko>=3.4
+netmiko>=4.3

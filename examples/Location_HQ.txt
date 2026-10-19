@@ -1,0 +1,15 @@
+# SAMPLE inventory - safe placeholder addresses. Replace with your own devices.
+#
+# Format: hostname, ip
+#   '#' starts a comment
+#   ',', ';', '|' or a tab are accepted as separators
+#   "hostname ip", "ip hostname" and a bare IP are also accepted
+#
+# Copy this file to <base_dir>/locations/HQ.txt and edit it.
+
+HQ-CORE-SW1,    10.10.10.1
+HQ-CORE-SW2,    10.10.10.2
+HQ-DIST-SW1,    10.10.10.5
+HQ-ACC-SW1,     10.10.10.11
+HQ-ACC-SW2,     10.10.10.12
+# HQ-ACC-SW3,   10.10.10.13      # commented out: RMA pending

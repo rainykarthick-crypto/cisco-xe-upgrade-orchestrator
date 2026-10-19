@@ -1,0 +1,13 @@
+# SAMPLE inventory - safe placeholder addresses. Replace with your own devices.
+#
+# Format: hostname, ip
+#   '#' starts a comment
+#   ',', ';', '|' or a tab are accepted as separators
+#   "hostname ip", "ip hostname" and a bare IP are also accepted
+#
+# Copy this file to <base_dir>/locations/Wada.txt and edit it.
+
+WADA-CORE-SW1,  10.20.20.1
+WADA-ACC-SW1,   10.20.20.11
+WADA-ACC-SW2,   10.20.20.12
+WADA-ACC-SW3,   10.20.20.13

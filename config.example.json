@@ -1,0 +1,12 @@
+{
+  "_comment": "Optional tuning for the orchestrator. Copy to <base_dir>/config.json. Only UPPERCASE constants that exist in orchestrator.py are applied; everything else is ignored.",
+  "TARGET_VERSION": "17.18.04",
+  "LARGE_MODEL_PARALLEL": 3,
+  "STATE_MACHINE_DEADLINE": 2400,
+  "PING_DOWN_TIMEOUT_SEC": 300,
+  "PING_UP_TIMEOUT_SEC": 900,
+  "POST_REBOOT_SETTLE_SEC": 120,
+  "POST_REBOOT_MAX_ATTEMPTS": 30,
+  "USE_PSCP": true,
+  "PSCP_TRANSFER_FALLBACK": true
+}
