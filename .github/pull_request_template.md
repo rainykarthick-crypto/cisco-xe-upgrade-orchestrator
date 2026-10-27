@@ -18,12 +18,12 @@
 - [ ] `python -m pyflakes orchestrator.py` (no new undefined names)
 - [ ] `python orchestrator.py --validate`
 - [ ] `python orchestrator.py --help` (CLI unchanged or intentionally changed)
-- [ ] Lab-tested on: <!-- e.g. C9300-48P, IOS-XE 17.12.4 → 17.18.04 -->
+- [ ] Lab-tested on: <!-- e.g. C9300-48P, IOS-XE 17.12.4 -> 17.18.04 -->
 
 ## Safety checklist
 
 - [ ] No invariant broken (state-driven, session continuity, version-aware dispatch,
-      service locks, temp-change ledger) — see `docs/architecture_workflow.md`
+      service locks, temp-change ledger) - see `docs/architecture_workflow.md`
 - [ ] Destructive paths still require `--yes`; `--dry-run` remains read-only
 - [ ] New/changed device commands are issued through the same guarded helpers
 - [ ] Timeouts and retries have bounded values (no unbounded wait)

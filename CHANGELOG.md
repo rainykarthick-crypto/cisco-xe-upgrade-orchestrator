@@ -42,7 +42,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`insufficient_space`), boot-mode detection (bundle vs install).
 * SCP transfer via pscp with stall detection, retry, host-key retry and a tuned paramiko
   fallback; MD5 verification of the transferred image.
-* State-driven `install add` → `activate` → `commit`, one command per state read, with
+* State-driven `install add` -> `activate` -> `commit`, one command per state read, with
   installer-lock clearing and `packages.conf` repair.
 * Reboot monitoring (ICMP down/up/stable, SSH ready, boot-loop detection) and post-upgrade
   verification (version, stack, interfaces, running-config drift).

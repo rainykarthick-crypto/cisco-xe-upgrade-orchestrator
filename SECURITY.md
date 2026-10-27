@@ -11,7 +11,7 @@ verification status and the checks to reproduce it are recorded in
 Please do **not** disclose security issues in public issues or pull requests.
 
 Use GitHub's private reporting:
-**Security → Advisories → Report a vulnerability**
+**Security -> Advisories -> Report a vulnerability**
 (`https://github.com/rainykarthick-crypto/cisco-xe-upgrade-orchestrator/security/advisories/new`)
 
 Include: affected version/commit, impact, reproduction steps (on a lab device), and any
@@ -28,7 +28,7 @@ sensitive:
   files that outlive the run is a vulnerability. `.gitignore` excludes those files; treat a
   committed one as a leak.
 * **Command injection.** Hostnames, IPs and firmware filenames are interpolated into device
-  CLI commands and into `pscp` invocations. Inventory files are therefore trusted input —
+  CLI commands and into `pscp` invocations. Inventory files are therefore trusted input -
   document any change that loosens validation.
 * **Transport.** SCP/SSH host keys are not pinned in this version; a man-in-the-middle on
   the management network can impersonate a switch. Report any suggestion that host-key

@@ -4,7 +4,7 @@ This document explains how `orchestrator.py` drives a fleet upgrade: the phase m
 per-device state machine, the concurrency model, the safety invariants it must never break,
 and the artefacts a run leaves behind.
 
-Target release: **IOS-XE 17.18.04** · Platforms: Catalyst 9200 /
+Target release: **IOS-XE 17.18.04** - Platforms: Catalyst 9200 /
 9200L / 9200CX / 9300 / 9500.
 
 ---
@@ -32,7 +32,7 @@ graph TD
     A[CLI parsing + config.json] --> B[Validate / Check / Discover]
     B --> C[PRE-CHECK per device]
     C --> D[TRANSFER per device]
-    D --> E[INSTALL: add → activate → commit]
+    D --> E[INSTALL: add -> activate -> commit]
     E --> F[RELOAD + boot monitoring]
     F --> G[VERIFY: version, stack, interfaces, drift]
     G --> H[REVERT temp changes + reports]
@@ -41,11 +41,11 @@ graph TD
 | Phase | Key operations | Output |
 |---|---|---|
 | **Bootstrap** | Parse CLI (`--locations`, `--hosts`, `--limit`, `--exclude`, `--base-dir`, `--config`), load `config.json` overrides, establish `RUN_ID`, create `logs/`, `reports/`, `state/`, `backups/` | run context |
-| **Discovery** | `locations/<name>.txt` → `Device(hostname, ip, location, target)`; `--hosts SW1=ip` for ad-hoc devices | device list |
+| **Discovery** | `locations/<name>.txt` -> `Device(hostname, ip, location, target)`; `--hosts SW1=ip` for ad-hoc devices | device list |
 | **PRE-CHECK** | `show version`, model/firmware consistency, `show boot` (bundle vs install), free-flash vs required bytes (image + extraction overhead) | `insufficient_space` / `firmware mismatch` skips |
-| **TRANSFER** | pscp with progress stall detection → retry → retry-with-host-key → paramiko SFTP fallback; MD5 verify | image on `flash:` |
+| **TRANSFER** | pscp with progress stall detection -> retry -> retry-with-host-key -> paramiko SFTP fallback; MD5 verify | image on `flash:` |
 | **INSTALL** | `install add file flash:<image> activate commit`-style sequence, one command per state read; installer-lock detection and clearing; `packages.conf` repair for install-mode boot | activated/committed image |
-| **RELOAD** | ICMP down → up → stable, SSH ready, boot-loop detection, bounded reconnect attempts | device back in service |
+| **RELOAD** | ICMP down -> up -> stable, SSH ready, boot-loop detection, bounded reconnect attempts | device back in service |
 | **VERIFY** | post version, stack members, interface state, running-config drift, optional reconcile | result row |
 | **CLEANUP** | revert every entry in the temp-change ledger and verify the revert | CSV + rollback doc |
 
@@ -57,14 +57,14 @@ graph TD
 `stage/step` while it moves through:
 
 ```
-PRE-CHECK  (clock · model · readiness · version · wiping)
-   │
-TRANSFER   (pscp · paramiko · hash-verify)
-   │
-INSTALL    (add · activate · commit · repair)
-   │
-VERIFY     (post-boot · stack · interfaces · drift)
-   │
+PRE-CHECK  (clock - model - readiness - version - wiping)
+   |
+TRANSFER   (pscp - paramiko - hash-verify)
+   |
+INSTALL    (add - activate - commit - repair)
+   |
+VERIFY     (post-boot - stack - interfaces - drift)
+   |
 DONE / FAILED (reason recorded in the CSV and rollback document)
 ```
 
@@ -90,8 +90,8 @@ The loop never sleeps blindly between steps: it re-reads the device and decides.
 | Failure | Detected as | Recovery |
 |---|---|---|
 | Image will not fit | `insufficient_space: <free> free, <need> needed` (pre-check) | device skipped, run continues |
-| Wrong image for the model | `firmware mismatch: …` | device skipped |
-| SCP hang / silent stall | `pscp stalled Ns with no output` → process killed | retry, retry-with-host-key, paramiko fallback |
+| Wrong image for the model | `firmware mismatch: ...` | device skipped |
+| SCP hang / silent stall | `pscp stalled Ns with no output` -> process killed | retry, retry-with-host-key, paramiko fallback |
 | Install engine locked | installer-lock detection | lock cleared, state re-read, command retried |
 | Boot variable lost | `packages.conf` missing from `show boot` | boot variable repaired before activate |
 | Device does not return | `device did not return after activate` | bounded ICMP/SSH waits, then device marked failed |
@@ -118,26 +118,26 @@ Every failure ends up in `reports/<location>_<RUN_ID>.csv` **and** `logs/ROLLBAC
 
 ```text
 <base_dir>/
-├── logs/
-│   ├── master_<RUN_ID>.log            # orchestration decisions
-│   ├── <host>_<RUN_ID>.log            # every command + output for one device
-│   └── ROLLBACK_<loc>_<RUN_ID>.txt    # per-device rollback procedure
-├── reports/
-│   └── <loc>_<RUN_ID>.csv             # one row per device (model, versions, timings, result)
-├── state/
-│   ├── checkpoint_<loc>.json          # resume points
-│   └── temp_changes_<RUN_ID>.json     # ledger reverted at the end of the run
-└── backups/
-    └── <host>_<RUN_ID>_*.cfg          # pre-change configuration snapshots
++-- logs/
+| +-- master_<RUN_ID>.log            # orchestration decisions
+| +-- <host>_<RUN_ID>.log            # every command + output for one device
+| +-- ROLLBACK_<loc>_<RUN_ID>.txt    # per-device rollback procedure
++-- reports/
+| +-- <loc>_<RUN_ID>.csv             # one row per device (model, versions, timings, result)
++-- state/
+| +-- checkpoint_<loc>.json          # resume points
+| +-- temp_changes_<RUN_ID>.json     # ledger reverted at the end of the run
++-- backups/
+    +-- <host>_<RUN_ID>_*.cfg          # pre-change configuration snapshots
 ```
 
 ---
 
 ## 8. Running a safe campaign
 
-1. `--validate` — self-test the script in isolation.
-2. `--check` — read-only sweep; confirm versions, models and boot modes.
-3. `--dry-run` — full pre-flight including flash arithmetic and image/hash checks.
+1. `--validate` - self-test the script in isolation.
+2. `--check` - read-only sweep; confirm versions, models and boot modes.
+3. `--dry-run` - full pre-flight including flash arithmetic and image/hash checks.
 4. **Canary**: one location, small `--limit`, then verify its CSV and rollback doc.
 5. **Wave rollout**: remaining locations with `--yes`, watching `logs/master_*.log`.
 6. `--recover` if a run was interrupted; check `temp_changes_*.json` is empty afterwards.
@@ -146,7 +146,7 @@ Every failure ends up in `reports/<location>_<RUN_ID>.csv` **and** `logs/ROLLBAC
 
 ## 9. Extension points
 
-* `config.json` — override any uppercase constant (parallelism, timeouts, pscp usage,
+* `config.json` - override any uppercase constant (parallelism, timeouts, pscp usage,
   deadline). See `config.example.json`.
-* `locations/*.txt` — plain-text inventory, one device per line, `#` comments allowed.
-* `--hosts` — ad-hoc devices without an inventory file.
+* `locations/*.txt` - plain-text inventory, one device per line, `#` comments allowed.
+* `--hosts` - ad-hoc devices without an inventory file.

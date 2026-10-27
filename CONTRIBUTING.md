@@ -9,9 +9,9 @@ The orchestrator is built on five invariants (detailed in
 [`docs/architecture_workflow.md`](docs/architecture_workflow.md)). A change that breaks one
 of them is a regression even if it "works":
 
-1. **State driven, never timer driven** — read the device, classify, issue one command.
-2. **Session continuity** — the session that ran `install add` runs activate/commit.
-3. **Version-aware dispatch** — the activate form comes from the running IOS-XE version.
+1. **State driven, never timer driven** - read the device, classify, issue one command.
+2. **Session continuity** - the session that ran `install add` runs activate/commit.
+3. **Version-aware dispatch** - the activate form comes from the running IOS-XE version.
 4. **Service locks on every device**, including devices already on target.
 5. **Temporary changes are recorded before they are made** and reverted afterwards.
 
@@ -45,7 +45,7 @@ touching a switch.
 
 ## Pull requests
 
-1. Branch from `main` (`feat/…`, `fix/…`, `docs/…`).
+1. Branch from `main` (`feat/...`, `fix/...`, `docs/...`).
 2. Keep commits focused; use [Conventional Commits](https://www.conventionalcommits.org/)
    (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`, `ci:`).
 3. Update `README.md` / `CHANGELOG.md` when behaviour or usage changes.
@@ -56,7 +56,7 @@ touching a switch.
 ## Reporting bugs and security issues
 
 * Bugs / features: use the issue templates.
-* Security: **do not** open a public issue — see [SECURITY.md](SECURITY.md).
+* Security: **do not** open a public issue - see [SECURITY.md](SECURITY.md).
 
 ## License
 

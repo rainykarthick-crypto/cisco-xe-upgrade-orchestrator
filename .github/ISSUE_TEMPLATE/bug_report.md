@@ -24,7 +24,7 @@ assignees: ''
 | Python version (`python -V`) | |
 | OS | |
 | Switch models | <!-- e.g. C9300-48P, C9200L-24P --> |
-| IOS-XE from → to | |
+| IOS-XE from -> to | |
 | pscp.exe present? | <!-- yes/no; paramiko fallback used? --> |
 
 ## Output
