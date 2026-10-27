@@ -40,16 +40,28 @@ jobs:
       - name: Syntax check
         run: python -m py_compile orchestrator.py
 
-      # The module is still being assembled (see docs/PROJECT_STATUS.md): its header
-      # and helper block are missing, so pyflakes reports undefined names and the CLI
-      # cannot start. Static analysis is therefore reported, not gating.
-      - name: Static analysis (informational)
-        continue-on-error: true
-        run: python -m pyflakes orchestrator.py
+      - name: Static analysis (undefined-name gate)
+        # Unused-import notices are tolerated; undefined names are not.
+        run: |
+          python -m pyflakes orchestrator.py > /tmp/pyflakes.txt 2>&1 || true
+          cat /tmp/pyflakes.txt
+          if grep -q "undefined name" /tmp/pyflakes.txt; then
+            echo "::error::undefined names in orchestrator.py"
+            exit 1
+          fi
+          echo "no undefined names"
 
-      - name: CLI smoke test (informational)
-        continue-on-error: true
-        run: python orchestrator.py --version
+      - name: CLI surface
+        env:
+          CISCO_UPGRADE_BASE: ${{ github.workspace }}
+        run: |
+          python orchestrator.py --version
+          python orchestrator.py --help
+
+      - name: Built-in self-test
+        env:
+          CISCO_UPGRADE_BASE: ${{ github.workspace }}
+        run: python orchestrator.py --validate
 
   docs:
     name: Documentation sanity

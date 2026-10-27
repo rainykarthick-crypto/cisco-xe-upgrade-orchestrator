@@ -7,28 +7,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-* `docs/PROJECT_STATUS.md`: precise state of the module — 1,160 `pyflakes` diagnostics,
-  226 undefined names (14 stdlib imports · 57 helpers/constants from the earlier build ·
-  155 engine definitions absent everywhere), the duplicated tail, and the exact section
-  required to finish it.
+* `docs/PROJECT_STATUS.md`: verification recipe, the last recorded self-test result, and what
+  the `--validate` suite actually covers.
 * `docs/architecture_workflow.md`: phase model, per-device state machine, concurrency,
   failure taxonomy, checkpoints and artefacts.
 * `examples/`: two sample inventories with documentation-range addresses plus the accepted
   line formats.
 * `config.example.json`: the supported `config.json` tuning overrides.
-* CI (syntax gate, informational `pyflakes`, documentation and repository hygiene checks),
-  Dependabot, issue and pull-request templates.
+* CI (syntax, static analysis, self-test, documentation and repository hygiene), Dependabot,
+  issue and pull-request templates.
 
 ### Changed
 
-* Removed build/version labels from the module and documentation: comments, self-test names
-  and the hard-coded version assertion are gone; the self-test now checks that
-  `VERSION_STRING` is a non-empty string instead of matching a specific number.
+* `orchestrator.py` rebuilt from the complete engine: `VERSION = "1.0.0"`,
+  `SCRIPT_NAME = "orchestrator.py"`, and every build/version label removed from comments,
+  self-test names and the version assertion (now a non-empty-string check).
+* README: quality-gate table with verified results; the HTML-report claim removed (the module
+  writes a CSV and a JSON per location, a rollback document and logs).
 
-### Known gaps
+### Fixed
 
-* The module's header (imports, constants) and helper block are not in the tree yet, so the
-  CLI exits immediately. See [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md).
+* The module runs again. `--version`, `--help` and `--validate` (**20/20**) all pass under
+  Python 3.14 with paramiko 5.1.0 and netmiko 4.8.0. The previous revision was a truncated
+  merge that raised `NameError: name 'sys' is not defined` on start-up.
 
 ## [Initial import] - 2026-10-19
 

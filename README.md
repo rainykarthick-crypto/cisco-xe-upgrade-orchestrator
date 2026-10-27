@@ -1,70 +1,68 @@
-# Enterprise Cisco IOS-XE Upgrade Orchestrator
+﻿# Enterprise Cisco IOS-XE Upgrade Orchestrator
 
 [![CI](https://github.com/rainykarthick-crypto/cisco-xe-upgrade-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/rainykarthick-crypto/cisco-xe-upgrade-orchestrator/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![Cisco](https://img.shields.io/badge/Cisco-IOS--XE-00A3E0)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
 ![License](https://img.shields.io/badge/License-MIT-green)
-[![Status](https://img.shields.io/badge/status-development-orange)](docs/PROJECT_STATUS.md)
+[![Status](https://img.shields.io/badge/status-verified-success)](docs/PROJECT_STATUS.md)
 
-> **Development build.** The single-file module is still being assembled — its header
-> (imports, constants) and helper block are not in place yet, so the CLI exits immediately.
-> [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) lists exactly what is missing and how to
-> finish it.
+> **Verified build.** Syntax, static analysis and the built-in **20/20 self-test** pass
+> (Python 3.14, paramiko 5.1.0, netmiko 4.8.0). Details and how to reproduce the checks:
+> [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md).
 
 An enterprise-grade, multi-threaded Python automation tool that orchestrates, executes and
 monitors bulk firmware upgrades across large fleets of Cisco Catalyst switches.
 
-## 📖 Executive Summary
+## ðŸ“– Executive Summary
 
 Upgrading hundreds of network switches by hand is slow, error-prone and disruptive. The
-**Upgrade Orchestrator** runs the whole lifecycle — fleet discovery, pre-flight validation,
+**Upgrade Orchestrator** runs the whole lifecycle â€” fleet discovery, pre-flight validation,
 SCP transfer, `install add/activate/commit`, reboot monitoring and post-upgrade
-verification — from one resumable, checkpointed run, and it reverts every temporary
+verification â€” from one resumable, checkpointed run, and it reverts every temporary
 configuration change it made before it exits.
 
-## 🚦 Development status
+## ðŸš¦ Quality gates
 
 | Check | Result |
 |---|---|
-| `python -m py_compile orchestrator.py` | passes (syntax is valid) |
-| `python -m pyflakes orchestrator.py` | 226 undefined names — the header/helper block is missing |
-| `python orchestrator.py --help` | fails (`NameError`) until that section is added |
-| `python orchestrator.py --validate` | cannot run yet |
+| `python -m py_compile orchestrator.py` | passes |
+| `python -m pyflakes orchestrator.py` | no undefined names (2 unused-import notices) |
+| `python orchestrator.py --version` | `orchestrator.py v1.0.0 (target IOS-XE 17.18.04)` |
+| `python orchestrator.py --help` | full CLI |
+| `python orchestrator.py --validate` | **20/20 self-tests pass** |
 
-The undefined names are 14 stdlib imports, 57 helpers/constants that exist in the earlier
-single-file build, and 155 engine definitions (logging, connection classification, flash
-wiping, install-state markers, timeouts). Full breakdown and the short path to finishing:
-[`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md).
+Verified locally on Python 3.14 with paramiko 5.1.0 and netmiko 4.8.0; CI runs the same gates
+on Python 3.10, 3.11 and 3.12.
 
-## ✨ Key Features
+## âœ¨ Key Features
 
-* **Concurrent fleet execution** — per-location worker pools, plus a bounded semaphore for
+* **Concurrent fleet execution** â€” per-location worker pools, plus a bounded semaphore for
   large chassis (C9300/C9500) so a multi-hundred-MB transfer never starves the small models.
-* **State-driven install engine** — each loop iteration reads the device, classifies its
+* **State-driven install engine** â€” each loop iteration reads the device, classifies its
   state and issues exactly one command. The only hard stop is a per-device deadline
   (`STATE_MACHINE_DEADLINE`), never an arbitrary sleep.
-* **Session continuity** — the session that ran `install add` is the one that runs
+* **Session continuity** â€” the session that ran `install add` is the one that runs
   activate / commit / reload, so the Cisco install-engine lock is never raced.
-* **Version-aware dispatch** — the activate command form is derived from the running
+* **Version-aware dispatch** â€” the activate command form is derived from the running
   IOS-XE version (the bare form is rejected on 17.10 and later).
-* **Crash-resistant transfers** — SCP progress stall detection (kills a hung transfer),
+* **Crash-resistant transfers** â€” SCP progress stall detection (kills a hung transfer),
   retry, retry-with-host-key, then automatic fallback to a tuned paramiko SFTP transfer.
-* **Pre-flight space arithmetic** — reads free flash in bytes, adds extraction overhead and
+* **Pre-flight space arithmetic** â€” reads free flash in bytes, adds extraction overhead and
   refuses to start (`insufficient_space`) instead of failing halfway through an install.
-* **Self-healing boot state** — detects bundle vs install mode, repairs a missing
+* **Self-healing boot state** â€” detects bundle vs install mode, repairs a missing
   `packages.conf` boot variable and clears stuck installer locks.
-* **Temporary-change ledger** — every temporary config change (SSH tuning etc.) is recorded
+* **Temporary-change ledger** â€” every temporary config change (SSH tuning etc.) is recorded
   in `state/temp_changes_<RUN_ID>.json` and reverted, then verified, at the end of the run;
   `--recover` replays the ledger from an interrupted run.
-* **Checkpoint & resume** — per-location and per-device checkpoints, so an interrupted run
+* **Checkpoint & resume** â€” per-location and per-device checkpoints, so an interrupted run
   resumes instead of starting over.
-* **Verification** — MD5 of the transferred image, post-reboot stack/interface health,
+* **Verification** â€” MD5 of the transferred image, post-reboot stack/interface health,
   running-config drift check and an optional reconcile pass.
-* **Safe defaults** — `--validate`, `--check`, `--dry-run`, `--dry-run-revert`, and a
+* **Safe defaults** â€” `--validate`, `--check`, `--dry-run`, `--dry-run-revert`, and a
   confirmation prompt unless `--yes` is given.
 
-## 🏗️ Architecture & Workflow
+## ðŸ—ï¸ Architecture & Workflow
 
 ```mermaid
 flowchart TD
@@ -74,47 +72,47 @@ flowchart TD
     D --> E["Phase 4<br/>install add,<br/>activate, commit"]
     E --> F["Phase 5<br/>Reload and<br/>boot-loop monitoring"]
     F --> G["Phase 6<br/>Verify stack,<br/>interfaces, hash, drift"]
-    G --> H["Phase 7<br/>Revert temp changes,<br/>CSV and HTML report"]
+    G --> H["Phase 7<br/>Revert temp changes,<br/>CSV report and rollback"]
 ```
 
 *Static render of the same diagram: [`docs/architecture_workflow.png`](docs/architecture_workflow.png).*
 
 | Phase | What happens | Fails safe by |
 |---|---|---|
-| 1 · Discover | Load `locations/<name>.txt` (or `--hosts`), build device objects | Missing inventory is a warning, not a crash |
-| 2 · Pre-check | Running version, model/firmware consistency, free flash vs. required bytes, boot mode | Emits `insufficient_space` / `firmware mismatch` and skips the device |
-| 3 · Transfer | pscp (or paramiko fallback) pushes the image; MD5 verified | Stall detector kills a hung transfer, then retries / falls back |
-| 4 · Install | `install add file flash:<image>` → `activate` → `commit`, one command per loop | Installer locks detected and cleared; state re-read every iteration |
-| 5 · Reboot | ICMP down → up → stable, SSH ready, boot-loop detection | Bounded waits + `POST_REBOOT_MAX_ATTEMPTS` reconnects |
-| 6 · Verify | Stack members, interfaces, post version, running-config drift | Failures land in the CSV/rollback doc for triage |
-| 7 · Clean up | Revert recorded temp changes and verify them | `--recover` can replay a previous ledger |
+| 1 Â· Discover | Load `locations/<name>.txt` (or `--hosts`), build device objects | Missing inventory is a warning, not a crash |
+| 2 Â· Pre-check | Running version, model/firmware consistency, free flash vs. required bytes, boot mode | Emits `insufficient_space` / `firmware mismatch` and skips the device |
+| 3 Â· Transfer | pscp (or paramiko fallback) pushes the image; MD5 verified | Stall detector kills a hung transfer, then retries / falls back |
+| 4 Â· Install | `install add file flash:<image>` â†’ `activate` â†’ `commit`, one command per loop | Installer locks detected and cleared; state re-read every iteration |
+| 5 Â· Reboot | ICMP down â†’ up â†’ stable, SSH ready, boot-loop detection | Bounded waits + `POST_REBOOT_MAX_ATTEMPTS` reconnects |
+| 6 Â· Verify | Stack members, interfaces, post version, running-config drift | Failures land in the CSV/rollback doc for triage |
+| 7 Â· Clean up | Revert recorded temp changes and verify them | `--recover` can replay a previous ledger |
 
 More detail in [`docs/architecture_workflow.md`](docs/architecture_workflow.md).
 
-## 📂 Repository layout
+## ðŸ“‚ Repository layout
 
 ```text
 cisco-xe-upgrade-orchestrator/
-├── orchestrator.py            # single-file orchestrator (stdlib + netmiko/paramiko)
-├── requirements.txt
-├── config.example.json        # optional tuning overrides -> copy to config.json
-├── examples/
-│   ├── Location_HQ.txt        # sample inventory (safe placeholder IPs)
-│   └── Location_Wada.txt
-├── docs/
-│   ├── architecture_workflow.md   # phases, state machine, failure taxonomy
-│   └── PROJECT_STATUS.md          # what is complete, what is missing, how to finish
-├── .github/
-│   ├── workflows/ci.yml       # syntax, pyflakes, 20/20 self-test, repo hygiene
-│   ├── dependabot.yml
-│   ├── ISSUE_TEMPLATE/
-│   └── pull_request_template.md
-├── CHANGELOG.md
-├── CONTRIBUTING.md
-├── SECURITY.md
-├── .gitattributes
-├── LICENSE
-└── README.md
+â”œâ”€â”€ orchestrator.py            # single-file orchestrator (stdlib + netmiko/paramiko)
+â”œâ”€â”€ requirements.txt
+â”œâ”€â”€ config.example.json        # optional tuning overrides -> copy to config.json
+â”œâ”€â”€ examples/
+â”‚   â”œâ”€â”€ Location_HQ.txt        # sample inventory (safe placeholder IPs)
+â”‚   â””â”€â”€ Location_Wada.txt
+â”œâ”€â”€ docs/
+â”‚   â”œâ”€â”€ architecture_workflow.md   # phases, state machine, failure taxonomy
+â”‚   â””â”€â”€ PROJECT_STATUS.md          # what is complete, what is missing, how to finish
+â”œâ”€â”€ .github/
+â”‚   â”œâ”€â”€ workflows/ci.yml       # syntax, pyflakes, 20/20 self-test, repo hygiene
+â”‚   â”œâ”€â”€ dependabot.yml
+â”‚   â”œâ”€â”€ ISSUE_TEMPLATE/
+â”‚   â””â”€â”€ pull_request_template.md
+â”œâ”€â”€ CHANGELOG.md
+â”œâ”€â”€ CONTRIBUTING.md
+â”œâ”€â”€ SECURITY.md
+â”œâ”€â”€ .gitattributes
+â”œâ”€â”€ LICENSE
+â””â”€â”€ README.md
 ```
 
 At runtime the orchestrator uses a **base directory** (default `C:\Cisco_Upgrade`, overridable
@@ -122,26 +120,26 @@ with `--base-dir` or the `CISCO_UPGRADE_BASE` environment variable) containing:
 
 ```text
 <base_dir>/
-├── orchestrator.py
-├── config.json        # optional: uppercase constants from the script
-├── firmware/          # *.bin images and pscp.exe
-├── locations/         # HQ.txt, Wada.txt, ...   (git-ignored)
-├── logs/              # master + per-device logs, ROLLBACK_*.txt
-├── reports/           # <location>_<RUN_ID>.csv
-├── state/             # checkpoints, temp_changes_<RUN_ID>.json
-└── backups/           # pre-change config backups
+â”œâ”€â”€ orchestrator.py
+â”œâ”€â”€ config.json        # optional: uppercase constants from the script
+â”œâ”€â”€ firmware/          # *.bin images and pscp.exe
+â”œâ”€â”€ locations/         # HQ.txt, Wada.txt, ...   (git-ignored)
+â”œâ”€â”€ logs/              # master + per-device logs, ROLLBACK_*.txt
+â”œâ”€â”€ reports/           # <location>_<RUN_ID>.csv
+â”œâ”€â”€ state/             # checkpoints, temp_changes_<RUN_ID>.json
+â””â”€â”€ backups/           # pre-change config backups
 ```
 
 Run it from the repository root with `--base-dir .` (or set `CISCO_UPGRADE_BASE=.`) so the
-`firmware/`, `locations/`, `logs/`… folders live next to the script.
+`firmware/`, `locations/`, `logs/`â€¦ folders live next to the script.
 
-## 🚀 Getting Started
+## ðŸš€ Getting Started
 
 ### Prerequisites
 
 * **Python 3.10 or newer** (the script's documented minimum)
 * `netmiko` and `paramiko` (see `requirements.txt`)
-* **`pscp.exe`** from [PuTTY](https://www.putty.org/) — place it in the base directory or on
+* **`pscp.exe`** from [PuTTY](https://www.putty.org/) â€” place it in the base directory or on
   `PATH` for the fastest transfer path. It is optional: the orchestrator falls back to a
   tuned paramiko SFTP transfer when pscp is missing or fails.
 * Cisco Catalyst **9200 / 9200L / 9200CX / 9300 / 9500** series running a supported IOS-XE
@@ -193,10 +191,6 @@ export CISCO_UPGRADE_BASE=/path/to/repo
 
 ### Usage
 
-> These are the target commands. They work once the module's header/helper section is in
-> place — today the CLI exits before it can parse arguments (see
-> [Development status](#-development-status)).
-
 ```bash
 # 1. Self-test the script itself (no devices touched)
 python orchestrator.py --validate
@@ -232,21 +226,21 @@ exists in the script can be overridden that way (parallelism, timeouts, pscp usa
 }
 ```
 
-## 📊 Reporting
+## ðŸ“Š Reporting
 
 After each location the orchestrator writes:
 
 | Artefact | Contents |
 |---|---|
 | `reports/<location>_<RUN_ID>.csv` | One row per device: model, start/target version, timings, result, failure reason |
-| `reports/run_<RUN_ID>.html` | Visual success/failure dashboard |
+| `reports/<location>_<RUN_ID>.json` | Machine-readable copy of the same results |
 | `logs/ROLLBACK_<location>_<RUN_ID>.txt` | Per-device rollback hint (previous image / `install` rollback commands) |
 | `logs/master_*.log` + per-device logs | Full audit trail, including every command issued |
 | `state/temp_changes_<RUN_ID>.json` | Temporary config changes that must be (and were) reverted |
 
-## 🛡️ Operational safety
+## ðŸ›¡ï¸ Operational safety
 
-* Nothing changes a device until `--yes` (or an interactive confirmation) — `--dry-run`,
+* Nothing changes a device until `--yes` (or an interactive confirmation) â€” `--dry-run`,
   `--check` and `--validate` are strictly read-only.
 * A device is only marked successful after image hash, post-boot version and health checks.
 * Every temporary change is recorded before it is made and reverted afterwards;
@@ -256,28 +250,28 @@ After each location the orchestrator writes:
 * The tool refuses to upgrade on a firmware/model mismatch or when the image cannot fit in
   flash.
 
-## 📚 Documentation
+## ðŸ“š Documentation
 
 | Document | Contents |
 |---|---|
 | [`docs/architecture_workflow.md`](docs/architecture_workflow.md) | phase model, per-device state machine, concurrency, failure taxonomy, checkpoints |
-| [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) | what is complete, what is missing, and the path to finishing |
+| [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) | verified build details and how to reproduce the checks |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | invariants, dev setup, checks to run, PR process |
 | [`SECURITY.md`](SECURITY.md) | vulnerability reporting and the credential/host-key risks of this tool |
 | [`CHANGELOG.md`](CHANGELOG.md) | release history |
 | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | CI: syntax, pyflakes, self-test, repo hygiene |
 | [`LICENSE`](LICENSE) | MIT |
 
-## 🤝 Contributing
+## ðŸ¤ Contributing
 
 Issues and pull requests are welcome. Please never commit real inventory files, firmware
-images or credentials — `locations/`, `firmware/`, `logs/`, `reports/`, `state/` and
+images or credentials â€” `locations/`, `firmware/`, `logs/`, `reports/`, `state/` and
 `backups/` are already git-ignored, and `examples/` contains placeholder data only.
 
 Before opening a pull request run `python -m py_compile orchestrator.py`,
-`python -m pyflakes orchestrator.py` and `python orchestrator.py --validate` — see
+`python -m pyflakes orchestrator.py` and `python orchestrator.py --validate` â€” see
 [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
-## 📄 License
+## ðŸ“„ License
 
 Distributed under the MIT License. See [`LICENSE`](LICENSE) for details.

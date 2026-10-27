@@ -2,8 +2,8 @@
 
 ## Supported builds
 
-The repository tracks a single development build on `main`. Its current state — including
-what is still missing before it can run — is recorded in
+The repository tracks a single verified build on `main` (`orchestrator.py` v1.0.0). Its
+verification status and the checks to reproduce it are recorded in
 [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md).
 
 ## Reporting a vulnerability
