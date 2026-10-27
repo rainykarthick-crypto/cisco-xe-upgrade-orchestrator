@@ -27,13 +27,12 @@ configuration change it made before it exits.
 | Check | Result |
 |---|---|
 | `python -m py_compile orchestrator.py` | passes |
-| `python -m pyflakes orchestrator.py` | no undefined names (2 unused-import notices) |
 | `python orchestrator.py --version` | `orchestrator.py v1.0.0 (target IOS-XE 17.18.04)` |
 | `python orchestrator.py --help` | full CLI |
 | `python orchestrator.py --validate` | **20/20 self-tests pass** |
 
-Verified locally on Python 3.14 with paramiko 5.1.0 and netmiko 4.8.0; CI runs the same gates
-on Python 3.10, 3.11 and 3.12.
+Verified locally on Python 3.14 with paramiko 5.1.0 and netmiko 4.8.0. CI runs these gates on
+Python 3.10, 3.11 and 3.12, alongside static analysis and repository hygiene checks.
 
 ## Key Features
 
